@@ -174,10 +174,11 @@ python -m webui.app
 
 Open the URL printed in the terminal (default `http://127.0.0.1:7860`) and:
 
-1. Upload a match video and a court template image.
-2. Click "Detect Court" to auto-detect court boundaries. To correct, click 4 corners on the image then click "Apply Manual Corners".
+1. Upload the match video. The court template image is optional: when it is omitted, the WebUI samples frames evenly across the video and selects the frame with the strongest court-detection result and suitable clarity as the template.
+2. Click "Auto-select Video Frame & Detect Court". To correct, click 4 corners on the image then click "Apply Manual Corners"; uploading a manually captured template image overrides automatic frame selection.
 3. Adjust analysis settings (pose model, language, visualization options, etc.).
 4. Click "Run Analysis" and wait for the progress bar. Results include the annotated video, heatmaps/scatter plots, and detection data.
+5. Click the `›_` button in the bottom-right corner to inspect live backend output, including model initialization, processing progress, FFmpeg export, and error traces.
 
 | Court Detection and Settings | Analysis Results |
 | --- | --- |

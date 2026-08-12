@@ -12,9 +12,13 @@ from badminton_analysis.court.mapper import (
     compute_expanded_roi,
     resolve_court_corners,
 )
+from badminton_analysis.court.detector import auto_detect_court_corners
 from badminton_analysis.system import BadmintonAnalysisSystem, load_runtime_dependencies
 
 _MAX_WEBUI_OUTPUTS = 10
+_MAX_GENERATED_TEMPLATES = 20
+_MAX_COURT_FRAME_SAMPLES = 24
+_COURT_DETECTION_SIZE = (1080, 720)
 
 _dependencies_loaded = False
 
@@ -46,6 +50,28 @@ def _cleanup_old_outputs(base_dir="outputs", prefix="webui_", keep=_MAX_WEBUI_OU
         try:
             shutil.rmtree(path)
         except Exception:
+            pass
+
+
+def _cleanup_generated_templates(base_dir=os.path.join("outputs", "court_templates"),
+                                 keep=_MAX_GENERATED_TEMPLATES):
+    """Keep generated video-frame templates bounded without touching user files."""
+    if not os.path.isdir(base_dir):
+        return
+
+    templates = []
+    for name in os.listdir(base_dir):
+        if not name.startswith("auto_court_"):
+            continue
+        full = os.path.join(base_dir, name)
+        if os.path.isfile(full):
+            templates.append((os.path.getmtime(full), full))
+
+    templates.sort(reverse=True)
+    for _, path in templates[keep:]:
+        try:
+            os.remove(path)
+        except OSError:
             pass
 
 
@@ -98,6 +124,155 @@ def prepare_court(template_path, manual_corners=None):
         "mid_height": mid_height,
         "preview_bgr": preview,
     }
+
+
+def _sample_frame_indices(total_frames, max_samples=_MAX_COURT_FRAME_SAMPLES):
+    """Return evenly distributed frame indices, avoiding likely intro/outro shots."""
+    if total_frames <= 0:
+        return []
+
+    if total_frames == 1:
+        return [0]
+
+    margin = int(total_frames * 0.03)
+    start = min(margin, total_frames - 1)
+    end = max(start, total_frames - 1 - margin)
+    sample_count = min(max_samples, end - start + 1)
+    return sorted({int(index) for index in np.linspace(start, end, sample_count)})
+
+
+def _court_frame_score(frame):
+    """Score a frame using the existing court detector plus a clarity tie-breaker."""
+    detection_frame = cv2.resize(frame, _COURT_DETECTION_SIZE)
+    corners, _mask, debug = auto_detect_court_corners(detection_frame)
+    if not corners:
+        return None
+
+    detector_score = float(debug.get("score") or 0.0)
+    gray = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    # Court-line geometry decides the result; clarity only separates similar candidates.
+    selection_score = detector_score + min(np.log1p(sharpness), 8.0)
+    return {
+        "detector_score": detector_score,
+        "sharpness": sharpness,
+        "selection_score": selection_score,
+    }
+
+
+def _fallback_frame_score(frame):
+    """Rank clear court-like frames even when line geometry cannot find four corners."""
+    detection_frame = cv2.resize(frame, _COURT_DETECTION_SIZE)
+    hsv = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    green = (h >= 35) & (h <= 95) & (s >= 30) & (v >= 45)
+    lower_court = green[int(green.shape[0] * 0.25):]
+    green_ratio = float(np.count_nonzero(lower_court) / max(1, lower_court.size))
+    gray = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return {
+        "green_ratio": green_ratio,
+        "sharpness": sharpness,
+        "selection_score": green_ratio * 100.0 + min(np.log1p(sharpness), 8.0),
+    }
+
+
+def extract_best_court_template(video_path, output_dir=os.path.join("outputs", "court_templates"),
+                                max_samples=_MAX_COURT_FRAME_SAMPLES):
+    """Extract the most suitable court frame from a video using the native detector.
+
+    The saved PNG is the exact video-resolution template used later for mapping;
+    this avoids coordinate drift between the preview and analysis video.
+    """
+    _ensure_dependencies()
+    if not video_path or not os.path.isfile(video_path):
+        raise FileNotFoundError("Cannot read video for automatic court detection.")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if fps <= 0 or total_frames <= 0:
+        cap.release()
+        raise RuntimeError(f"Cannot read video metadata: {video_path}")
+
+    best_detected = None
+    best_fallback = None
+    sampled_indices = _sample_frame_indices(total_frames, max_samples=max_samples)
+    for frame_index in sampled_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+
+        fallback_score = _fallback_frame_score(frame)
+        fallback_candidate = {
+            "frame": frame,
+            "frame_index": frame_index,
+            "detected": False,
+            "detector_score": 0.0,
+            **fallback_score,
+        }
+        if best_fallback is None or fallback_candidate["selection_score"] > best_fallback["selection_score"]:
+            best_fallback = fallback_candidate
+
+        score = _court_frame_score(frame)
+        if score is not None:
+            candidate = {
+                "frame": frame,
+                "frame_index": frame_index,
+                "detected": True,
+                "green_ratio": fallback_score["green_ratio"],
+                **score,
+            }
+            if best_detected is None or candidate["selection_score"] > best_detected["selection_score"]:
+                best_detected = candidate
+    cap.release()
+
+    best = best_detected or best_fallback
+    if best is None:
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    _cleanup_generated_templates(output_dir)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    template_path = os.path.join(output_dir, f"auto_court_{timestamp}_{best['frame_index']}.png")
+    encoded, data = cv2.imencode(".png", best["frame"])
+    if not encoded:
+        raise RuntimeError("Failed to save the automatically selected court frame.")
+    data.tofile(template_path)
+
+    return {
+        "template_path": template_path,
+        "frame_index": best["frame_index"],
+        "time_sec": best["frame_index"] / fps,
+        "sampled_frames": len(sampled_indices),
+        "detected": best["detected"],
+        "detector_score": round(best["detector_score"], 2),
+        "green_ratio": round(best["green_ratio"], 4),
+        "sharpness": round(best["sharpness"], 2),
+    }
+
+
+def prepare_court_from_video(video_path):
+    """Create a template from a video frame, then reuse the normal court workflow."""
+    selected = extract_best_court_template(video_path)
+    if selected is None:
+        return {
+            "corners": None,
+            "roi_corners": None,
+            "mid_height": None,
+            "preview_bgr": None,
+            "template_path": None,
+            "selection": None,
+        }
+
+    prepared = prepare_court(selected["template_path"])
+    prepared["template_path"] = selected["template_path"]
+    prepared["selection"] = selected
+    return prepared
 
 
 def _find_ffmpeg():
@@ -174,6 +349,32 @@ def _scale_corners_to_video(corners, template_path, video_path):
     return [(int(x * sx), int(y * sy)) for x, y in corners]
 
 
+def _max_template_match_score(video_path, template_path, max_samples=24):
+    """Measure whether an uploaded template can pass the runtime court-view gate."""
+    template = imread_safe(template_path, cv2.IMREAD_GRAYSCALE)
+    cap = cv2.VideoCapture(video_path)
+    if template is None or not cap.isOpened():
+        if cap.isOpened():
+            cap.release()
+        return None
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    template = cv2.resize(template, (frame_w, frame_h))
+    best_score = -1.0
+    for frame_index in _sample_frame_indices(total_frames, max_samples=max_samples):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        score = float(cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED).max())
+        best_score = max(best_score, score)
+    cap.release()
+    return None if best_score < 0 else best_score
+
+
 def run_analysis(video_path, template_path, corners, options, progress_cb=None):
     """Run the full analysis pipeline headlessly.
 
@@ -189,6 +390,13 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None):
     """
     _ensure_dependencies()
     _cleanup_old_outputs()
+
+    match_score = _max_template_match_score(video_path, template_path)
+    if match_score is not None and match_score < 0.75:
+        raise RuntimeError(
+            f"球场模板与当前视频不匹配（抽样最高匹配度 {match_score:.3f}，"
+            "运行要求 0.750）。请清空已上传的模板图，再从当前视频自动选择球场帧。"
+        )
 
     corners = _scale_corners_to_video(corners, template_path, video_path)
 
@@ -249,15 +457,29 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None):
     system.keep_audio = keep_audio
     system.process_video(progress_callback=progress_cb)
 
-    if visualize_positions:
+    warnings = []
+    has_detections = os.path.isfile(system.detections_path) and os.path.getsize(system.detections_path) > 0
+    if not has_detections:
+        warnings.append(
+            "没有生成有效的球场检测数据，因此无法生成热力图和散点图。"
+            "请使用当前视频中的模板帧，并检查四个球场角点。"
+        )
+
+    if visualize_positions and has_detections:
         if language == "en":
             from badminton_analysis.visualization.player_positions_en import analyze_player_positions
         else:
             from badminton_analysis.visualization.player_positions_zh import analyze_player_positions
         vis_dir = os.path.join(output_dir, "position_visualizations")
-        analyze_player_positions(system.detections_path, vis_dir, fps=system.fps)
+        visualization_ok = analyze_player_positions(system.detections_path, vis_dir, fps=system.fps)
+        if not visualization_ok:
+            warnings.append(
+                "已经生成位置检测数据，但图表渲染失败。请打开右下角后台输出查看详情。"
+            )
 
     web_video_path = _reencode_for_browser(system.output_video_path, output_dir)
+    if not os.path.isfile(web_video_path) or os.path.getsize(web_video_path) == 0:
+        raise RuntimeError("标注视频导出失败，未生成可播放文件。请打开右下角后台输出查看详情。")
 
     result = {
         "output_dir": output_dir,
@@ -265,6 +487,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None):
         "metadata": system.metadata_path,
         "detections": system.detections_path,
         "visualizations": [],
+        "warnings": warnings,
     }
 
     vis_dir = os.path.join(output_dir, "position_visualizations")

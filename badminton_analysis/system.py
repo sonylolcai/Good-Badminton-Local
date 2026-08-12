@@ -299,6 +299,7 @@ class BadmintonAnalysisSystem:
 
 
         if not is_court:
+            self._write_output_frame(frame, frame_count, out)
             return frame, detect_frame_count
 
         detect_frame_count += 1
@@ -376,15 +377,19 @@ class BadmintonAnalysisSystem:
             )
         
 
-        if frame is not None:
-            if self.show_display:
-                cv2.imshow('frame', frame)
-                cv2.waitKey(1)
-            out.write(frame)
-
-            if self.save_images:
-                cv2.imwrite(os.path.join(self.images_save_dir, f"{frame_count}.png"), frame)
+        self._write_output_frame(frame, frame_count, out)
         return frame, detect_frame_count
+
+    def _write_output_frame(self, frame, frame_count, out):
+        """Write every source frame so the exported video keeps its full timeline."""
+        if frame is None:
+            return
+        if self.show_display:
+            cv2.imshow('frame', frame)
+            cv2.waitKey(1)
+        out.write(frame)
+        if self.save_images:
+            cv2.imwrite(os.path.join(self.images_save_dir, f"{frame_count}.png"), frame)
 
     def _get_template_path(self):
         """Get the court template image path."""
@@ -483,16 +488,20 @@ class BadmintonAnalysisSystem:
             cv2.destroyAllWindows()
 
         if hasattr(self, 'keep_audio') and self.keep_audio:
-            vap.process_video_with_audio(
+            export_ok = vap.process_video_with_audio(
                 video_path=self.video_path,
                 temp_video_path=self.temp_output_video_path,
                 output_path=self.output_video_path,
                 save_dir=self.save_dir
             )
         else:
-            vap.process_video_without_audio(
+            export_ok = vap.process_video_without_audio(
                 temp_video_path=self.temp_output_video_path,
                 output_path=self.output_video_path
+            )
+        if not export_ok:
+            raise RuntimeError(
+                "Annotated video export failed. Open the backend console for the FFmpeg error."
             )
 
     def analyze_shuttlecock(self, roi_corners, corners):
