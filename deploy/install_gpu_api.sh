@@ -83,7 +83,7 @@ rm -f "$APP_DIR/.requirements-server.txt"
 if [[ ! -f "$APP_DIR/.gpu-api.env" ]]; then
   umask 077
   api_key="$(openssl rand -hex 32)"
-  printf 'GOOD_BADMINTON_API_KEY=%s\nGOOD_BADMINTON_API_DATA_DIR=%s/api_data\nPORT=8001\n' \
+  printf 'GOOD_BADMINTON_API_KEY=%s\nGOOD_BADMINTON_API_DATA_DIR=%s/api_data\nPORT=8080\n' \
     "$api_key" "$APP_DIR" > "$APP_DIR/.gpu-api.env"
   echo "Created $APP_DIR/.gpu-api.env. Store its API key in the business service secret manager."
 fi
@@ -113,7 +113,7 @@ else
     # shellcheck disable=SC1091
     source "$APP_DIR/.gpu-api.env"
     set +a
-    nohup "$PYTHON_BIN" -m uvicorn api.app:app --host 0.0.0.0 --port "${PORT:-8001}" \
+    nohup "$PYTHON_BIN" -m uvicorn api.app:app --host 0.0.0.0 --port "${PORT:-8080}" \
       > "$APP_DIR/gpu-api.log" 2>&1 &
     echo $! > "$pid_file"
   )
