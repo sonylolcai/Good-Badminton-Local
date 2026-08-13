@@ -9,7 +9,7 @@ import argparse
 def load_runtime_dependencies():
     """Load heavy runtime dependencies after argparse has handled --help."""
     global cv2, np, YOLO, CourtMapper, annotate_court, compute_expanded_roi, PlayerTracker
-    global CourtTrajectoryVisualizer, ShuttlecockTracker
+    global CourtTrajectoryVisualizer, ShuttlecockTracker, FixedCameraMatchPipeline
     global PlayerPoseVisualizer, StatsVisualizer, RTMPoseProcessor, YOLOPoseProcessor, vap
     global JsonlDetectionWriter, write_json, SCHEMA_VERSION
 
@@ -26,6 +26,7 @@ def load_runtime_dependencies():
         from .tracking.player import PlayerTracker as _PlayerTracker
         from .visualization.court_trajectory import CourtTrajectoryVisualizer as _CourtTrajectoryVisualizer
         from .detection.shuttlecock import ShuttlecockTracker as _ShuttlecockTracker
+        from .analysis.fixed_camera_match import FixedCameraMatchPipeline as _FixedCameraMatchPipeline
         from .visualization.player_pose import PlayerPoseVisualizer as _PlayerPoseVisualizer
         from .visualization.stats import StatsVisualizer as _StatsVisualizer
         from .detection.rtmpose import RTMPoseProcessor as _RTMPoseProcessor
@@ -49,6 +50,7 @@ def load_runtime_dependencies():
     PlayerTracker = _PlayerTracker
     CourtTrajectoryVisualizer = _CourtTrajectoryVisualizer
     ShuttlecockTracker = _ShuttlecockTracker
+    FixedCameraMatchPipeline = _FixedCameraMatchPipeline
     PlayerPoseVisualizer = _PlayerPoseVisualizer
     StatsVisualizer = _StatsVisualizer
     RTMPoseProcessor = _RTMPoseProcessor
@@ -69,7 +71,7 @@ class BadmintonAnalysisSystem:
                  yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True,
                  output_video_style='annotated', pose_imgsz=1280,
                  pose_conf=0.15, far_player_enhancement=False,
-                 far_pose_roi=(0.12, 0.30, 0.86, 0.82)):
+                 far_pose_roi=(0.12, 0.30, 0.86, 0.82), net_image_line=None):
         self.video_path = video_path
         self.show_display = show_display
         self.language = language
@@ -85,6 +87,7 @@ class BadmintonAnalysisSystem:
             raise ValueError("pose_conf must be greater than 0 and no more than 1")
         self.far_player_enhancement = bool(far_player_enhancement)
         self.far_pose_roi = tuple(float(value) for value in far_pose_roi)
+        self.net_image_line = net_image_line
         if output_video_style not in {'annotated', 'skeleton'}:
             raise ValueError(
                 "output_video_style must be 'annotated' or 'skeleton'."
@@ -137,6 +140,7 @@ class BadmintonAnalysisSystem:
 
         self.metadata_path = os.path.join(self.save_dir, "metadata.json")
         self.detections_path = os.path.join(self.save_dir, "detections.jsonl")
+        self.spatial_match_summary_path = os.path.join(self.save_dir, "spatial_match_summary.json")
         output_prefix = "skeleton" if self.output_video_style == "skeleton" else "detect"
         self.output_video_path = os.path.join(self.save_dir, f"{output_prefix}_{self.video_name}.mp4")
         self.detection_writer = None
@@ -217,7 +221,6 @@ class BadmintonAnalysisSystem:
         self.court_corners = corners
         self.court_roi_corners = roi_corners
 
-        self._write_metadata(fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height)
         self.detection_writer = JsonlDetectionWriter(self.detections_path)
         
 
@@ -225,6 +228,10 @@ class BadmintonAnalysisSystem:
         self.player_pose_visualizer.court_mapper = self.court_mapper
         self.player_tracker = PlayerTracker(corners=corners, threshold=mid_height, history_size=30,
                                           detection_writer=self.detection_writer, fps=fps)
+        self.fixed_camera_match = FixedCameraMatchPipeline(
+            corners, fps=fps, net_image_line=self.net_image_line
+        )
+        self._write_metadata(fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height)
         
 
         self.stats_visualizer = StatsVisualizer(
@@ -295,6 +302,7 @@ class BadmintonAnalysisSystem:
                 "corners": corners,
                 "roi_corners": roi_corners,
                 "mid_height": mid_height,
+                "net_image_line": self.fixed_camera_match.net_image_line if hasattr(self, "fixed_camera_match") else self.net_image_line,
                 "coordinate_system": {
                     "unit": "meter",
                     "width": 6.1,
@@ -305,8 +313,14 @@ class BadmintonAnalysisSystem:
                 "video": self.output_video_path,
                 "detections": self.detections_path,
                 "video_style": self.output_video_style,
+                "spatial_match_summary": self.spatial_match_summary_path,
             },
             "temporal_tracking": {
+                "players": {
+                    "identity_key": "track_id",
+                    "zone_policy": "zone_id is transient court space; never identity, team, or side",
+                    "legacy_compatibility": "players.upper/lower retained for existing consumers only",
+                },
                 "shuttlecock": {
                     "max_prediction_frames": self.shuttlecock_tracker.max_prediction_frames,
                     "prediction_confidence_decay": self.shuttlecock_tracker.prediction_confidence_decay,
@@ -367,6 +381,13 @@ class BadmintonAnalysisSystem:
         
 
         pose_data = self.player_pose_visualizer.get_current_pose_data() or {}
+        spatial_state = self.fixed_camera_match.update(
+            frame_index=frame_count,
+            observations=self._spatial_observations(pose_data.get("detections", [])),
+            shuttlecock=self._spatial_shuttle_input(
+                ball_position, self.shuttlecock_tracker.get_last_detection()
+            ),
+        )
         players = self.player_tracker.update(
             frame_count,
             centroids,
@@ -376,6 +397,7 @@ class BadmintonAnalysisSystem:
             detect_frame_count,
             pose_detections=pose_data.get("detections"),
             ball_detection=self.shuttlecock_tracker.get_last_detection(),
+            spatial_state=spatial_state,
         )
         
 
@@ -440,6 +462,39 @@ class BadmintonAnalysisSystem:
 
         self._write_output_frame(output_frame, frame_count, out)
         return output_frame, detect_frame_count
+
+    def _spatial_observations(self, pose_detections):
+        """Translate pose evidence to court coordinates for the new tracker."""
+        observations = []
+        for detection in pose_detections:
+            image_xy = detection.get("location")
+            if not image_xy or len(image_xy) < 2:
+                continue
+            court_xy = self.court_mapper.image_to_court(image_xy)
+            if len(court_xy) != 2:
+                continue
+            observations.append(
+                {
+                    "image_xy": image_xy,
+                    "court_xy": [float(court_xy[0]), float(court_xy[1])],
+                    "confidence": detection.get("confidence", 0.0),
+                    "location_method": detection.get("location_method"),
+                    "location_confidence": detection.get("location_confidence"),
+                    "source": detection.get("source"),
+                }
+            )
+        return observations
+
+    def _spatial_shuttle_input(self, ball_position, ball_detection):
+        """Only actual ball observations may contribute to analytic evidence."""
+        if ball_position is None or not ball_detection:
+            return None
+        detected = ball_detection.get("status") == "detected"
+        return {
+            "image_xy": ball_position,
+            "confidence": ball_detection.get("confidence", 0.0),
+            "detected": detected,
+        }
 
     def _create_output_frame(self, source_frame):
         """Create either the normal annotation canvas or an anonymous line canvas."""
@@ -545,6 +600,8 @@ class BadmintonAnalysisSystem:
 
     def _cleanup(self, cap):
         """Clean up resources and merge audio when needed."""
+        if hasattr(self, "fixed_camera_match"):
+            write_json(self.spatial_match_summary_path, self.fixed_camera_match.finalize())
         if self.detection_writer is not None:
             self.detection_writer.close()
             self.detection_writer = None

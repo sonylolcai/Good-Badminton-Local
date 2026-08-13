@@ -75,7 +75,8 @@
 
 ### P1
 
-- [ ] 将 `PlayerTracker` 重构为 `track_id` 驱动的通用球员集合，保持单打兼容。
+- [x] 新增球场坐标驱动的 `FixedCameraMatchPipeline`：独立输出多球员 `track_id`、瞬时 `zone_id`、赛后身份认领接口、单目近似三维球与可拒绝回合状态；旧 `PlayerTracker.upper/lower` 仅保留给现有 UI 兼容。详见 `FIXED_CAMERA_SINGLES_SPATIAL_TRACKING.md`。
+- [ ] 将现有热力图、散点图和视频轨迹叠加迁移到 `spatial.tracks` 的 `track_id` 聚合视图；不得继续以 `upper/lower` 作为新功能的数据源。
 - [ ] 建立遮挡片段人工真值，评测 ByteTrack 的遮挡恢复、ID-switch和最长可可信预测时间；通过门槛后再接入正式流程。
 - [ ] 增加 `singles | doubles`、队伍归属、四人身份确认、换边保持和人工纠错。
 - [ ] 使 detections、轨迹、热力图和统计支持个人、队伍、全场三层聚合。
