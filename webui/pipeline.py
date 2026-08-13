@@ -375,7 +375,8 @@ def _max_template_match_score(video_path, template_path, max_samples=24):
     return None if best_score < 0 else best_score
 
 
-def run_analysis(video_path, template_path, corners, options, progress_cb=None):
+def run_analysis(video_path, template_path, corners, options, progress_cb=None,
+                 output_dir=None, cleanup_outputs=True):
     """Run the full analysis pipeline headlessly.
 
     Args:
@@ -389,7 +390,8 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None):
         dict with output file paths.
     """
     _ensure_dependencies()
-    _cleanup_old_outputs()
+    if cleanup_outputs:
+        _cleanup_old_outputs()
 
     match_score = _max_template_match_score(video_path, template_path)
     if match_score is not None and match_score < 0.75:
@@ -413,7 +415,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None):
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    output_dir = os.path.join("outputs", f"webui_{video_name}_{timestamp}")
+    output_dir = output_dir or os.path.join("outputs", f"webui_{video_name}_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
 
     with open(os.path.join(output_dir, "court_annotations.txt"), "w") as f:

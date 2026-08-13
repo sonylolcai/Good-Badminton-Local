@@ -1,0 +1,19 @@
+[Unit]
+Description=Good-Badminton GPU video analysis API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__GPU_USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.gpu-api.env
+ExecStart=__APP_DIR__/.venv/bin/python -m uvicorn api.app:app --host 0.0.0.0 --port 8001 --workers 1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

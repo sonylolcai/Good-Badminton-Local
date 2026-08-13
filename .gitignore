@@ -14,6 +14,8 @@ env/
 # Local inputs and generated outputs
 results/
 outputs/
+api_data/
+.gpu-api.env
 *.log
 
 # Model weights are intentionally not published

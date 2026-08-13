@@ -1,0 +1,85 @@
+# GPU 视频分析 API 部署与联调
+
+## 服务边界
+
+GPU 服务器仅负责：接收视频/球场模板、运行模型、保存分析产物并返回任务 JSON。用户、SSO、比赛业务记录、运动员档案、复核数据库和查询接口仍由业务服务器负责。
+
+```text
+业务服务器 / WebUI → GPU API（提交任务、轮询、取结果）
+                         └→ 本地磁盘：输入、视频、detections.jsonl、metadata、汇总 JSON
+```
+
+API 是异步单队列：一张 24 GB 显卡一次只处理一场比赛，避免多任务同时加载姿态/球模型导致显存耗尽。它不提供公网匿名计算；除健康检查外所有接口必须携带 `X-API-Key`。
+
+## 接口
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `GET` | `/api/v1/health` | 服务存活、鉴权配置、工作线程状态 |
+| `POST` | `/api/v1/jobs` | 上传视频、球场模板、人工四角，创建分析任务 |
+| `GET` | `/api/v1/jobs/{job_id}` | 查询排队/运行进度/错误 |
+| `GET` | `/api/v1/jobs/{job_id}/result` | 已成功任务的 JSON 结果与产物 URL |
+| `GET` | `/api/v1/jobs/{job_id}/artifacts/{name}` | 下载标注视频、元数据、检测 JSONL 等 |
+
+`POST /api/v1/jobs` 使用 `multipart/form-data`：
+
+- `video`：MP4、MOV、MKV、AVI 或 WebM；当前上限 10 GiB。
+- `template`：同机位的球场模板图片。
+- `court_corners`：例如 `[[120,210],[1035,209],[1150,700],[35,700]]`。
+- `options_json`：可选 JSON；支持推理尺寸、人体置信度、远端 ROI、匿名骨架视频等，不接受用户传入任意模型路径。
+
+请求示例：
+
+```bash
+curl -X POST http://GPU_HOST:8001/api/v1/jobs \
+  -H "X-API-Key: $GOOD_BADMINTON_API_KEY" \
+  -F "video=@match.mp4" \
+  -F "template=@court.png" \
+  -F 'court_corners=[[120,210],[1035,209],[1150,700],[35,700]]' \
+  -F 'options_json={"pose_imgsz":1280,"output_video_style":"skeleton","audio":false}'
+```
+
+成功后轮询 `/api/v1/jobs/{job_id}`。`succeeded` 后调用 `/result`，返回 `annotated_video`、`metadata`、`detections` 和（生成时）`spatial_match_summary` 的受保护下载 URL。
+
+## 服务器安装
+
+前置条件：CUDA 12.4、NVIDIA 驱动、Python 3、Git、FFmpeg、可使用 `sudo` 的 Linux 用户。先将当前分支推送到你的 fork：
+
+```powershell
+git push -u origin fixed-camera-singles-spatial-tracking
+```
+
+在 GPU 实例内执行：
+
+```bash
+git clone --branch fixed-camera-singles-spatial-tracking https://github.com/sonylolcai/Good-Badminton-Local.git ~/good-badminton
+cd ~/good-badminton
+chmod +x deploy/install_gpu_api.sh
+./deploy/install_gpu_api.sh ~/good-badminton fixed-camera-singles-spatial-tracking
+```
+
+脚本会安装 CUDA PyTorch 2.5.1/cu124、其他项目依赖、创建只允许当前用户读取的 `.gpu-api.env`、运行 API 测试，并配置 systemd 服务。密钥只存在 `.gpu-api.env`，不要提交、截图或发到聊天中。
+
+启动后在实例内检查：
+
+```bash
+curl http://127.0.0.1:8001/api/v1/health
+sudo journalctl -u good-badminton-gpu-api -f
+```
+
+## 业务服务器联调
+
+业务服务器不写 GPU 服务器的数据库。它保存 `job_id`、自己业务侧的比赛 ID、任务状态和 API Key；处理完成后下载 JSON/视频到对象存储或自身存储，再入库业务索引。`detections.jsonl` 是原始模型输出，不可被业务层覆盖。
+
+公开端口前至少完成其一：只允许业务服务器 IP 访问 8001，或让 API 仅绑定 `127.0.0.1` 并经 SSH/VPN/反向代理访问。API Key 是访问控制，不是 HTTPS；跨公网调用应由反向代理提供 TLS。
+
+## 停止与关机
+
+处理完成后先确认没有 `queued` 或 `running` 任务，再停止服务并关机：
+
+```bash
+sudo systemctl stop good-badminton-gpu-api
+sudo shutdown -h now
+```
+
+不要在任务运行时直接关机；任务状态会保留为中断失败，已上传文件和已有产物不会自动删除。
