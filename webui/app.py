@@ -22,7 +22,8 @@ from webui.pipeline import (
     prepare_court_from_video,
     run_analysis,
 )
-from webui.remote_gpu import RemoteAnalysisError, run_remote_analysis
+from webui.remote_gpu import RemoteAnalysisError, remote_gpu_config, run_remote_analysis
+from webui.task_ledger import BusinessTaskLedger
 
 _MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MB
@@ -248,21 +249,41 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         events.put(event)
 
     def worker():
+        ledger = None
+        business_task_id = None
         try:
             remote_output_dir = os.path.join(
                 "outputs", "remote_jobs", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             )
+            ledger = BusinessTaskLedger()
+            business_task_id = ledger.start_task(
+                output_dir=remote_output_dir,
+                remote_base_url=remote_gpu_config()["base_url"],
+            )
+
+            def remote_status(event):
+                ledger.record_remote_event(business_task_id, event)
+                publish({**event, "business_task_id": business_task_id})
+
             try:
                 result = run_remote_analysis(
                     video_path=video_file, template_path=template_path, corners=corners,
-                    options=options, output_dir=remote_output_dir, status_cb=publish,
+                    options=options, output_dir=remote_output_dir, status_cb=remote_status,
+                    business_task_id=business_task_id,
                 )
                 outcome["result"] = result
-                publish({"mode": "remote_gpu", "phase": "succeeded"})
+                ledger.record_terminal(business_task_id, status="succeeded")
+                publish({"mode": "remote_gpu", "phase": "succeeded", "business_task_id": business_task_id})
             except RemoteAnalysisError as remote_exc:
                 fallback_reason = str(remote_exc)
                 print(f"Remote GPU analysis failed; falling back locally: {fallback_reason}")
-                publish({"mode": "local_fallback", "phase": "local_analyzing", "fallback_reason": fallback_reason})
+                ledger.record_terminal(
+                    business_task_id, status="local_fallback", error={"message": fallback_reason}
+                )
+                publish({
+                    "mode": "local_fallback", "phase": "local_analyzing",
+                    "fallback_reason": fallback_reason, "business_task_id": business_task_id,
+                })
 
                 def local_progress(frame, total):
                     publish({
@@ -281,11 +302,17 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                     "remote_failure": fallback_reason,
                 })
                 outcome["result"] = result
-                publish({"mode": "local_fallback", "phase": "succeeded", "fallback_reason": fallback_reason})
+                ledger.record_terminal(business_task_id, status="succeeded")
+                publish({
+                    "mode": "local_fallback", "phase": "succeeded",
+                    "fallback_reason": fallback_reason, "business_task_id": business_task_id,
+                })
         except Exception as exc:
             traceback.print_exc()
             outcome["error"] = exc
-            publish({"phase": "failed", "error": str(exc)})
+            if ledger is not None and business_task_id is not None:
+                ledger.record_terminal(business_task_id, status="failed", error={"message": str(exc)})
+            publish({"phase": "failed", "error": str(exc), "business_task_id": business_task_id})
         finally:
             finished.set()
 

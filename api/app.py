@@ -47,16 +47,22 @@ def create_app(data_dir=None, start_worker=True):
         template: UploadFile = File(...),
         court_corners: str = Form(...),
         options_json: str = Form("{}"),
+        x_idempotency_key: Optional[str] = Header(default=None),
     ):
         corners = _parse_corners(court_corners)
         options = _parse_options(options_json)
+        if x_idempotency_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", x_idempotency_key):
+            raise HTTPException(status_code=422, detail="X-Idempotency-Key must be 16-128 safe characters")
+        existing = manager.get_by_idempotency_key(x_idempotency_key)
+        if existing is not None:
+            return _job_response(existing, receipt_reused=True)
         job_id = os.urandom(16).hex()
         staging_dir = data_path / "staging" / job_id
         staging_dir.mkdir(parents=True, exist_ok=False)
         try:
             video_path = await _save_upload(video, staging_dir, VIDEO_EXTENSIONS, "video")
             template_path = await _save_upload(template, staging_dir, IMAGE_EXTENSIONS, "template")
-            job = manager.create_job(video_path, template_path, corners, options)
+            job = manager.create_job(video_path, template_path, corners, options, x_idempotency_key)
             destination = data_path / "jobs" / job["job_id"] / "input"
             destination.mkdir(parents=True, exist_ok=True)
             video_target = destination / video_path.name
@@ -78,13 +84,22 @@ def create_app(data_dir=None, start_worker=True):
                 options,
                 destination.parent / "output",
             )
-            return _job_response(manager.get_job(job["job_id"]))
+            return _job_response(manager.get_job(job["job_id"]), receipt_reused=False)
         except HTTPException:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
+
+    @app.get("/api/v1/jobs/by-idempotency/{idempotency_key}", dependencies=[Depends(require_api_key)])
+    def get_job_by_idempotency(idempotency_key: str):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", idempotency_key):
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = manager.get_by_idempotency_key(idempotency_key)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return _job_response(job, receipt_reused=True)
 
     @app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(require_api_key)])
     def get_job(job_id: str):
@@ -121,9 +136,9 @@ def _require_job(manager, job_id):
     return job
 
 
-def _job_response(job):
+def _job_response(job, receipt_reused=None):
     result = job.get("result")
-    return {
+    response = {
         "job_id": job["job_id"],
         "status": job["status"],
         "created_at": job.get("created_at"),
@@ -133,7 +148,18 @@ def _job_response(job):
         "error": job.get("error"),
         "execution": job.get("execution"),
         "result": result,
+        "state_history": job.get("state_history", []),
     }
+    if receipt_reused is not None:
+        response["receipt"] = {
+            "accepted": True,
+            "accepted_at": (job.get("request") or {}).get("accepted_at") or job.get("created_at"),
+            "reused": receipt_reused,
+            "status_url": f"/api/v1/jobs/{job['job_id']}",
+            "result_url": f"/api/v1/jobs/{job['job_id']}/result",
+            "poll_after_seconds": 2,
+        }
+    return response
 
 
 def _parse_corners(value):

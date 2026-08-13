@@ -52,15 +52,16 @@ class AnalysisJobManager:
     def worker_running(self):
         return self._worker is not None and self._worker.is_alive()
 
-    def create_job(self, video_path, template_path, corners, options):
+    def create_job(self, video_path, template_path, corners, options, idempotency_key=None):
         job_id = uuid.uuid4().hex
         job_dir = self.jobs_dir / job_id
         output_dir = job_dir / "output"
         output_dir.mkdir(parents=True, exist_ok=False)
+        accepted_at = utc_now()
         job = {
             "job_id": job_id,
             "status": "queued",
-            "created_at": utc_now(),
+            "created_at": accepted_at,
             "started_at": None,
             "finished_at": None,
             "progress": {"processed_frames": 0, "total_frames": None, "ratio": 0.0},
@@ -70,6 +71,11 @@ class AnalysisJobManager:
                 "court_corners": corners,
             },
             "options": options,
+            "request": {"idempotency_key": idempotency_key, "accepted_at": accepted_at},
+            "state_history": [
+                {"at": accepted_at, "status": "accepted", "event": "durably_stored"},
+                {"at": accepted_at, "status": "queued", "event": "enqueued"},
+            ],
             "execution": {
                 "mode": "remote_gpu",
                 "fallback_used": False,
@@ -79,6 +85,19 @@ class AnalysisJobManager:
         }
         self._write_job(job)
         return job
+
+    def get_by_idempotency_key(self, idempotency_key):
+        """Find a prior accepted request so retrying a timed-out POST is safe."""
+        if not idempotency_key:
+            return None
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (job.get("request") or {}).get("idempotency_key") == idempotency_key:
+                return job
+        return None
 
     def enqueue(self, job_id, video_path, template_path, corners, options, output_dir):
         """Queue a job only after uploads have moved to their durable paths."""
@@ -117,7 +136,7 @@ class AnalysisJobManager:
         job = self.get_job(job_id)
         if job is None:
             return
-        job.update({"status": "running", "started_at": utc_now(), "error": None})
+        self._set_status(job, "running", started_at=utc_now(), error=None)
         self._write_job(job)
 
         def progress(processed_frames, total_frames):
@@ -147,27 +166,25 @@ class AnalysisJobManager:
                 cleanup_outputs=False,
             )
             job = self.get_job(job_id)
-            job.update(
-                {
-                    "status": "succeeded",
-                    "finished_at": utc_now(),
-                    "progress": {**job["progress"], "ratio": 1.0},
-                    "result": self._result_manifest(result, output_dir),
-                }
+            self._set_status(
+                job,
+                "succeeded",
+                finished_at=utc_now(),
+                progress={**job["progress"], "ratio": 1.0},
+                result=self._result_manifest(result, output_dir),
             )
             self._write_job(job)
         except Exception as exc:
             job = self.get_job(job_id) or {"job_id": job_id}
-            job.update(
-                {
-                    "status": "failed",
-                    "finished_at": utc_now(),
-                    "error": {
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(limit=20),
-                    },
-                }
+            self._set_status(
+                job,
+                "failed",
+                finished_at=utc_now(),
+                error={
+                    "message": str(exc),
+                    "type": type(exc).__name__,
+                    "traceback": traceback.format_exc(limit=20),
+                },
             )
             self._write_job(job)
 
@@ -237,20 +254,29 @@ class AnalysisJobManager:
             except (OSError, json.JSONDecodeError):
                 continue
             if job.get("status") in {"queued", "running"}:
-                job.update(
-                    {
-                        "status": "failed",
-                        "finished_at": utc_now(),
-                        "error": {
-                            "type": "ServiceRestarted",
-                            "message": "The GPU API restarted before this job completed; submit it again.",
-                        },
-                    }
+                self._set_status(
+                    job,
+                    "failed",
+                    finished_at=utc_now(),
+                    error={
+                        "type": "ServiceRestarted",
+                        "message": "The GPU API restarted before this job completed; submit it again.",
+                    },
                 )
                 self._write_job(job)
 
     def _job_path(self, job_id):
         return self.jobs_dir / job_id / "job.json"
+
+    @staticmethod
+    def _set_status(job, status, **fields):
+        previous = job.get("status")
+        job.update(fields)
+        job["status"] = status
+        if previous != status:
+            job.setdefault("state_history", []).append(
+                {"at": utc_now(), "status": status, "event": "state_changed"}
+            )
 
     def _write_job(self, job):
         path = self._job_path(job["job_id"])

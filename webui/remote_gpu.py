@@ -51,7 +51,8 @@ def _load_local_config_file():
             os.environ.setdefault(key, value.strip())
 
 
-def run_remote_analysis(video_path, template_path, corners, options, output_dir, progress_cb=None, status_cb=None):
+def run_remote_analysis(video_path, template_path, corners, options, output_dir, progress_cb=None, status_cb=None,
+                        business_task_id=None):
     """Submit, wait for, and retrieve one remote job into *output_dir*."""
     config = remote_gpu_config()
     if not config["api_key"]:
@@ -66,9 +67,16 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
         options=options,
         progress_cb=progress_cb,
         status_cb=status_cb,
+        idempotency_key=business_task_id,
     )
     job_id = job["job_id"]
-    _emit(status_cb, {"mode": "remote_gpu", "phase": "queued", "job_id": job_id})
+    receipt = job.get("receipt") or {}
+    _emit(status_cb, {
+        "mode": "remote_gpu", "phase": "accepted", "job_id": job_id,
+        "accepted_at": receipt.get("accepted_at") or job.get("created_at"),
+        "status_url": receipt.get("status_url"),
+        "submission_reused": bool(receipt.get("reused")),
+    })
     latest = _wait_for_job(config, job_id, progress_cb=progress_cb, status_cb=status_cb)
     if latest.get("status") != "succeeded":
         error = latest.get("error") or {}
@@ -76,7 +84,9 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
 
     _emit(status_cb, {"mode": "remote_gpu", "phase": "downloading", "job_id": job_id})
     result = _json_request(config, f"/api/v1/jobs/{job_id}/result")
-    return _download_result(config, job_id, result, output_dir)
+    downloaded = _download_result(config, job_id, result, output_dir)
+    _emit(status_cb, {"mode": "remote_gpu", "phase": "downloaded", "job_id": job_id})
+    return downloaded
 
 
 def _remote_options(options):
@@ -89,7 +99,8 @@ def _remote_options(options):
     }
 
 
-def _submit_multipart(config, video_path, template_path, corners, options, progress_cb=None, status_cb=None):
+def _submit_multipart(config, video_path, template_path, corners, options, progress_cb=None, status_cb=None,
+                      idempotency_key=None):
     parsed = urlparse(config["base_url"])
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_URL must be an http(s) URL")
@@ -111,6 +122,8 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
         connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
         connection.putheader("Content-Length", str(length))
         connection.putheader("X-API-Key", config["api_key"])
+        if idempotency_key:
+            connection.putheader("X-Idempotency-Key", idempotency_key)
         connection.endheaders()
         for name, value in fields.items():
             connection.send(_field_part(boundary, name, value))
@@ -155,6 +168,41 @@ def _wait_for_job(config, job_id, progress_cb=None, status_cb=None):
             return job
         time.sleep(config["poll_seconds"])
     raise RemoteAnalysisError(f"remote GPU job {job_id} polling timed out")
+
+
+def recover_remote_task(business_task_id, remote_job_id, output_dir, status_cb=None):
+    """Run one durable recovery pass after the business process restarts.
+
+    If a process died after upload but before reading the HTTP 202 response, the
+    idempotency key lets the updated GPU API reveal the already-accepted job.
+    This performs one poll only; a service scheduler can call it repeatedly.
+    """
+    config = remote_gpu_config()
+    job_id = remote_job_id
+    if not job_id:
+        recovered = _json_request(config, f"/api/v1/jobs/by-idempotency/{business_task_id}")
+        job_id = recovered["job_id"]
+        receipt = recovered.get("receipt") or {}
+        _emit(status_cb, {
+            "mode": "remote_gpu", "phase": "accepted", "job_id": job_id,
+            "accepted_at": receipt.get("accepted_at") or recovered.get("created_at"),
+            "status_url": receipt.get("status_url"), "recovered": True,
+        })
+    job = _json_request(config, f"/api/v1/jobs/{job_id}")
+    details = job.get("progress") or {}
+    _emit(status_cb, {
+        "mode": "remote_gpu", "phase": job.get("status"), "job_id": job_id,
+        "processed_frames": details.get("processed_frames", 0),
+        "total_frames": details.get("total_frames"), "ratio": details.get("ratio", 0.0),
+        "recovered": True,
+    })
+    if job.get("status") != "succeeded":
+        return job, None
+    _emit(status_cb, {"mode": "remote_gpu", "phase": "downloading", "job_id": job_id, "recovered": True})
+    result = _json_request(config, f"/api/v1/jobs/{job_id}/result")
+    downloaded = _download_result(config, job_id, result, output_dir)
+    _emit(status_cb, {"mode": "remote_gpu", "phase": "downloaded", "job_id": job_id, "recovered": True})
+    return job, downloaded
 
 
 def _download_result(config, job_id, result, output_dir):

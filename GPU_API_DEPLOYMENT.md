@@ -56,6 +56,41 @@ API 是异步单队列：一张 24 GB 显卡一次只处理一场比赛，避免
 | `GET` | `/api/v1/jobs/{job_id}/result` | 已成功任务的 JSON 结果与产物 URL |
 | `GET` | `/api/v1/jobs/{job_id}/artifacts/{name}` | 下载标注视频、元数据、检测 JSONL、热力图等 |
 
+### 可靠提交与状态账本
+
+不能把视频请求发出后就假定 GPU 已收到。业务端必须先创建自己的
+`business_task_id`，并把它放在 `X-Idempotency-Key` 请求头中。GPU 只有在
+上传文件已落盘、`job.json` 已持久化并已进入单 GPU 队列后，才返回 HTTP 202 和
+接收回执：
+
+```json
+{
+  "job_id": "…",
+  "status": "queued",
+  "receipt": {
+    "accepted": true,
+    "accepted_at": "…",
+    "reused": false,
+    "status_url": "/api/v1/jobs/…",
+    "result_url": "/api/v1/jobs/…/result",
+    "poll_after_seconds": 2
+  }
+}
+```
+
+只有收到该回执，业务端才可将任务标为 `accepted`；网络超时重试相同
+`X-Idempotency-Key` 会返回同一个 GPU `job_id`，不会重复执行。GPU 的 `job.json`
+会保存 `accepted → queued → running → succeeded/failed` 的 `state_history`。
+
+当前本地 WebUI 作为业务端验证实现，会在 `outputs/business_tasks/<business_task_id>.json`
+保存：发送开始、上传进度、GPU 接收回执、每次轮询的帧进度、下载结果、远端错误与
+本地兜底。该账本不含 API Key。正式业务服务器应使用同一结构写入其数据库，并在服务
+重启后按已保存的 `job_id` 继续轮询；前端只读取业务服务器记录，不直接信任 GPU 状态。
+若业务进程在收到回执前中断，则用
+`GET /api/v1/jobs/by-idempotency/{business_task_id}` 恢复同一个任务，绝不盲目重传视频。
+本地验证可执行 `python -m webui.reconcile_remote_tasks`；它只轮询并下载已完成产物，可由
+业务服务器的定时任务安全地每 2 秒调用一次。
+
 `POST /api/v1/jobs` 使用 `multipart/form-data`：
 
 - `video`：MP4、MOV、MKV、AVI 或 WebM；当前上限 10 GiB。
