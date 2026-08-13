@@ -16,6 +16,7 @@ results/
 outputs/
 api_data/
 .gpu-api.env
+.webui-remote-gpu.env
 *.log
 
 # Model weights are intentionally not published

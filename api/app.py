@@ -131,6 +131,7 @@ def _job_response(job):
         "finished_at": job.get("finished_at"),
         "progress": job.get("progress"),
         "error": job.get("error"),
+        "execution": job.get("execution"),
         "result": result,
     }
 

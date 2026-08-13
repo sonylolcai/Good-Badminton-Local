@@ -1,6 +1,8 @@
 import json
 import os
 import traceback
+from datetime import datetime
+from pathlib import Path
 
 from webui.log_capture import get_backend_logs, install_backend_log_capture
 
@@ -17,9 +19,23 @@ from webui.pipeline import (
     prepare_court_from_video,
     run_analysis,
 )
+from webui.remote_gpu import RemoteAnalysisError, run_remote_analysis
 
 _MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+def _write_execution_metadata(result, execution):
+    """Persist the execution origin so local fallback is never invisible."""
+    metadata_path = result.get("metadata")
+    if not metadata_path or not os.path.isfile(metadata_path):
+        return
+    with open(metadata_path, "r", encoding="utf-8") as source:
+        metadata = json.load(source)
+    metadata["execution"] = execution
+    with open(metadata_path, "w", encoding="utf-8") as output:
+        json.dump(metadata, output, ensure_ascii=False, indent=2)
+        output.write("\n")
 
 
 def _validate_file_size(path, max_bytes, label="File"):
@@ -224,13 +240,42 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         progress(frame / total, desc=f"Processing frame {frame}/{total}")
 
     try:
-        result = run_analysis(
-            video_path=video_file,
-            template_path=template_path,
-            corners=corners,
-            options=options,
-            progress_cb=progress_cb,
+        remote_output_dir = os.path.join(
+            "outputs", "remote_jobs", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         )
+
+        def remote_progress(ratio, description):
+            progress(ratio, desc=description)
+
+        try:
+            result = run_remote_analysis(
+                video_path=video_file,
+                template_path=template_path,
+                corners=corners,
+                options=options,
+                output_dir=remote_output_dir,
+                progress_cb=remote_progress,
+            )
+            gr.Info("已使用远端 GPU 完成分析。")
+        except RemoteAnalysisError as remote_exc:
+            fallback_reason = str(remote_exc)
+            print(f"Remote GPU analysis failed; falling back locally: {fallback_reason}")
+            gr.Warning(f"远端 GPU 不可用，已自动切换本地分析：{fallback_reason}")
+            result = run_analysis(
+                video_path=video_file,
+                template_path=template_path,
+                corners=corners,
+                options=options,
+                progress_cb=progress_cb,
+            )
+            _write_execution_metadata(
+                result,
+                {
+                    "mode": "local_fallback",
+                    "fallback_used": True,
+                    "remote_failure": fallback_reason,
+                },
+            )
     except Exception as exc:
         traceback.print_exc()
         raise gr.Error(f"分析失败：{exc}") from exc

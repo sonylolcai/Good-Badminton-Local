@@ -70,6 +70,10 @@ class AnalysisJobManager:
                 "court_corners": corners,
             },
             "options": options,
+            "execution": {
+                "mode": "remote_gpu",
+                "fallback_used": False,
+            },
             "error": None,
             "result": None,
         }
@@ -195,14 +199,20 @@ class AnalysisJobManager:
                 }
 
         images = []
-        for candidate in result.get("visualizations", []):
+        for index, candidate in enumerate(result.get("visualizations", [])):
             path = Path(candidate).resolve()
             try:
                 relative_path = path.relative_to(output_path)
             except ValueError:
                 continue
             if path.is_file():
-                images.append(relative_path.as_posix())
+                name = f"visualization_{index}"
+                artifacts[name] = {
+                    "relative_path": relative_path.as_posix(),
+                    "media_type": self._media_type(path),
+                    "size_bytes": path.stat().st_size,
+                }
+                images.append(name)
         return {
             "warnings": list(result.get("warnings", [])),
             "artifacts": artifacts,
@@ -215,6 +225,9 @@ class AnalysisJobManager:
             ".mp4": "video/mp4",
             ".json": "application/json",
             ".jsonl": "application/x-ndjson",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
         }.get(path.suffix.lower(), "application/octet-stream")
 
     def _recover_interrupted_jobs(self):

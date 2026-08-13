@@ -61,6 +61,7 @@ class GpuApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         payload = response.json()
         self.assertEqual(payload["status"], "queued")
+        self.assertEqual(payload["execution"]["mode"], "remote_gpu")
         job_id = payload["job_id"]
 
         status_response = self.client.get(
