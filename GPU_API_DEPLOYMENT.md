@@ -85,6 +85,8 @@ GOOD_BADMINTON_GPU_API_URL=http://xn-g.suanjiayun.com:52028
 GOOD_BADMINTON_GPU_API_KEY=<从 GPU 实例 .gpu-api.env 读取的密钥>
 ```
 
+也可将这些值（尤其是 API Key）写到 WebUI 项目根目录的 gitignored 文件 `.webui-remote-gpu.env`；以 `.webui-remote-gpu.env.example` 为模板。显式环境变量优先于该文件。不要把这个文件上传到 GPU 实例或提交 Git。
+
 点击“解析视频”后，WebUI 先以 HTTP multipart 将本地文件持续分块写入 GPU API，随后轮询远端任务并下载标注视频、JSONL、元数据与热力图到本机 `outputs/remote_jobs/`。远端任一步骤异常时，才自动切换到已有的本地 `run_analysis`，并写入：
 
 ```json

@@ -28,12 +28,27 @@ class RemoteAnalysisError(RuntimeError):
 
 def remote_gpu_config():
     """Read server-side configuration; secrets never enter browser state."""
+    _load_local_config_file()
     return {
         "base_url": os.environ.get("GOOD_BADMINTON_GPU_API_URL", DEFAULT_GPU_API_URL).rstrip("/"),
         "api_key": os.environ.get("GOOD_BADMINTON_GPU_API_KEY", ""),
         "timeout_seconds": float(os.environ.get("GOOD_BADMINTON_GPU_API_TIMEOUT", "30")),
         "poll_seconds": float(os.environ.get("GOOD_BADMINTON_GPU_API_POLL_SECONDS", "2")),
     }
+
+
+def _load_local_config_file():
+    """Load a minimal gitignored WebUI env file without an extra dependency."""
+    config_path = Path(os.environ.get("GOOD_BADMINTON_WEBUI_CONFIG", ".webui-remote-gpu.env"))
+    if not config_path.is_file():
+        return
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key and key.replace("_", "").isalnum():
+            os.environ.setdefault(key, value.strip())
 
 
 def run_remote_analysis(video_path, template_path, corners, options, output_dir, progress_cb=None):

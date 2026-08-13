@@ -1,9 +1,10 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from api.jobs import AnalysisJobManager
-from webui.remote_gpu import _multipart_length, _remote_options
+from webui.remote_gpu import _load_local_config_file, _multipart_length, _remote_options
 
 
 class RemoteGpuTests(unittest.TestCase):
@@ -42,6 +43,19 @@ class RemoteGpuTests(unittest.TestCase):
             artifact = manifest["artifacts"]["visualization_0"]
             self.assertEqual(artifact["relative_path"], "position_visualizations/heatmap.png")
             self.assertEqual(artifact["media_type"], "image/png")
+
+    def test_local_config_does_not_overwrite_explicit_environment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "remote.env"
+            config.write_text("GOOD_BADMINTON_GPU_API_KEY=file-key\n", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {"GOOD_BADMINTON_WEBUI_CONFIG": str(config), "GOOD_BADMINTON_GPU_API_KEY": "explicit-key"},
+                clear=False,
+            ):
+                _load_local_config_file()
+                import os
+                self.assertEqual(os.environ["GOOD_BADMINTON_GPU_API_KEY"], "explicit-key")
 
 
 if __name__ == "__main__":
