@@ -61,10 +61,35 @@ fi
 "$APP_DIR/.venv/bin/python" -m unittest tests.test_gpu_api -v
 
 service_file="/etc/systemd/system/${SERVICE_NAME}.service"
-sed \
-  -e "s|__GPU_USER__|$USER|g" \
-  -e "s|__APP_DIR__|$APP_DIR|g" \
-  "$APP_DIR/deploy/${SERVICE_NAME}.service" | sudo tee "$service_file" >/dev/null
-sudo systemctl daemon-reload
-sudo systemctl enable --now "$SERVICE_NAME"
-sudo systemctl status "$SERVICE_NAME" --no-pager
+if command -v systemctl >/dev/null && systemctl show-environment >/dev/null 2>&1; then
+  sed \
+    -e "s|__GPU_USER__|$USER|g" \
+    -e "s|__APP_DIR__|$APP_DIR|g" \
+    "$APP_DIR/deploy/${SERVICE_NAME}.service" | sudo tee "$service_file" >/dev/null
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "$SERVICE_NAME"
+  sudo systemctl status "$SERVICE_NAME" --no-pager
+else
+  # Most rented GPU images expose a long-lived Docker container rather than
+  # systemd.  Keep the same API contract and record the PID for status/stop.
+  pid_file="$APP_DIR/.gpu-api.pid"
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    kill "$(cat "$pid_file")"
+  fi
+  (
+    cd "$APP_DIR"
+    set -a
+    # shellcheck disable=SC1091
+    source "$APP_DIR/.gpu-api.env"
+    set +a
+    nohup "$APP_DIR/.venv/bin/uvicorn" api.app:app --host 0.0.0.0 --port "${PORT:-8001}" \
+      > "$APP_DIR/gpu-api.log" 2>&1 &
+    echo $! > "$pid_file"
+  )
+  sleep 2
+  kill -0 "$(cat "$pid_file")" 2>/dev/null || {
+    echo "GPU API failed to start; see $APP_DIR/gpu-api.log" >&2
+    exit 1
+  }
+  echo "Started container-mode GPU API (PID $(cat "$pid_file")); log: $APP_DIR/gpu-api.log"
+fi

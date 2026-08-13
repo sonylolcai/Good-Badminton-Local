@@ -58,13 +58,19 @@ chmod +x deploy/install_gpu_api.sh
 ./deploy/install_gpu_api.sh ~/good-badminton fixed-camera-singles-spatial-tracking
 ```
 
-脚本会安装 CUDA PyTorch 2.5.1/cu124、其他项目依赖、创建只允许当前用户读取的 `.gpu-api.env`、运行 API 测试，并配置 systemd 服务。密钥只存在 `.gpu-api.env`，不要提交、截图或发到聊天中。
+脚本会安装与驱动兼容的 CUDA PyTorch、其他项目依赖、创建只允许当前用户读取的 `.gpu-api.env` 并运行 API 测试。存在可用 systemd 时，它会配置 systemd 服务；多数租赁 GPU 容器没有 systemd 时，则自动以后台 `uvicorn` 进程启动，并在项目目录记录 `.gpu-api.pid` 和 `gpu-api.log`。密钥只存在 `.gpu-api.env`，不要提交、截图或发到聊天中。
 
 启动后在实例内检查：
 
 ```bash
 curl http://127.0.0.1:8001/api/v1/health
 sudo journalctl -u good-badminton-gpu-api -f
+```
+
+容器模式请改为：
+
+```bash
+tail -f ~/good-badminton/gpu-api.log
 ```
 
 ## 业务服务器联调
@@ -81,5 +87,7 @@ sudo journalctl -u good-badminton-gpu-api -f
 sudo systemctl stop good-badminton-gpu-api
 sudo shutdown -h now
 ```
+
+容器模式先执行 `kill "$(cat ~/good-badminton/.gpu-api.pid)"`，再从平台页面执行关机/释放实例；不要在任务运行时直接关机。
 
 不要在任务运行时直接关机；任务状态会保留为中断失败，已上传文件和已有产物不会自动删除。
