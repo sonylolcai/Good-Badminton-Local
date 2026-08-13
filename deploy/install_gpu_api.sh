@@ -28,12 +28,18 @@ else
 fi
 echo "Using PyTorch ${PYTORCH_CUDA_INDEX} wheels for NVIDIA driver ${driver_version}."
 
-if [[ ! -d "$APP_DIR/.git" ]]; then
-  git clone --branch "$BRANCH" --single-branch "$REPOSITORY" "$APP_DIR"
+if [[ "${GOOD_BADMINTON_SKIP_GIT_SYNC:-0}" == "1" ]]; then
+  [[ -f "$APP_DIR/api/app.py" ]] || {
+    echo "GOOD_BADMINTON_SKIP_GIT_SYNC=1 requires an extracted project at $APP_DIR" >&2
+    exit 1
+  }
+  echo "Skipping Git sync; deploying the extracted source at $APP_DIR."
+elif [[ ! -d "$APP_DIR/.git" ]]; then
+  GIT_TERMINAL_PROMPT=0 git clone --branch "$BRANCH" --single-branch "$REPOSITORY" "$APP_DIR"
 else
-  git -C "$APP_DIR" fetch origin "$BRANCH"
+  GIT_TERMINAL_PROMPT=0 git -C "$APP_DIR" fetch origin "$BRANCH"
   git -C "$APP_DIR" switch "$BRANCH"
-  git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
+  GIT_TERMINAL_PROMPT=0 git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
 fi
 
 python3 -m venv "$APP_DIR/.venv"

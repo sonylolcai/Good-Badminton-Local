@@ -58,6 +58,31 @@ chmod +x deploy/install_gpu_api.sh
 ./deploy/install_gpu_api.sh ~/good-badminton fixed-camera-singles-spatial-tracking
 ```
 
+### GitHub HTTPS 受限时：官方源码包兜底
+
+若实例无法连接 `github.com:443`，先测试官方下载域名：
+
+```bash
+curl -IL --connect-timeout 10 --max-time 20 \
+  https://codeload.github.com/sonylolcai/Good-Badminton-Local/zip/refs/heads/fixed-camera-singles-spatial-tracking
+```
+
+能返回 `200` 或 `302` 时，使用同一分支的源码包部署（不需要 Git，也不会跳转到任何第三方镜像）：
+
+```bash
+test ! -e ~/good-badminton-source || { echo "~/good-badminton-source already exists; choose a new empty directory."; exit 1; }
+curl -fL --retry 2 \
+  https://codeload.github.com/sonylolcai/Good-Badminton-Local/zip/refs/heads/fixed-camera-singles-spatial-tracking \
+  -o /tmp/good-badminton-source.zip
+unzip -q /tmp/good-badminton-source.zip -d ~
+mv ~/Good-Badminton-Local-fixed-camera-singles-spatial-tracking ~/good-badminton-source
+cd ~/good-badminton-source
+chmod +x deploy/install_gpu_api.sh
+GOOD_BADMINTON_SKIP_GIT_SYNC=1 ./deploy/install_gpu_api.sh ~/good-badminton-source fixed-camera-singles-spatial-tracking
+```
+
+若 `codeload.github.com` 同样无法访问，不要使用不受控的第三方 GitHub 镜像。请通过云平台的文件上传功能上传本分支的源码包，或为实例配置平台提供的 HTTP/HTTPS 代理，然后重复该流程。
+
 脚本会安装与驱动兼容的 CUDA PyTorch、其他项目依赖、创建只允许当前用户读取的 `.gpu-api.env` 并运行 API 测试。存在可用 systemd 时，它会配置 systemd 服务；多数租赁 GPU 容器没有 systemd 时，则自动以后台 `uvicorn` 进程启动，并在项目目录记录 `.gpu-api.pid` 和 `gpu-api.log`。密钥只存在 `.gpu-api.env`，不要提交、截图或发到聊天中。
 
 启动后在实例内检查：
