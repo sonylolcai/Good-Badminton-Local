@@ -51,7 +51,7 @@ def _load_local_config_file():
             os.environ.setdefault(key, value.strip())
 
 
-def run_remote_analysis(video_path, template_path, corners, options, output_dir, progress_cb=None):
+def run_remote_analysis(video_path, template_path, corners, options, output_dir, progress_cb=None, status_cb=None):
     """Submit, wait for, and retrieve one remote job into *output_dir*."""
     config = remote_gpu_config()
     if not config["api_key"]:
@@ -65,13 +65,16 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
         corners=corners,
         options=options,
         progress_cb=progress_cb,
+        status_cb=status_cb,
     )
     job_id = job["job_id"]
-    latest = _wait_for_job(config, job_id, progress_cb=progress_cb)
+    _emit(status_cb, {"mode": "remote_gpu", "phase": "queued", "job_id": job_id})
+    latest = _wait_for_job(config, job_id, progress_cb=progress_cb, status_cb=status_cb)
     if latest.get("status") != "succeeded":
         error = latest.get("error") or {}
         raise RemoteAnalysisError(error.get("message") or f"remote job {job_id} ended as {latest.get('status')}")
 
+    _emit(status_cb, {"mode": "remote_gpu", "phase": "downloading", "job_id": job_id})
     result = _json_request(config, f"/api/v1/jobs/{job_id}/result")
     return _download_result(config, job_id, result, output_dir)
 
@@ -86,7 +89,7 @@ def _remote_options(options):
     }
 
 
-def _submit_multipart(config, video_path, template_path, corners, options, progress_cb=None):
+def _submit_multipart(config, video_path, template_path, corners, options, progress_cb=None, status_cb=None):
     parsed = urlparse(config["base_url"])
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_URL must be an http(s) URL")
@@ -101,6 +104,7 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
     endpoint = (parsed.path.rstrip("/") + "/api/v1/jobs") or "/api/v1/jobs"
     sent = 0
     total_upload = os.path.getsize(video_path) + os.path.getsize(template_path)
+    _emit(status_cb, {"mode": "remote_gpu", "phase": "uploading", "uploaded_bytes": 0, "total_upload_bytes": total_upload})
 
     try:
         connection.putrequest("POST", endpoint)
@@ -119,6 +123,7 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
                     sent += len(chunk)
                     if progress_cb and total_upload:
                         progress_cb(min(sent / total_upload * 0.25, 0.25), "正在流式上传到 GPU 服务器")
+                    _emit(status_cb, {"mode": "remote_gpu", "phase": "uploading", "uploaded_bytes": sent, "total_upload_bytes": total_upload})
             connection.send(b"\r\n")
         connection.send(f"--{boundary}--\r\n".encode("utf-8"))
         response = connection.getresponse()
@@ -132,12 +137,17 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
     return _parse_json(body, "remote job submission")
 
 
-def _wait_for_job(config, job_id, progress_cb=None):
+def _wait_for_job(config, job_id, progress_cb=None, status_cb=None):
     deadline = time.monotonic() + float(os.environ.get("GOOD_BADMINTON_GPU_JOB_TIMEOUT", "43200"))
     while time.monotonic() < deadline:
         job = _json_request(config, f"/api/v1/jobs/{job_id}")
         state = job.get("status")
         details = job.get("progress") or {}
+        _emit(status_cb, {
+            "mode": "remote_gpu", "phase": state, "job_id": job_id,
+            "processed_frames": details.get("processed_frames", 0),
+            "total_frames": details.get("total_frames"), "ratio": details.get("ratio", 0.0),
+        })
         if progress_cb:
             ratio = float(details.get("ratio") or 0.0)
             progress_cb(0.25 + ratio * 0.75, f"GPU {state}: {details.get('processed_frames', 0)}/{details.get('total_frames') or '?'} 帧")
@@ -225,6 +235,11 @@ def _parse_json(value, label):
         return json.loads(value)
     except json.JSONDecodeError as exc:
         raise RemoteAnalysisError(f"{label} was not valid JSON") from exc
+
+
+def _emit(callback, value):
+    if callback:
+        callback(value)
 
 
 def _field_part(boundary, name, value):

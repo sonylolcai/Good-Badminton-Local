@@ -1,5 +1,8 @@
 import json
 import os
+import queue
+import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -236,49 +239,74 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "ball_model": ball_model or "weights/yolo11s-ball.pt",
     }
 
-    def progress_cb(frame, total):
-        progress(frame / total, desc=f"Processing frame {frame}/{total}")
+    events = queue.Queue()
+    finished = threading.Event()
+    outcome = {}
+    started = time.monotonic()
 
-    try:
-        remote_output_dir = os.path.join(
-            "outputs", "remote_jobs", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        )
+    def publish(event):
+        events.put(event)
 
-        def remote_progress(ratio, description):
-            progress(ratio, desc=description)
-
+    def worker():
         try:
-            result = run_remote_analysis(
-                video_path=video_file,
-                template_path=template_path,
-                corners=corners,
-                options=options,
-                output_dir=remote_output_dir,
-                progress_cb=remote_progress,
+            remote_output_dir = os.path.join(
+                "outputs", "remote_jobs", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             )
-            gr.Info("已使用远端 GPU 完成分析。")
-        except RemoteAnalysisError as remote_exc:
-            fallback_reason = str(remote_exc)
-            print(f"Remote GPU analysis failed; falling back locally: {fallback_reason}")
-            gr.Warning(f"远端 GPU 不可用，已自动切换本地分析：{fallback_reason}")
-            result = run_analysis(
-                video_path=video_file,
-                template_path=template_path,
-                corners=corners,
-                options=options,
-                progress_cb=progress_cb,
-            )
-            _write_execution_metadata(
-                result,
-                {
-                    "mode": "local_fallback",
-                    "fallback_used": True,
+            try:
+                result = run_remote_analysis(
+                    video_path=video_file, template_path=template_path, corners=corners,
+                    options=options, output_dir=remote_output_dir, status_cb=publish,
+                )
+                outcome["result"] = result
+                publish({"mode": "remote_gpu", "phase": "succeeded"})
+            except RemoteAnalysisError as remote_exc:
+                fallback_reason = str(remote_exc)
+                print(f"Remote GPU analysis failed; falling back locally: {fallback_reason}")
+                publish({"mode": "local_fallback", "phase": "local_analyzing", "fallback_reason": fallback_reason})
+
+                def local_progress(frame, total):
+                    publish({
+                        "mode": "local_fallback", "phase": "local_analyzing",
+                        "processed_frames": frame, "total_frames": total,
+                        "ratio": round(frame / total, 4) if total else 0.0,
+                        "fallback_reason": fallback_reason,
+                    })
+
+                result = run_analysis(
+                    video_path=video_file, template_path=template_path, corners=corners,
+                    options=options, progress_cb=local_progress,
+                )
+                _write_execution_metadata(result, {
+                    "mode": "local_fallback", "fallback_used": True,
                     "remote_failure": fallback_reason,
-                },
-            )
-    except Exception as exc:
-        traceback.print_exc()
-        raise gr.Error(f"分析失败：{exc}") from exc
+                })
+                outcome["result"] = result
+                publish({"mode": "local_fallback", "phase": "succeeded", "fallback_reason": fallback_reason})
+        except Exception as exc:
+            traceback.print_exc()
+            outcome["error"] = exc
+            publish({"phase": "failed", "error": str(exc)})
+        finally:
+            finished.set()
+
+    threading.Thread(target=worker, name="webui-analysis-status", daemon=True).start()
+    status = {"mode": "remote_gpu", "phase": "preparing", "elapsed_seconds": 0}
+    while not finished.is_set() or not events.empty():
+        updated = False
+        while True:
+            try:
+                status.update(events.get_nowait())
+                updated = True
+            except queue.Empty:
+                break
+        status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        if updated or status["phase"] == "preparing":
+            yield None, None, None, None, status.copy()
+        time.sleep(0.4)
+
+    if "error" in outcome:
+        raise gr.Error(f"分析失败：{outcome['error']}") from outcome["error"]
+    result = outcome["result"]
 
     for warning in result.get("warnings", []):
         gr.Warning(warning)
@@ -293,7 +321,9 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
 
     detections_file = result["detections"] if os.path.isfile(result["detections"]) else None
 
-    return output_video, viz_images or None, metadata_content, detections_file
+    status["phase"] = "succeeded"
+    status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+    yield output_video, viz_images or None, metadata_content, detections_file, status.copy()
 
 
 _UI_TEXT = {
@@ -332,6 +362,7 @@ _UI_TEXT = {
         "run_btn": "运行分析",
         "results": "### 结果",
         "out_video": "标注视频",
+        "out_status": "分析进度（远端任务）",
         "out_gallery": "热力图和散点图",
         "out_metadata": "元数据",
         "out_detections": "检测数据 (JSONL)",
@@ -382,6 +413,7 @@ _UI_TEXT = {
         "run_btn": "Run Analysis",
         "results": "### Results",
         "out_video": "Annotated Video",
+        "out_status": "Analysis Progress (Remote Job)",
         "out_gallery": "Heatmaps & Scatter Plots",
         "out_metadata": "Metadata",
         "out_detections": "Detections (JSONL)",
@@ -512,6 +544,7 @@ def _switch_language(lang):
         gr.update(value=t["step2"]),
         gr.update(value=t["run_btn"]),
         gr.update(value=t["results"]),
+        gr.update(label=t["out_status"]),
         gr.update(label=t["out_video"]),
         gr.update(label=t["out_gallery"]),
         gr.update(label=t["out_metadata"]),
@@ -595,6 +628,10 @@ def build_ui():
                 run_btn = gr.Button(t["run_btn"], variant="primary")
 
                 md_results = gr.Markdown(t["results"])
+                output_status = gr.JSON(
+                    label=t["out_status"],
+                    value={"phase": "idle", "hint": "点击运行分析后显示上传、排队、帧进度与执行来源。"},
+                )
                 output_video = gr.Video(label=t["out_video"])
                 output_gallery = gr.Gallery(label=t["out_gallery"], columns=2, height="auto")
                 output_metadata = gr.JSON(label=t["out_metadata"])
@@ -640,7 +677,7 @@ def build_ui():
             visualize_positions, yolo_pose_model, ball_model,
             md_step1, detect_btn, court_image, corner_status, apply_btn,
             md_step2, run_btn, md_results,
-            output_video, output_gallery, output_metadata, output_detections,
+            output_status, output_video, output_gallery, output_metadata, output_detections,
         ]
         language.change(fn=_switch_language, inputs=[language], outputs=lang_outputs)
 
@@ -697,7 +734,7 @@ def build_ui():
                 show_player_stats, show_pose_roi, visualize_positions,
                 yolo_pose_model, ball_model,
             ],
-            outputs=[output_video, output_gallery, output_metadata, output_detections],
+            outputs=[output_video, output_gallery, output_metadata, output_detections, output_status],
         )
 
     return demo
