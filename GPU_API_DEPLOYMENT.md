@@ -248,6 +248,22 @@ sleep 3
 curl -fsS "http://127.0.0.1:${PORT:-8080}/api/v1/health"
 ```
 
+### 容器开机自启动
+
+`nohup` 只能脱离当前终端运行；容器/实例重启后不会自动恢复。项目提供了容器启动脚本 `deploy/start_gpu_api_container.sh`。在算家云控制台的“启动命令 / 开机脚本 / 容器启动命令”字段配置：
+
+```bash
+bash /root/good-badminton-source-<commit>/deploy/start_gpu_api_container.sh /root/good-badminton-source-<commit>
+```
+
+脚本读取同目录 `.gpu-api.env` 的 `PORT=8080`、写入 `.gpu-api.pid` 与 `gpu-api.log`，并在 10 秒内验证本机健康检查。重复执行时，如果已有健康 API，会安全退出而不创建重复进程。停止命令为：
+
+```bash
+bash /root/good-badminton-source-<commit>/deploy/stop_gpu_api_container.sh /root/good-badminton-source-<commit>
+```
+
+若云平台没有启动命令能力，不能依赖 crontab 或容器内 systemd；每次开机后必须手动执行该启动脚本，或向平台申请 OpenAPI/CLI/启动钩子。
+
 分析完成、确认没有 `queued` 或 `running` 任务后再停止 API 并从平台关机。GPU 实例已关机时不能自唤醒；要实现“有任务才开机、完成就关机”，由业务服务器调用算家云 OpenAPI 或官方 CLI 执行启动、等待健康检查、提交任务、取回结果、停机的生命周期。
 
 ### 升级和回滚
