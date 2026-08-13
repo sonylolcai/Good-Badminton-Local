@@ -176,8 +176,9 @@ python -m webui.app
 1. 上传比赛视频。球场模板图为可选项：未上传时，WebUI 会从视频中均匀抽样多帧，自动选择球场检测评分最高且画面较清晰的一帧作为模板。
 2. 点击"自动选择视频帧并检测球场"。如果需要修正，可以直接在图片上点击 4 个角点后点击"应用手动角点"；也可以上传自行截取的模板图覆盖自动选帧结果。
 3. 调整分析参数（姿态模型、语言、可视化选项等）。
-4. 点击"运行分析"，等待进度条完成后查看标注视频、热力图/散点图和检测数据。
-5. 点击页面右下角的 `›_` 按钮，可以实时查看模型初始化、处理进度、FFmpeg 转码和错误堆栈等后台输出。
+4. 选择输出视频样式：“原视频标注”会在真人画面上叠加标注；“仅球场、骨架和羽毛球”会使用黑色匿名画布，只保留原机位球场线、人体骨架/位置点和羽毛球轨迹。
+5. 点击"运行分析"，等待进度条完成后查看输出视频、热力图/散点图和检测数据。
+6. 点击页面右下角的 `›_` 按钮，可以实时查看模型初始化、处理进度、FFmpeg 转码和错误堆栈等后台输出。
 
 | 球场检测与参数配置 | 分析结果查看 |
 | --- | --- |
@@ -245,8 +246,13 @@ RTMPose 模型档位：
 --pose-family                姿态模型族：rtmpose、rtmo 或 yolo-pose
 --pose-mode                  RTMPose / RTMO 档位：lightweight、balanced、performance
 --yolo-pose-model            YOLO pose 模型路径或模型名，默认 yolo11n-pose.pt
+--pose-imgsz {640,960,1280}  YOLO Pose 输入尺寸，当前固定机位基线默认 1280
+--pose-conf FLOAT             YOLO Pose 人体置信阈值，固定低清机位默认 0.15
+--far-player-enhancement true|false  启用全场640加远端ROI二次640检测，默认 false
+--far-pose-roi x1,y1,x2,y2  相对姿态检测区域的归一化远端ROI，默认 0.12,0.30,0.86,0.82
 --template-path              球场模板图路径；不传时会弹出文件选择框
 --pose-roi true|false                是否显示姿态检测 ROI 框，默认 true
+--output-video-style annotated|skeleton  输出原视频标注或匿名骨架视频，默认 annotated
 --display true|false                 是否显示 OpenCV 预览窗口，默认 true
 --skeletons true|false               是否显示人体骨架，默认 true
 --player-trajectories true|false     是否显示球员轨迹，默认 true
@@ -265,7 +271,7 @@ RTMPose 模型档位：
 默认输出到 `outputs/<视频文件名>/`：
 
 - `metadata.json`：视频、模型、球场标注和输出文件元数据。
-- `detections.jsonl`：逐帧检测记录，包含回合编号、球员、手部、球场坐标、速度和羽毛球坐标。
+- `detections.jsonl`：逐帧检测记录，包含回合编号、球员、手部、球场坐标、速度、羽毛球坐标，以及人体落点的真实/降级/缺失状态、置信度和推理来源。羽毛球额外记录 `detected / predicted / missing`、候选数量、过滤原因和短缺口长度；`predicted` 只能用于连续显示和低权重轨迹，不应当作击球/失误真值。
 - `detect_<视频文件名>.mp4`：带骨架、轨迹、统计信息和回合编号叠加层的输出视频。
 - `court_annotations.txt`：球场标注坐标缓存。
 - `position_visualizations/heatmaps/`：球员位置热力图。

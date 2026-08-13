@@ -25,6 +25,8 @@ class ShuttlecockTracker:
         roi_padding_ratio=0.08,
         max_box_area_ratio=0.004,
         max_aspect_ratio=4.0,
+        max_prediction_frames=3,
+        prediction_confidence_decay=0.6,
     ):
         self.yolo_ball_model = yolo_ball_model
         self.trajectory_length = trajectory_length
@@ -36,12 +38,19 @@ class ShuttlecockTracker:
         self.roi_padding_ratio = roi_padding_ratio
         self.max_box_area_ratio = max_box_area_ratio
         self.max_aspect_ratio = max_aspect_ratio
+        self.max_prediction_frames = max(0, int(max_prediction_frames))
+        self.prediction_confidence_decay = float(prediction_confidence_decay)
+        if not 0.0 <= self.prediction_confidence_decay <= 1.0:
+            raise ValueError("prediction_confidence_decay must be between 0 and 1")
 
         self.shuttlecock_trajectory = deque(maxlen=trajectory_length)
+        self.actual_history = deque(maxlen=trajectory_length)
         self.last_valid_position = None
+        self.last_valid_confidence = None
         self.last_candidate = None
         self.last_detection = self._empty_detection_state()
         self.missing_frames = 0
+        self.frame_index = 0
 
         if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
             self.ultra_device = 0
@@ -58,61 +67,107 @@ class ShuttlecockTracker:
         if self.show_performance_stats:
             print(f"YOLO shuttlecock inference took {time.time() - t0:.2f} sec")
 
-        candidates = self._extract_candidates(ball_results, frame.shape, roi_corners)
+        candidates, candidate_diagnostics = self._extract_candidates(
+            ball_results, frame.shape, roi_corners
+        )
         selected = self._select_candidate(candidates)
         self.last_candidate = selected
         self.last_detection = {
+            "status": "candidate" if selected is not None else "missing",
             "visible": selected is not None,
             "accepted": False,
             "image": list(selected["point"]) if selected else None,
             "confidence": selected["confidence"] if selected else None,
             "candidate_count": len(candidates),
+            "raw_candidate_count": candidate_diagnostics["raw_candidate_count"],
+            "filtered_rejections": candidate_diagnostics["filtered_rejections"],
+            "source": "ball_model" if selected is not None else None,
+            "gap_frames": 0,
+            "rejection_reason": None if selected is not None else "no_candidate",
         }
         return list(selected["point"]) if selected else [0, 0]
 
     def update_trajectory(self, ball_position, roi_corners=None):
+        self.frame_index += 1
         if ball_position == [0, 0] or ball_position is None:
-            self._record_missing_detection()
-            self._mark_detection_rejected()
-            return [0, 0]
+            return self._handle_missing("no_candidate", roi_corners)
 
         point = tuple(ball_position)
         if not self._point_in_roi(point, roi_corners):
-            self._record_missing_detection()
-            self._mark_detection_rejected()
-            return [0, 0]
+            return self._handle_missing("outside_court_roi", roi_corners)
 
         if self._is_outlier(point):
-            self._record_missing_detection()
-            self._mark_detection_rejected()
-            return [0, 0]
+            return self._handle_missing("motion_gate", roi_corners)
 
         self._append_valid_point(point)
         self.last_detection["accepted"] = True
+        self.last_detection["status"] = "detected"
         self.last_detection["image"] = list(point)
+        self.last_detection["source"] = "ball_model"
+        self.last_detection["gap_frames"] = 0
+        self.last_detection["rejection_reason"] = None
         return list(point)
+
+    def _handle_missing(self, reason, roi_corners):
+        self._record_missing_detection()
+        predicted = self._predict_missing_position()
+        if predicted is not None and self._point_in_roi(predicted, roi_corners):
+            confidence = (self.last_valid_confidence or 0.0) * (
+                self.prediction_confidence_decay ** self.missing_frames
+            )
+            self.last_detection.update(
+                {
+                    "status": "predicted",
+                    "visible": False,
+                    "accepted": False,
+                    "image": [float(predicted[0]), float(predicted[1])],
+                    "confidence": float(confidence),
+                    "source": "constant_velocity",
+                    "gap_frames": self.missing_frames,
+                    "rejection_reason": reason,
+                }
+            )
+            return [float(predicted[0]), float(predicted[1])]
+
+        self._mark_detection_rejected(reason)
+        return [0, 0]
 
     def _extract_candidates(self, ball_results, frame_shape, roi_corners):
         boxes = ball_results.boxes
         if boxes is None or boxes.xywh.shape[0] < 1:
-            return []
+            return [], {
+                "raw_candidate_count": 0,
+                "filtered_rejections": {},
+            }
 
         xywh = boxes.xywh.detach().cpu().numpy()
         confidences = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.ones(len(xywh))
         frame_area = max(1, frame_shape[0] * frame_shape[1])
 
         candidates = []
+        rejected = {
+            "invalid_geometry": 0,
+            "box_too_large": 0,
+            "aspect_ratio": 0,
+            "outside_court_roi": 0,
+        }
         for box, confidence in zip(xywh, confidences):
             center_x, center_y, width, height = [float(value) for value in box]
             if width <= 0 or height <= 0:
+                rejected["invalid_geometry"] += 1
                 continue
 
             point = (int(center_x), int(center_y))
             area_ratio = (width * height) / frame_area
             aspect_ratio = max(width / height, height / width)
-            if area_ratio > self.max_box_area_ratio or aspect_ratio > self.max_aspect_ratio:
+            if area_ratio > self.max_box_area_ratio:
+                rejected["box_too_large"] += 1
+                continue
+            if aspect_ratio > self.max_aspect_ratio:
+                rejected["aspect_ratio"] += 1
                 continue
             if not self._point_in_roi(point, roi_corners):
+                rejected["outside_court_roi"] += 1
                 continue
 
             candidates.append(
@@ -124,7 +179,12 @@ class ShuttlecockTracker:
                 }
             )
 
-        return candidates
+        return candidates, {
+            "raw_candidate_count": int(len(xywh)),
+            "filtered_rejections": {
+                reason: count for reason, count in rejected.items() if count
+            },
+        }
 
     def _select_candidate(self, candidates):
         if not candidates:
@@ -169,16 +229,32 @@ class ShuttlecockTracker:
         return False
 
     def _predict_next_position(self):
-        if len(self.shuttlecock_trajectory) < 2:
+        if len(self.actual_history) < 2:
             return self.shuttlecock_trajectory[-1]
 
-        prev_x, prev_y = self.shuttlecock_trajectory[-2]
-        last_x, last_y = self.shuttlecock_trajectory[-1]
-        return (last_x + (last_x - prev_x), last_y + (last_y - prev_y))
+        (prev_frame, (prev_x, prev_y)), (last_frame, (last_x, last_y)) = list(self.actual_history)[-2:]
+        elapsed = max(1, last_frame - prev_frame)
+        return (
+            last_x + (last_x - prev_x) / elapsed,
+            last_y + (last_y - prev_y) / elapsed,
+        )
+
+    def _predict_missing_position(self):
+        if self.missing_frames > self.max_prediction_frames or len(self.actual_history) < 2:
+            return None
+        (prev_frame, (prev_x, prev_y)), (last_frame, (last_x, last_y)) = list(self.actual_history)[-2:]
+        elapsed = max(1, last_frame - prev_frame)
+        target_elapsed = self.frame_index - last_frame
+        return (
+            last_x + ((last_x - prev_x) / elapsed) * target_elapsed,
+            last_y + ((last_y - prev_y) / elapsed) * target_elapsed,
+        )
 
     def _append_valid_point(self, point):
         self.shuttlecock_trajectory.append(point)
+        self.actual_history.append((self.frame_index, point))
         self.last_valid_position = point
+        self.last_valid_confidence = self.last_detection.get("confidence")
         self.missing_frames = 0
 
     def _record_missing_detection(self):
@@ -186,17 +262,28 @@ class ShuttlecockTracker:
         if self.missing_frames > self.max_missing_frames:
             self.last_valid_position = None
 
-    def _mark_detection_rejected(self):
+    def _mark_detection_rejected(self, reason=None):
+        self.last_detection["status"] = "missing"
         self.last_detection["accepted"] = False
         self.last_detection["image"] = None
+        self.last_detection["confidence"] = None
+        self.last_detection["source"] = None
+        self.last_detection["gap_frames"] = self.missing_frames
+        self.last_detection["rejection_reason"] = reason
 
     def _empty_detection_state(self):
         return {
+            "status": "missing",
             "visible": False,
             "accepted": False,
             "image": None,
             "confidence": None,
             "candidate_count": 0,
+            "raw_candidate_count": 0,
+            "filtered_rejections": {},
+            "source": None,
+            "gap_frames": 0,
+            "rejection_reason": None,
         }
 
     def _distance(self, point_a, point_b):
@@ -221,15 +308,23 @@ class ShuttlecockTracker:
             print(f"Drawing shuttlecock trajectory took {time.time() - t0:.2f} sec")
 
     def handle_visualization(self, frame):
-        if self.show_trajectory and self.shuttlecock_trajectory:
+        if not self.show_trajectory:
+            return
+        if self.shuttlecock_trajectory:
             self.draw_trajectory(frame)
+        if self.last_detection.get("status") == "predicted" and self.last_detection.get("image"):
+            point = tuple(int(round(value)) for value in self.last_detection["image"])
+            cv2.circle(frame, point, 7, (0, 255, 255), thickness=2, lineType=cv2.LINE_AA)
 
     def clear_trajectory(self):
         self.shuttlecock_trajectory.clear()
+        self.actual_history.clear()
         self.last_valid_position = None
+        self.last_valid_confidence = None
         self.last_candidate = None
         self.last_detection = self._empty_detection_state()
         self.missing_frames = 0
+        self.frame_index = 0
 
     def get_trajectory(self):
         return list(self.shuttlecock_trajectory)

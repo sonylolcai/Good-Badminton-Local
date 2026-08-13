@@ -434,6 +434,11 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None):
     show_player_stats = options.get("show_player_stats", True)
     show_pose_roi = options.get("show_pose_roi", True)
     visualize_positions = options.get("visualize_positions", True)
+    output_video_style = options.get("output_video_style", "annotated")
+    pose_imgsz = int(options.get("pose_imgsz", 1280))
+    pose_conf = float(options.get("pose_conf", 0.15))
+    far_player_enhancement = bool(options.get("far_player_enhancement", False))
+    far_pose_roi = options.get("far_pose_roi", (0.12, 0.30, 0.86, 0.82))
 
     system = BadmintonAnalysisSystem(
         video_path,
@@ -453,6 +458,11 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None):
         pose_family=pose_family,
         yolo_pose_model=yolo_pose_model,
         show_pose_roi=show_pose_roi,
+        output_video_style=output_video_style,
+        pose_imgsz=pose_imgsz,
+        pose_conf=pose_conf,
+        far_player_enhancement=far_player_enhancement,
+        far_pose_roi=far_pose_roi,
     )
     system.keep_audio = keep_audio
     system.process_video(progress_callback=progress_cb)

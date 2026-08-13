@@ -16,6 +16,9 @@ class PlayerPoseVisualizer:
         show_player_trajectories=True,
         show_performance_stats=False,
         court_filter_margin=0.75,
+        far_baseline_margin=3.0,
+        near_baseline_margin=None,
+        keypoint_conf_threshold=0.25,
     ):
         self.rtmpose_processor = rtmpose_processor or RTMPoseProcessor()
         self.show_skeletons = show_skeletons
@@ -23,7 +26,14 @@ class PlayerPoseVisualizer:
         self.show_performance_stats = show_performance_stats
         self.current_pose_data = None
         self.court_mapper = None
-        self.court_filter_margin = court_filter_margin
+        self.court_filter_margin = float(court_filter_margin)
+        self.far_baseline_margin = float(far_baseline_margin)
+        self.near_baseline_margin = (
+            self.court_filter_margin
+            if near_baseline_margin is None
+            else float(near_baseline_margin)
+        )
+        self.keypoint_conf_threshold = float(keypoint_conf_threshold)
 
         self.skeleton_connections = [
             (5, 6),
@@ -46,7 +56,7 @@ class PlayerPoseVisualizer:
         point_right_hands = {}
 
         t0 = time.time()
-        keypoints_all, _confidence_scores = self.rtmpose_processor.process_frame(roi)
+        keypoints_all, confidence_scores = self.rtmpose_processor.process_frame(roi)
         if self.show_performance_stats:
             inference_name = getattr(self.rtmpose_processor, "inference_name", "Pose")
             print(f"{inference_name} inference took {time.time() - t0:.2f} sec")
@@ -56,34 +66,65 @@ class PlayerPoseVisualizer:
             return centroids, point_left_hands, point_right_hands
 
         persons = self._normalize_people(keypoints_all)
+        detailed_detections = self._get_detailed_detections()
         filtered_people = []
+        filtered_detections = []
+        locations = []
         active_court_mapper = court_mapper or self.court_mapper
 
-        for kp in persons:
+        for index, kp in enumerate(persons):
             kp_arr = np.asarray(kp)
             if kp_arr.ndim != 2 or kp_arr.shape[0] < 17 or kp_arr.shape[1] < 2:
                 continue
 
-            lf = kp_arr[15]
-            rf = kp_arr[16]
-            if lf[0] <= 1 or lf[1] <= 1 or rf[0] <= 1 or rf[1] <= 1:
+            detail = detailed_detections[index] if index < len(detailed_detections) else {}
+            scores = detail.get("keypoint_scores")
+            if scores is None and confidence_scores is not None and index < len(confidence_scores):
+                scores = np.asarray(confidence_scores[index])
+            bbox = detail.get("bbox")
+            if bbox is None:
+                bbox = self._bbox_from_keypoints(kp_arr)
+            location = self._select_ground_point(
+                kp_arr,
+                keypoint_scores=scores,
+                bbox=bbox,
+                person_confidence=detail.get("confidence", 1.0),
+            )
+            if location is None:
                 continue
 
-            mid_point = (
-                (float(lf[0] + x1) + float(rf[0] + x1)) / 2,
-                (float(lf[1] + y1) + float(rf[1] + y1)) / 2 + 10,
-            )
+            local_point = location["point"]
+            mid_point = (float(local_point[0] + x1), float(local_point[1] + y1))
             if not self._is_on_court(mid_point, active_court_mapper):
                 continue
 
             filtered_people.append(kp_arr)
             centroids.append(mid_point)
 
+            global_detail = self._globalize_detection(detail, kp_arr, bbox, x1, y1)
+            global_detail.update(
+                {
+                    "location": [mid_point[0], mid_point[1]],
+                    "location_method": location["method"],
+                    "location_confidence": location["confidence"],
+                    "location_degraded": location["degraded"],
+                }
+            )
+            filtered_detections.append(global_detail)
+            locations.append(
+                {
+                    "point": [mid_point[0], mid_point[1]],
+                    "method": location["method"],
+                    "confidence": location["confidence"],
+                    "degraded": location["degraded"],
+                }
+            )
+
             lh = kp_arr[9]
             rh = kp_arr[10]
-            if lh[0] > 1 and lh[1] > 1:
+            if self._keypoint_is_visible(lh, scores, 9):
                 point_left_hands[mid_point[1]] = (int(lh[0] + x1), int(lh[1] + y1))
-            if rh[0] > 1 and rh[1] > 1:
+            if self._keypoint_is_visible(rh, scores, 10):
                 point_right_hands[mid_point[1]] = (int(rh[0] + x1), int(rh[1] + y1))
 
         if filtered_people:
@@ -91,11 +132,99 @@ class PlayerPoseVisualizer:
                 "keypoints": np.asarray(filtered_people),
                 "offset_x": x1,
                 "offset_y": y1,
+                "detections": filtered_detections,
+                "locations": locations,
             }
         else:
             self.current_pose_data = None
 
         return centroids, point_left_hands, point_right_hands
+
+    def _get_detailed_detections(self):
+        getter = getattr(self.rtmpose_processor, "get_last_detections", None)
+        if not callable(getter):
+            return []
+        detections = getter()
+        return detections if isinstance(detections, list) else []
+
+    @staticmethod
+    def _bbox_from_keypoints(keypoints):
+        points = np.asarray(keypoints, dtype=float)
+        valid = np.isfinite(points[:, :2]).all(axis=1)
+        valid &= (points[:, 0] > 1) & (points[:, 1] > 1)
+        if not np.any(valid):
+            return None
+        visible = points[valid, :2]
+        return np.asarray(
+            [visible[:, 0].min(), visible[:, 1].min(), visible[:, 0].max(), visible[:, 1].max()],
+            dtype=float,
+        )
+
+    def _keypoint_is_visible(self, point, scores, index):
+        point = np.asarray(point, dtype=float)
+        if point.size < 2 or not np.isfinite(point[:2]).all() or point[0] <= 1 or point[1] <= 1:
+            return False
+        if scores is None or index >= len(scores):
+            return True
+        score = float(scores[index])
+        return np.isfinite(score) and score >= self.keypoint_conf_threshold
+
+    def _select_ground_point(self, keypoints, keypoint_scores=None, bbox=None, person_confidence=1.0):
+        """Select a court contact point and expose whether it used degraded evidence."""
+        points = np.asarray(keypoints, dtype=float)
+        scores = None if keypoint_scores is None else np.asarray(keypoint_scores, dtype=float).reshape(-1)
+        try:
+            base_confidence = float(np.clip(person_confidence, 0.0, 1.0))
+        except (TypeError, ValueError):
+            base_confidence = 0.0
+
+        left_visible = self._keypoint_is_visible(points[15], scores, 15)
+        right_visible = self._keypoint_is_visible(points[16], scores, 16)
+        if left_visible and right_visible:
+            point = (points[15, :2] + points[16, :2]) / 2.0
+            ankle_confidence = 1.0 if scores is None else min(float(scores[15]), float(scores[16]))
+            return {
+                "point": point,
+                "method": "ankles_midpoint",
+                "confidence": float(np.clip(base_confidence * ankle_confidence, 0.0, 1.0)),
+                "degraded": False,
+            }
+
+        if left_visible or right_visible:
+            ankle_index = 15 if left_visible else 16
+            ankle_confidence = 1.0 if scores is None else float(scores[ankle_index])
+            return {
+                "point": points[ankle_index, :2].copy(),
+                "method": "single_ankle",
+                "confidence": float(np.clip(base_confidence * ankle_confidence * 0.75, 0.0, 1.0)),
+                "degraded": True,
+            }
+
+        if bbox is None:
+            return None
+        bbox = np.asarray(bbox, dtype=float).reshape(-1)
+        if bbox.size < 4 or not np.isfinite(bbox[:4]).all() or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            return None
+        return {
+            "point": np.asarray([(bbox[0] + bbox[2]) / 2.0, bbox[3]], dtype=float),
+            "method": "bbox_bottom_center",
+            "confidence": float(np.clip(base_confidence * 0.35, 0.0, 1.0)),
+            "degraded": True,
+        }
+
+    @staticmethod
+    def _globalize_detection(detail, keypoints, bbox, offset_x, offset_y):
+        global_detail = dict(detail)
+        global_keypoints = np.asarray(keypoints, dtype=float).copy()
+        global_keypoints[:, 0] += offset_x
+        global_keypoints[:, 1] += offset_y
+        global_detail["keypoints"] = global_keypoints
+        if bbox is not None:
+            global_bbox = np.asarray(bbox, dtype=float).copy()
+            global_bbox[[0, 2]] += offset_x
+            global_bbox[[1, 3]] += offset_y
+            global_detail["bbox"] = global_bbox
+        return global_detail
 
     def _normalize_people(self, keypoints):
         if isinstance(keypoints, np.ndarray):
@@ -115,8 +244,11 @@ class PlayerPoseVisualizer:
         if court_position is None or len(court_position) < 2:
             return False
         x, y = float(court_position[0]), float(court_position[1])
-        margin = self.court_filter_margin
-        return -margin <= x <= 6.1 + margin and -margin <= y <= 13.4 + margin
+        lateral_margin = self.court_filter_margin
+        return (
+            -lateral_margin <= x <= 6.1 + lateral_margin
+            and -self.far_baseline_margin <= y <= 13.4 + self.near_baseline_margin
+        )
 
     def draw_players(self, frame, player_tracker, cached_movement_stats, stats_visualizer=None, rally_count=0):
         if self.show_skeletons and self.current_pose_data is not None:

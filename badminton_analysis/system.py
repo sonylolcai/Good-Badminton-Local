@@ -66,7 +66,10 @@ class BadmintonAnalysisSystem:
                  save_images=False, language='zh', output_dir=None,
                  ball_model_path='weights/yolo11s-ball.pt', template_path=None,
                  pose_mode='balanced', pose_family='rtmpose',
-                 yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True):
+                 yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True,
+                 output_video_style='annotated', pose_imgsz=1280,
+                 pose_conf=0.15, far_player_enhancement=False,
+                 far_pose_roi=(0.12, 0.30, 0.86, 0.82)):
         self.video_path = video_path
         self.show_display = show_display
         self.language = language
@@ -76,6 +79,17 @@ class BadmintonAnalysisSystem:
         self.pose_family = pose_family
         self.yolo_pose_model = yolo_pose_model
         self.show_pose_roi = show_pose_roi
+        self.pose_imgsz = int(pose_imgsz)
+        self.pose_conf = float(pose_conf)
+        if not 0.0 < self.pose_conf <= 1.0:
+            raise ValueError("pose_conf must be greater than 0 and no more than 1")
+        self.far_player_enhancement = bool(far_player_enhancement)
+        self.far_pose_roi = tuple(float(value) for value in far_pose_roi)
+        if output_video_style not in {'annotated', 'skeleton'}:
+            raise ValueError(
+                "output_video_style must be 'annotated' or 'skeleton'."
+            )
+        self.output_video_style = output_video_style
 
 
         self.show_skeletons = show_skeletons
@@ -99,7 +113,13 @@ class BadmintonAnalysisSystem:
             )
         
         if self.pose_family == 'yolo-pose':
-            self.rtmpose_processor = YOLOPoseProcessor(model_path=self.yolo_pose_model)
+            self.rtmpose_processor = YOLOPoseProcessor(
+                model_path=self.yolo_pose_model,
+                imgsz=self.pose_imgsz,
+                conf=self.pose_conf,
+                asymmetric=self.far_player_enhancement,
+                far_roi=self.far_pose_roi,
+            )
         else:
             self.rtmpose_processor = RTMPoseProcessor(mode=self.pose_mode, pose_family=self.pose_family)
         self.yolo_ball_model = YOLO(self.ball_model_path)
@@ -117,7 +137,8 @@ class BadmintonAnalysisSystem:
 
         self.metadata_path = os.path.join(self.save_dir, "metadata.json")
         self.detections_path = os.path.join(self.save_dir, "detections.jsonl")
-        self.output_video_path = os.path.join(self.save_dir, f"detect_{self.video_name}.mp4")
+        output_prefix = "skeleton" if self.output_video_style == "skeleton" else "detect"
+        self.output_video_path = os.path.join(self.save_dir, f"{output_prefix}_{self.video_name}.mp4")
         self.detection_writer = None
         
 
@@ -249,6 +270,25 @@ class BadmintonAnalysisSystem:
             },
             "models": {
                 "shuttlecock": self.ball_model_path,
+                "pose": {
+                    "family": self.pose_family,
+                    "model": self.yolo_pose_model if self.pose_family == "yolo-pose" else self.pose_mode,
+                    "imgsz": self.pose_imgsz if self.pose_family == "yolo-pose" else None,
+                    "conf": self.pose_conf if self.pose_family == "yolo-pose" else None,
+                    "detection_plan": (
+                        "full_640+far_roi_640"
+                        if self.pose_family == "yolo-pose" and self.far_player_enhancement
+                        else f"full_{self.pose_imgsz}"
+                        if self.pose_family == "yolo-pose"
+                        else "native"
+                    ),
+                    "far_roi_normalized": list(self.far_pose_roi) if self.far_player_enhancement else None,
+                    "court_filter_margins_m": {
+                        "lateral": self.player_pose_visualizer.court_filter_margin,
+                        "far_baseline": self.player_pose_visualizer.far_baseline_margin,
+                        "near_baseline": self.player_pose_visualizer.near_baseline_margin,
+                    },
+                },
             },
             "court": {
                 "template_path": template_path,
@@ -264,6 +304,14 @@ class BadmintonAnalysisSystem:
             "outputs": {
                 "video": self.output_video_path,
                 "detections": self.detections_path,
+                "video_style": self.output_video_style,
+            },
+            "temporal_tracking": {
+                "shuttlecock": {
+                    "max_prediction_frames": self.shuttlecock_tracker.max_prediction_frames,
+                    "prediction_confidence_decay": self.shuttlecock_tracker.prediction_confidence_decay,
+                    "prediction_usage": "visualization_and_export_only; exclude from hit/error ground truth",
+                },
             },
         }
         write_json(self.metadata_path, metadata)
@@ -299,19 +347,15 @@ class BadmintonAnalysisSystem:
 
 
         if not is_court:
-            self._write_output_frame(frame, frame_count, out)
-            return frame, detect_frame_count
+            output_frame = self._create_output_frame(frame)
+            self._write_output_frame(output_frame, frame_count, out)
+            return output_frame, detect_frame_count
 
         detect_frame_count += 1
 
         x1, y1 = roi_corners[0]
         x2, y2 = roi_corners[1]
         roi = frame[y1:y2, x1:x2]
-        if self.show_pose_roi:
-            cv2.rectangle(frame, roi_corners[0], roi_corners[1], (255, 0, 0), 2)
-            cv2.putText(frame, "Pose ROI", (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2, cv2.LINE_AA)
-
-
         pose_t0 = time.time()
         centroids, point_left_hands, point_right_hands = self.player_pose_visualizer.detect_players(roi, x1, y1)
         pose_elapsed = time.time() - pose_t0
@@ -322,13 +366,17 @@ class BadmintonAnalysisSystem:
         ball_position = self.shuttlecock_tracker.update_trajectory(detected_ball_position, roi_corners)
         
 
-        shuttle_draw_t0 = time.time()
-        self.shuttlecock_tracker.handle_visualization(frame)
-        shuttle_draw_elapsed = time.time() - shuttle_draw_t0
-        
-
-        players = self.player_tracker.update(frame_count, centroids, ball_position, 
-                                             point_left_hands, point_right_hands, detect_frame_count)
+        pose_data = self.player_pose_visualizer.get_current_pose_data() or {}
+        players = self.player_tracker.update(
+            frame_count,
+            centroids,
+            ball_position,
+            point_left_hands,
+            point_right_hands,
+            detect_frame_count,
+            pose_detections=pose_data.get("detections"),
+            ball_detection=self.shuttlecock_tracker.get_last_detection(),
+        )
         
 
         if frame_count == 1 or not self.cached_movement_stats:
@@ -347,13 +395,26 @@ class BadmintonAnalysisSystem:
             and frame_count % self.performance_log_interval_frames == 0
         )
 
+        output_frame = self._create_output_frame(frame)
+        if self.output_video_style == "annotated" and self.show_pose_roi:
+            cv2.rectangle(output_frame, roi_corners[0], roi_corners[1], (255, 0, 0), 2)
+            cv2.putText(output_frame, "Pose ROI", (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2, cv2.LINE_AA)
+
+        shuttle_draw_t0 = time.time()
+        self.shuttlecock_tracker.handle_visualization(output_frame)
+        shuttle_draw_elapsed = time.time() - shuttle_draw_t0
+
         t0 = time.time()
 
         self.player_pose_visualizer.draw_players(
-            frame=frame, 
+            frame=output_frame,
             player_tracker=self.player_tracker, 
             cached_movement_stats=self.cached_movement_stats,
-            stats_visualizer=self.stats_visualizer if self.show_player_stats else None,
+            stats_visualizer=(
+                self.stats_visualizer
+                if self.show_player_stats and self.output_video_style == "annotated"
+                else None
+            ),
             rally_count=self.rally_count
         )
         t1 = time.time()
@@ -361,9 +422,9 @@ class BadmintonAnalysisSystem:
         
 
         court_draw_elapsed = 0.0
-        if self.show_court_trajectory:
+        if self.show_court_trajectory and self.output_video_style == "annotated":
             t0 = time.time()
-            frame = self.court_trajectory_visualizer.draw_overlay(frame, self.player_tracker.court_history)
+            output_frame = self.court_trajectory_visualizer.draw_overlay(output_frame, self.player_tracker.court_history)
             t1 = time.time()
             court_draw_elapsed = t1 - t0
 
@@ -377,8 +438,18 @@ class BadmintonAnalysisSystem:
             )
         
 
-        self._write_output_frame(frame, frame_count, out)
-        return frame, detect_frame_count
+        self._write_output_frame(output_frame, frame_count, out)
+        return output_frame, detect_frame_count
+
+    def _create_output_frame(self, source_frame):
+        """Create either the normal annotation canvas or an anonymous line canvas."""
+        if self.output_video_style != "skeleton":
+            return source_frame
+
+        canvas = np.zeros_like(source_frame)
+        if hasattr(self, "court_mapper"):
+            canvas, _ = self.court_mapper.draw_court_overlay(canvas)
+        return canvas
 
     def _write_output_frame(self, frame, frame_count, out):
         """Write every source frame so the exported video keeps its full timeline."""

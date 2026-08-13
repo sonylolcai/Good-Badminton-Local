@@ -247,8 +247,13 @@ RTMPose / RTMO modes:
 --pose-family                Pose model family: rtmpose, rtmo, or yolo-pose
 --pose-mode                  RTMPose / RTMO mode: lightweight, balanced, performance
 --yolo-pose-model            YOLO pose model path or model name, default yolo11n-pose.pt
+--pose-imgsz {640,960,1280}  YOLO Pose input size; fixed-camera baseline defaults to 1280
+--pose-conf FLOAT             YOLO Pose person-confidence threshold; low-resolution fixed-camera default is 0.15
+--far-player-enhancement true|false  Enable full-frame 640 plus far-ROI 640 inference, default false
+--far-pose-roi x1,y1,x2,y2  Normalized far ROI relative to the pose crop, default 0.12,0.30,0.86,0.82
 --template-path              Court template image path; opens a file picker if omitted
 --pose-roi true|false                Show pose-detection ROI box, default true
+--output-video-style annotated|skeleton  Export annotated source or anonymous skeleton video, default annotated
 --display true|false                 Show OpenCV preview window, default true
 --skeletons true|false               Show human skeletons, default true
 --player-trajectories true|false     Show player trajectories, default true

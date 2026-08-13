@@ -170,6 +170,8 @@ def ensure_court_for_analysis(video_file, template_path, corners, click_corners,
 
 def run_full_analysis(analysis_ready, video_file, template_path, corners,
                       pose_family, pose_mode, language, audio,
+                      output_video_style,
+                      pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
                       show_skeletons, show_player_trajectories,
                       show_court_trajectory, show_shuttlecock_trajectory,
                       show_player_stats, show_pose_roi, visualize_positions,
@@ -187,11 +189,26 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
 
     _validate_file_size(video_file, _MAX_VIDEO_BYTES, "Video")
 
+    try:
+        parsed_far_roi = tuple(float(item.strip()) for item in far_pose_roi.split(','))
+    except (AttributeError, ValueError) as exc:
+        raise gr.Error("远端 ROI 必须是 x1,y1,x2,y2 四个归一化数值。") from exc
+    if len(parsed_far_roi) != 4 or not (
+        0 <= parsed_far_roi[0] < parsed_far_roi[2] <= 1
+        and 0 <= parsed_far_roi[1] < parsed_far_roi[3] <= 1
+    ):
+        raise gr.Error("远端 ROI 必须满足 0 <= x1 < x2 <= 1 且 0 <= y1 < y2 <= 1。")
+
     options = {
         "pose_family": pose_family,
         "pose_mode": pose_mode,
         "language": language,
         "audio": audio,
+        "output_video_style": output_video_style,
+        "pose_imgsz": int(pose_imgsz),
+        "pose_conf": float(pose_conf),
+        "far_player_enhancement": far_player_enhancement,
+        "far_pose_roi": parsed_far_roi,
         "show_skeletons": show_skeletons,
         "show_player_trajectories": show_player_trajectories,
         "show_court_trajectory": show_court_trajectory,
@@ -245,6 +262,11 @@ _UI_TEXT = {
         "pose_mode": "姿态模式",
         "language": "语言 / Language",
         "audio": "保留音频",
+        "output_style": "输出视频样式",
+        "pose_imgsz": "YOLO Pose 输入尺寸",
+        "pose_conf": "远端人体置信阈值",
+        "far_player_enhancement": "远端球员增强（全场640 + 远端ROI 640）",
+        "far_pose_roi": "远端 ROI（相对姿态区域 x1,y1,x2,y2）",
         "advanced": "高级选项",
         "skeletons": "显示骨架",
         "player_traj": "显示球员轨迹",
@@ -290,6 +312,11 @@ _UI_TEXT = {
         "pose_mode": "Pose Mode",
         "language": "Language / 语言",
         "audio": "Keep Audio",
+        "output_style": "Output Video Style",
+        "pose_imgsz": "YOLO Pose Input Size",
+        "pose_conf": "Far-player confidence threshold",
+        "far_player_enhancement": "Far-player enhancement (full 640 + far ROI 640)",
+        "far_pose_roi": "Far ROI (relative pose region x1,y1,x2,y2)",
         "advanced": "Advanced Options",
         "skeletons": "Show Skeletons",
         "player_traj": "Show Player Trajectories",
@@ -417,6 +444,11 @@ def _switch_language(lang):
         gr.update(label=t["pose_family"]),
         gr.update(label=t["pose_mode"]),
         gr.update(label=t["audio"]),
+        gr.update(label=t["output_style"]),
+        gr.update(label=t["pose_imgsz"]),
+        gr.update(label=t["pose_conf"]),
+        gr.update(label=t["far_player_enhancement"]),
+        gr.update(label=t["far_pose_roi"]),
         gr.update(label=t["advanced"]),
         gr.update(label=t["skeletons"]),
         gr.update(label=t["player_traj"]),
@@ -475,6 +507,26 @@ def build_ui():
                     value="zh", label=t["language"],
                 )
                 audio = gr.Checkbox(value=True, label=t["audio"])
+                output_video_style = gr.Radio(
+                    choices=[
+                        ("原视频标注 / Annotated source", "annotated"),
+                        ("仅球场、骨架和羽毛球 / Skeleton only", "skeleton"),
+                    ],
+                    value="skeleton", label=t["output_style"],
+                )
+                pose_imgsz = gr.Dropdown(
+                    choices=[640, 960, 1280], value=1280, label=t["pose_imgsz"],
+                )
+                pose_conf = gr.Slider(
+                    minimum=0.10, maximum=0.50, step=0.01, value=0.15,
+                    label=t["pose_conf"],
+                )
+                far_player_enhancement = gr.Checkbox(
+                    value=False, label=t["far_player_enhancement"],
+                )
+                far_pose_roi = gr.Textbox(
+                    value="0.12,0.30,0.86,0.82", label=t["far_pose_roi"],
+                )
 
                 with gr.Accordion(t["advanced"], open=False) as adv_accordion:
                     show_skeletons = gr.Checkbox(value=True, label=t["skeletons"])
@@ -536,7 +588,8 @@ def build_ui():
 
         lang_outputs = [
             md_title, md_inputs, video_input, template_input,
-            md_settings, pose_family, pose_mode, audio, adv_accordion,
+            md_settings, pose_family, pose_mode, audio, output_video_style,
+            pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi, adv_accordion,
             show_skeletons, show_player_trajectories, show_court_trajectory,
             show_shuttlecock_trajectory, show_player_stats, show_pose_roi,
             visualize_positions, yolo_pose_model, ball_model,
@@ -592,7 +645,8 @@ def build_ui():
             fn=run_full_analysis,
             inputs=[
                 analysis_ready_state, video_input, template_path_state, corners_state,
-                pose_family, pose_mode, language, audio,
+                pose_family, pose_mode, language, audio, output_video_style,
+                pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
                 show_skeletons, show_player_trajectories,
                 show_court_trajectory, show_shuttlecock_trajectory,
                 show_player_stats, show_pose_roi, visualize_positions,
@@ -606,4 +660,9 @@ def build_ui():
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.queue(default_concurrency_limit=1).launch(theme=gr.themes.Soft(), css=_APP_CSS)
+    demo.queue(default_concurrency_limit=1).launch(
+        server_name="127.0.0.1",
+        server_port=7861,
+        theme=gr.themes.Soft(),
+        css=_APP_CSS,
+    )

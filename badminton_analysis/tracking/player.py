@@ -56,6 +56,13 @@ class PlayerTracker:
                 "left": None,
                 "right": None,
             },
+            "position_evidence": {
+                "status": "missing",
+                "method": None,
+                "confidence": 0.0,
+                "degraded": False,
+                "source": None,
+            },
         }
 
     def _initialize_player_record(self):
@@ -77,9 +84,34 @@ class PlayerTracker:
             return None
         return [float(x), float(y)]
 
-    def write_detection_record(self, frame_index, players_record, ball_image_position, detect_frame_count):
+    def write_detection_record(self, frame_index, players_record, ball_image_position, detect_frame_count,
+                               ball_detection=None):
         if self.detection_writer is None:
             return
+
+        shuttlecock_record = {
+            "image": self._point_or_none(ball_image_position, zero_is_none=True),
+            "status": "missing",
+            "confidence": None,
+            "source": None,
+            "gap_frames": 0,
+            "accepted": False,
+        }
+        if ball_detection:
+            shuttlecock_record.update(
+                {
+                    "status": ball_detection.get("status", "missing"),
+                    "confidence": ball_detection.get("confidence"),
+                    "source": ball_detection.get("source"),
+                    "gap_frames": int(ball_detection.get("gap_frames", 0)),
+                    "accepted": bool(ball_detection.get("accepted", False)),
+                    "visible": bool(ball_detection.get("visible", False)),
+                    "candidate_count": int(ball_detection.get("candidate_count", 0)),
+                    "raw_candidate_count": int(ball_detection.get("raw_candidate_count", 0)),
+                    "filtered_rejections": dict(ball_detection.get("filtered_rejections", {})),
+                    "rejection_reason": ball_detection.get("rejection_reason"),
+                }
+            )
 
         record = {
             "schema_version": "1.0",
@@ -87,14 +119,14 @@ class PlayerTracker:
             "time_sec": round(frame_index / self.fps, 6) if self.fps else None,
             "detect_frame": int(detect_frame_count),
             "players": players_record,
-            "shuttlecock": {
-                "image": self._point_or_none(ball_image_position, zero_is_none=True),
-            },
+            "shuttlecock": shuttlecock_record,
         }
         self.detection_writer.write(record)
 
-    def update(self, frame_index, centroids, ball_image_position, left_hand_positions, right_hand_positions, detect_frame_count):
+    def update(self, frame_index, centroids, ball_image_position, left_hand_positions, right_hand_positions,
+               detect_frame_count, pose_detections=None, ball_detection=None):
         players_record = self._initialize_player_record()
+        pose_detections = pose_detections or []
 
         for region in ["upper", "lower"]:
             if self.players[region] is not None:
@@ -109,9 +141,15 @@ class PlayerTracker:
             else:
                 lower_court_centroids.append(centroid)
 
-        if len(upper_court_centroids) > 1:
-            upper_court_centroids.sort(key=lambda p: -p[1])
-            upper_court_centroids = [upper_court_centroids[0]]
+        # Keep one observation for each legacy slot.  Applying this policy only
+        # to the upper slot made the lower slot depend on YOLO result ordering:
+        # the last incidental person could overwrite the tracked player.
+        upper_court_centroids = self._select_region_candidate(
+            "upper", upper_court_centroids
+        )
+        lower_court_centroids = self._select_region_candidate(
+            "lower", lower_court_centroids
+        )
 
         filtered_centroids = upper_court_centroids + lower_court_centroids
 
@@ -120,16 +158,110 @@ class PlayerTracker:
                 region = "upper" if centroid[1] < self.threshold else "lower"
                 left_hand = left_hand_positions.get(centroid[1])
                 right_hand = right_hand_positions.get(centroid[1])
-                self._update_player_position(region, centroid, left_hand, right_hand, players_record)
+                pose_detection = self._find_pose_detection(centroid, pose_detections)
+                self._update_player_position(
+                    region, centroid, left_hand, right_hand, players_record, pose_detection
+                )
             except Exception as exc:
                 print(f"Error processing player position: {exc}")
                 import traceback
                 traceback.print_exc()
 
-        self.write_detection_record(frame_index, players_record, ball_image_position, detect_frame_count)
+        self.write_detection_record(
+            frame_index,
+            players_record,
+            ball_image_position,
+            detect_frame_count,
+            ball_detection=ball_detection,
+        )
         return self.players
 
-    def _update_player_position(self, region, centroid, left_hand_pos, right_hand_pos, players_record):
+    def _select_region_candidate(self, region, candidates):
+        """Return one deterministic candidate for a temporary legacy slot.
+
+        Existing fixed-camera processing still exposes ``upper`` and ``lower``
+        output fields.  Until it is migrated to persistent track IDs, retain
+        temporal continuity when a prior player location exists.  On the first
+        frame, choose the candidate furthest toward the camera in image space;
+        this preserves the former upper-slot behaviour and applies it equally
+        to the lower slot.
+        """
+        if not candidates:
+            return []
+
+        previous = self.players[region]
+        if previous is None:
+            selected = max(candidates, key=lambda point: point[1])
+        else:
+            selected = min(
+                candidates,
+                key=lambda point: float(
+                    np.hypot(point[0] - previous[0], point[1] - previous[1])
+                ),
+            )
+        return [selected]
+
+    @staticmethod
+    def _find_pose_detection(centroid, pose_detections):
+        best = None
+        best_distance = float("inf")
+        for detection in pose_detections:
+            location = detection.get("location")
+            if not location or len(location) < 2:
+                continue
+            distance = float(np.hypot(float(location[0]) - centroid[0], float(location[1]) - centroid[1]))
+            if distance < best_distance:
+                best = detection
+                best_distance = distance
+        return best if best_distance <= 2.0 else None
+
+    @staticmethod
+    def _serializable_list(value):
+        if value is None:
+            return None
+        array = np.asarray(value, dtype=float)
+        return array.tolist()
+
+    def _position_evidence(self, pose_detection):
+        if not pose_detection:
+            return {
+                "status": "detected",
+                "method": "legacy_pose_location",
+                "confidence": None,
+                "degraded": False,
+                "source": "pose_model",
+            }
+        degraded = bool(pose_detection.get("location_degraded", False))
+        inference = pose_detection.get("inference") or {}
+        return {
+            "status": "detected_degraded" if degraded else "detected",
+            "method": pose_detection.get("location_method", "unknown"),
+            "confidence": (
+                float(pose_detection["location_confidence"])
+                if pose_detection.get("location_confidence") is not None
+                else None
+            ),
+            "degraded": degraded,
+            "source": pose_detection.get("source", "pose_model"),
+            "merged_sources": list(pose_detection.get("merged_sources", [])),
+            "person_confidence": (
+                float(pose_detection["confidence"])
+                if pose_detection.get("confidence") is not None
+                else None
+            ),
+            "bbox_xyxy": self._serializable_list(pose_detection.get("bbox")),
+            "inference": {
+                "model": inference.get("model"),
+                "imgsz": inference.get("imgsz"),
+                "conf": inference.get("conf"),
+                "device": inference.get("device"),
+                "roi": list(inference.get("roi", [])),
+                "input_shape": list(inference.get("input_shape", [])),
+            },
+        }
+
+    def _update_player_position(self, region, centroid, left_hand_pos, right_hand_pos, players_record,
+                                pose_detection=None):
         self.players[region] = centroid
         self.history[region].append(centroid)
 
@@ -140,6 +272,7 @@ class PlayerTracker:
         player_record["image"] = self._point_or_none(centroid)
         player_record["court"] = self._point_or_none(court_position)
         player_record["speed"] = float(self.current_speed[region])
+        player_record["position_evidence"] = self._position_evidence(pose_detection)
         if left_hand_pos:
             player_record["hands"]["left"] = self._point_or_none(left_hand_pos)
         if right_hand_pos:
