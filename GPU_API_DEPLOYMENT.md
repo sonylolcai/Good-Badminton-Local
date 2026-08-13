@@ -85,6 +85,19 @@ GOOD_BADMINTON_SKIP_GIT_SYNC=1 ./deploy/install_gpu_api.sh ~/good-badminton-sour
 
 脚本会安装与驱动兼容的 CUDA PyTorch、其他项目依赖、创建只允许当前用户读取的 `.gpu-api.env` 并运行 API 测试。存在可用 systemd 时，它会配置 systemd 服务；多数租赁 GPU 容器没有 systemd 时，则自动以后台 `uvicorn` 进程启动，并在项目目录记录 `.gpu-api.pid` 和 `gpu-api.log`。密钥只存在 `.gpu-api.env`，不要提交、截图或发到聊天中。
 
+### 无公网但镜像已自带 GPU PyTorch
+
+一些租赁实例禁止访问 `download.pytorch.org`，却已有可用的 CUDA PyTorch。先确认 `python3 -c 'import torch; print(torch.cuda.is_available())'` 输出 `True`。将其余 Linux x86_64 / Python 3.12 依赖 wheel 上传到一个目录（例如 `/root/good-badminton-wheelhouse`）后，执行：
+
+```bash
+GOOD_BADMINTON_SKIP_GIT_SYNC=1 \
+GOOD_BADMINTON_USE_SYSTEM_TORCH=1 \
+GOOD_BADMINTON_WHEELHOUSE=/root/good-badminton-wheelhouse \
+./deploy/install_gpu_api.sh /root/good-badminton-source fixed-camera-singles-spatial-tracking
+```
+
+此模式不会创建隔离 venv 或下载/覆盖镜像的 PyTorch；其他依赖仅从上传的 wheel 目录安装，缺包会明确失败而不会访问公网。
+
 启动后在实例内检查：
 
 ```bash
