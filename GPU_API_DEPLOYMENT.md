@@ -117,6 +117,28 @@ tail -f ~/good-badminton/gpu-api.log
 
 公开端口前至少完成其一：只允许业务服务器 IP 访问 8001，或让 API 仅绑定 `127.0.0.1` 并经 SSH/VPN/反向代理访问。API Key 是访问控制，不是 HTTPS；跨公网调用应由反向代理提供 TLS。
 
+## 已验证的算家云部署记录（2026-08-13）
+
+| 项目 | 已验证配置 |
+| --- | --- |
+| 实例 | RTX 3090 24 GiB，NVIDIA 驱动 535.154.05 |
+| 系统 Python | Conda Python 3.12.7；自带 `torch 2.5.1`、CUDA 12.4，`torch.cuda.is_available()` 为 `True` |
+| API 监听 | 容器内 `0.0.0.0:8001`，由 `python3 -m uvicorn api.app:app` 启动 |
+| 公网映射 | `http://xn-g.suanjiayun.com:52028` |
+| 公网验收 | `GET /api/v1/health` 返回 HTTP 200 和 `status: ok`；根路径 `/` 返回 404 属于预期 |
+| 鉴权 | 除健康检查外，接口均需要 `.gpu-api.env` 中 API Key 对应的 `X-API-Key` |
+| 网络限制 | 实例无法访问 GitHub、codeload、PyTorch wheel 官方站和 APT 源；普通 pip 依赖可通过镜像安装 |
+
+### 当前环境的安全措施
+
+将公网 `52028/TCP` 的入站来源限制为业务服务器的公网 IP。不要把 `.gpu-api.env` 上传、提交或发送到聊天中。
+
+### 后续升级方式
+
+该实例无法从 GitHub 拉取分支，因此不能直接 `git pull`。每次升级建议由本地从指定提交打包源码 zip，经平台上传后解压到新目录（例如 `/root/good-badminton-source-<commit>`）；在新目录安装/复用依赖、启动到临时端口并执行健康检查后，再停止旧 PID 并切换正式端口。这保留可回退的旧目录和旧进程。
+
+只有纯 Python 代码的小修复，也可以上传补丁文件并在实例内 `patch -p1`；但涉及依赖、模型、部署脚本或多个文件时，一律上传完整、带提交号的源码包，减少版本漂移。
+
 ## 停止与关机
 
 处理完成后先确认没有 `queued` 或 `running` 任务，再停止服务并关机：
