@@ -43,7 +43,7 @@ curl -X POST http://GPU_HOST:8001/api/v1/jobs \
 
 ## 服务器安装
 
-前置条件：CUDA 12.4、NVIDIA 驱动、Python 3、Git、FFmpeg、可使用 `sudo` 的 Linux 用户。先将当前分支推送到你的 fork：
+前置条件：NVIDIA 驱动、Python 3、Git、FFmpeg、可使用 `sudo` 的 Linux 用户。安装脚本会按驱动版本自动安装 PyTorch CUDA 12.1（驱动 535+）或 CUDA 12.4（驱动 550+）wheel；不要求镜像工具包标签恰好为 CUDA 12.4。先将当前分支推送到你的 fork：
 
 ```powershell
 git push -u origin fixed-camera-singles-spatial-tracking
