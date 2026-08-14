@@ -198,3 +198,7 @@
 6. 教练或标注数据验证。
 
 模拟样例中的0～100分只是数据合同演示。正式产品应先积累有标签的比赛数据，再将原始指标映射为能力分位或等级。
+
+## 9. 已落地的球路人工复核入口
+
+WebUI 已提供“球路复核”Tab：从 `spatial.hit_events` 与二维羽毛球轨迹生成低置信度候选，按同一击球的时间窗口去重，并允许人工确认、修正、标为不确定或排除。原始 `detections.jsonl` 保持不可变；机器候选和人工审计记录分别保存。具体存储结构、使用步骤与训练集导出边界见 [SHOT_REVIEW_AND_ANNOTATION_WORKFLOW.md](SHOT_REVIEW_AND_ANNOTATION_WORKFLOW.md)。

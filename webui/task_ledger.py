@@ -105,7 +105,7 @@ class BusinessTaskLedger:
         self._write(task)
 
     def pending_tasks(self):
-        terminal = {"succeeded", "failed"}
+        terminal = {"succeeded", "failed", "cancelled"}
         for path in sorted(self.root.glob("*.json")):
             try:
                 task = json.loads(path.read_text(encoding="utf-8"))
