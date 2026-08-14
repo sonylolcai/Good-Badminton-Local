@@ -22,6 +22,10 @@ from pathlib import Path
 
 import cv2
 
+from badminton_analysis.analysis.offline_shot_reconstruction import (
+    generate_offline_artifacts,
+    load_jsonl as load_derived_jsonl,
+)
 from webui.pipeline import _find_ffmpeg
 
 
@@ -91,17 +95,19 @@ def create_or_load_review_session(analysis_dir, reference_video=None, regenerate
         return previous_session
 
     rows = _load_detections(detections_path)
+    derived = generate_offline_artifacts(detections_path)
+    derived_events = load_derived_jsonl(derived["events_path"])
     video_path = _resolve_reference_video(analysis_path, reference_video)
     session = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "generator": {
             "name": "weak_evidence_shot_review",
-            "version": "1.0",
+            "version": "2.0",
             "generated_at": utc_now(),
             "policy": (
-                "Shot type is a review proposal derived from image-plane shuttle motion and "
-                "existing low-confidence hit candidates. It is not a ground-truth score, error, "
-                "or player ability metric until a human confirms it."
+                "Shot type is an offline review proposal derived from immutable detector evidence, "
+                "short bounded reconstruction and player spatial context. It is not a ground-truth "
+                "score, error, or player ability metric until a human confirms it."
             ),
         },
         "source": {
@@ -109,10 +115,13 @@ def create_or_load_review_session(analysis_dir, reference_video=None, regenerate
             "detections_path": str(detections_path),
             "reference_video": str(video_path) if video_path else None,
             "detections_sha256": _sha256(detections_path),
+            "derived_tracks_path": derived["tracks_path"],
+            "derived_events_path": derived["events_path"],
+            "derived_version": derived["version"],
         },
         "labels": SHOT_TYPES,
         "review_decisions": REVIEW_DECISIONS,
-        "candidates": _build_candidates(rows),
+        "candidates": _build_candidates(rows, derived_events=derived_events),
     }
     if previous_session is not None:
         _preserve_manual_review_work(previous_session, session)
@@ -214,6 +223,8 @@ def candidate_at_table_row(session, row_index):
 
 def candidate_source_display(source):
     return {
+        "spatial_proximity": "Offline spatial proximity",
+        "bidirectional_trajectory_turn": "Offline bidirectional trajectory turn",
         "spatial_hit_candidate": "人体/空间接近",
         "trajectory_turn": "轨迹方向变化",
         "trajectory_gap_transition": "短暂断检衔接",
@@ -418,7 +429,9 @@ def ensure_context_clip(session, candidate):
     return str(clip_path) if clip_path.is_file() and clip_path.stat().st_size > 0 else None
 
 
-def _build_candidates(rows):
+def _build_candidates(rows, derived_events=None):
+    if derived_events is not None:
+        return [_candidate_from_derived_event(event) for event in derived_events]
     event_frames = []
     for row in rows:
         events = ((row.get("spatial") or {}).get("hit_events") or [])
@@ -442,6 +455,42 @@ def _build_candidates(rows):
         event_frames = _hand_proximity_candidates(rows)
     grouped = _deduplicate_candidates(event_frames)
     return [_candidate_from_seed(rows, seed, f"shot_{index:04d}") for index, seed in enumerate(grouped, start=1)]
+
+
+def _candidate_from_derived_event(event):
+    """Adapt immutable offline artifacts to the existing review UI contract."""
+    proposal = dict(event.get("proposal") or {})
+    label = proposal.get("label", "unknown")
+    if label not in SHOT_TYPES:
+        label = "unknown"
+    proposal["label"] = label
+    proposal["label_display"] = SHOT_TYPES[label]
+    proposal.setdefault("status", "needs_human_review")
+    proposal.setdefault("confidence", 0.0)
+    trajectory = dict(event.get("trajectory") or {})
+    evidence = dict(trajectory)
+    evidence.update({
+        "trajectory": trajectory,
+        "hitter": event.get("hitter") or {},
+        "receiver": event.get("receiver") or {},
+        "event_origin": event.get("event_origin"),
+        "image_plane_only": True,
+        "decision_contract": "machine candidate only; not eligible for statistics until confirmed human review",
+    })
+    return {
+        "shot_id": event.get("event_id"),
+        "hit_frame": int(event.get("frame", 0)),
+        "hit_time_sec": float(event.get("hit_time_sec", 0.0)),
+        "hitter_track_id": (event.get("hitter") or {}).get("track_id"),
+        "candidate_source": event.get("candidate_source", "unknown"),
+        "candidate_confidence": round(float(event.get("time_confidence") or 0.0), 4),
+        "candidate_reason": event.get("candidate_reason"),
+        "proposal": proposal,
+        "evidence": evidence,
+        "active": True,
+        "review": {"decision": "pending", "label": None, "reviewer": "", "note": "", "at": None},
+        "review_history": [],
+    }
 
 
 def _candidate_from_seed(rows, seed, shot_id):

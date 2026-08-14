@@ -250,7 +250,15 @@ class PlayerPoseVisualizer:
             and -self.far_baseline_margin <= y <= 13.4 + self.near_baseline_margin
         )
 
-    def draw_players(self, frame, player_tracker, cached_movement_stats, stats_visualizer=None, rally_count=0):
+    def draw_players(
+        self,
+        frame,
+        player_tracker,
+        cached_movement_stats,
+        stats_visualizer=None,
+        rally_count=0,
+        spatial_tracks=None,
+    ):
         if self.show_skeletons and self.current_pose_data is not None:
             t0 = time.time()
             self._draw_skeleton_on_frame(
@@ -263,20 +271,25 @@ class PlayerPoseVisualizer:
                 print(f"Drawing skeleton took {time.time() - t0:.2f} sec")
 
         t0 = time.time()
-        for position in ["upper", "lower"]:
-            if player_tracker.players[position] is None:
-                continue
+        if spatial_tracks is not None:
+            self._draw_spatial_tracks(frame, spatial_tracks)
+        else:
+            # Compatibility rendering for older callers. New analysis passes
+            # spatial tracks and never uses upper/lower as an identity source.
+            for position in ["upper", "lower"]:
+                if player_tracker.players[position] is None:
+                    continue
 
-            color = (0, 255, 255) if position == "upper" else (255, 0, 255)
-            cv2.circle(frame, tuple(map(int, player_tracker.players[position])), 5, color, -1, cv2.LINE_AA)
+                color = (0, 255, 255) if position == "upper" else (255, 0, 255)
+                cv2.circle(frame, tuple(map(int, player_tracker.players[position])), 5, color, -1, cv2.LINE_AA)
 
-            if self.show_player_trajectories:
-                history = list(player_tracker.history[position])
-                for i, pos in enumerate(history):
-                    if pos is None:
-                        continue
-                    radius = int(2 + (i / len(history)) * 3) if history else 2
-                    cv2.circle(frame, tuple(map(int, pos)), radius, color, -1, cv2.LINE_AA)
+                if self.show_player_trajectories:
+                    history = list(player_tracker.history[position])
+                    for i, pos in enumerate(history):
+                        if pos is None:
+                            continue
+                        radius = int(2 + (i / len(history)) * 3) if history else 2
+                        cv2.circle(frame, tuple(map(int, pos)), radius, color, -1, cv2.LINE_AA)
 
         if self.show_performance_stats:
             print(f"Drawing players and trajectories took {time.time() - t0:.2f} sec")
@@ -286,6 +299,38 @@ class PlayerPoseVisualizer:
             stats_visualizer.draw_player_stats(frame, cached_movement_stats, rally_count)
             if self.show_performance_stats:
                 print(f"Drawing player stats took {time.time() - t0:.2f} sec")
+
+    @staticmethod
+    def _draw_spatial_tracks(frame, tracks):
+        """Draw all player tracks and label measured versus temporal state."""
+        colors = {
+            "detected": (0, 255, 0),
+            "predicted": (0, 210, 255),
+            "missing": (70, 70, 255),
+        }
+        for track in tracks or []:
+            image_xy = track.get("image_xy")
+            if not image_xy or len(image_xy) < 2:
+                continue
+            status = track.get("status", "missing")
+            color = colors.get(status, colors["missing"])
+            position = (int(image_xy[0]), int(image_xy[1]))
+            cv2.circle(frame, position, 6, color, -1, cv2.LINE_AA)
+            label = str(track.get("track_id", "track"))
+            if track.get("team_id"):
+                label = f"{label} {track['team_id']}"
+            if status != "detected":
+                label = f"{label} ({status})"
+            cv2.putText(
+                frame,
+                label,
+                (position[0] + 8, max(16, position[1] - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
 
     def _draw_skeleton_on_frame(self, frame, keypoints, offset_x, offset_y):
         for person in self._normalize_people(keypoints):

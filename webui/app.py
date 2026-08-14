@@ -206,7 +206,7 @@ def ensure_court_for_analysis(video_file, template_path, corners, click_corners,
 
 
 def run_full_analysis(analysis_ready, video_file, template_path, corners,
-                      pose_family, pose_mode, language, audio,
+                      pose_family, pose_mode, language, audio, match_mode,
                       output_video_style,
                       pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
                       show_skeletons, show_player_trajectories,
@@ -241,6 +241,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "pose_mode": pose_mode,
         "language": language,
         "audio": audio,
+        "match_mode": match_mode,
         "output_video_style": output_video_style,
         "pose_imgsz": int(pose_imgsz),
         "pose_conf": float(pose_conf),
@@ -623,6 +624,107 @@ def _switch_language(lang):
 def _review_run_choices():
     """Return newest-first analysis folders eligible for shot review."""
     return [(Path(path).name, path) for path in find_analysis_runs("outputs")]
+
+
+def _identity_claim_path(analysis_dir):
+    return Path(analysis_dir).expanduser().resolve() / "match_identity_claims.json"
+
+
+def _match_identity_table(analysis_dir):
+    """Load post-match editable bindings without rewriting detection evidence."""
+    if not analysis_dir:
+        return [], "请先选择一场已完成的视频分析。"
+    analysis_path = Path(analysis_dir).expanduser().resolve()
+    summary_path = analysis_path / "spatial_match_summary.json"
+    metadata_path = analysis_path / "metadata.json"
+    if not summary_path.is_file():
+        return [], "未找到 spatial_match_summary.json；请先完成视频分析。"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+    except (OSError, ValueError) as error:
+        return [], f"读取 Track ID 汇总失败：{error}"
+    persisted = {}
+    claim_path = _identity_claim_path(analysis_path)
+    if claim_path.is_file():
+        try:
+            persisted = {
+                item.get("track_id"): item
+                for item in json.loads(claim_path.read_text(encoding="utf-8")).get("bindings", [])
+                if item.get("track_id")
+            }
+        except (OSError, ValueError):
+            persisted = {}
+    rows = []
+    for item in summary.get("player_style_inputs", []):
+        track_id = item.get("track_id")
+        binding = persisted.get(track_id, {})
+        rows.append([
+            track_id,
+            binding.get("person_id", item.get("person_id") or ""),
+            binding.get("team_id", item.get("team_id") or ""),
+            item.get("detected_frames", 0),
+            item.get("predicted_frames", 0),
+            item.get("missing_frames", 0),
+            item.get("distance_m", 0.0),
+        ])
+    mode = ((metadata.get("temporal_tracking") or {}).get("players") or {}).get("match_mode", "singles")
+    return rows, (
+        f"模式：**{mode}**。Track ID 是持续身份键；队伍不是由当前球场半区推断。"
+        "可填 person_id 与 team_a/team_b；保存后写入单独的人工绑定文件，不改 detections.jsonl。"
+    )
+
+
+def _save_match_identity_table(analysis_dir, table_value):
+    if not analysis_dir:
+        raise gr.Error("请先选择一场已完成的视频分析。")
+    analysis_path = Path(analysis_dir).expanduser().resolve()
+    summary_path = analysis_path / "spatial_match_summary.json"
+    metadata_path = analysis_path / "metadata.json"
+    if not summary_path.is_file():
+        raise gr.Error("未找到空间追踪汇总，无法保存身份绑定。")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+    known = {item.get("track_id") for item in summary.get("player_style_inputs", [])}
+    values = table_value.values.tolist() if hasattr(table_value, "values") else (table_value or [])
+    bindings = []
+    participants_by_team = {"team_a": set(), "team_b": set()}
+    mode = ((metadata.get("temporal_tracking") or {}).get("players") or {}).get("match_mode", "singles")
+    max_per_team = 1 if mode == "singles" else 2
+    for row in values:
+        if not row or not str(row[0] or "").strip():
+            continue
+        track_id = str(row[0]).strip()
+        if track_id not in known:
+            raise gr.Error(f"未知 Track ID：{track_id}")
+        person_id = str(row[1] or "").strip() or None
+        team_id = str(row[2] or "").strip() or None
+        if team_id not in {None, "team_a", "team_b"}:
+            raise gr.Error("team_id 只能留空、team_a 或 team_b。")
+        if team_id:
+            participants_by_team[team_id].add(person_id or track_id)
+        bindings.append({
+            "track_id": track_id,
+            "person_id": person_id,
+            "team_id": team_id,
+            "binding_source": "post_match_human_review",
+            "identity_alias": bool(person_id and sum(str(item[1] or "").strip() == person_id for item in values) > 1),
+        })
+    for team_id, participants in participants_by_team.items():
+        if len(participants) > max_per_team:
+            raise gr.Error(f"{mode} 模式下 {team_id} 最多确认 {max_per_team} 名不同球员。")
+    payload = {
+        "schema_version": "1.0",
+        "match_mode": mode,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "policy": "human post-match binding; immutable raw detections are not rewritten",
+        "bindings": bindings,
+    }
+    path = _identity_claim_path(analysis_path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return f"已保存 {len(bindings)} 条赛后身份/队伍绑定：`{path.name}`。原始检测和机器 Track ID 未被覆盖。"
 
 
 def _review_summary_markdown(session, selected_id=None):
@@ -1113,6 +1215,15 @@ def build_ui():
                         value="zh", label=t["language"],
                     )
                     audio = gr.Checkbox(value=True, label=t["audio"])
+                    match_mode = gr.Radio(
+                        choices=[
+                            ("Singles (one player per team)", "singles"),
+                            ("Doubles (up to two players per team)", "doubles"),
+                        ],
+                        value="singles",
+                        label="比赛模式 / Match mode",
+                        info="New tracking uses spatial.tracks. Doubles keeps same-side players instead of upper/lower filtering.",
+                    )
                     gr.Markdown("**输出视频：** 原视频人物 + 人体骨架 + 羽毛球标注")
                     # Preserve the analysis callback contract while preventing
                     # accidental Skeleton-only output in the normal workflow.
@@ -1312,6 +1423,23 @@ def build_ui():
                         review_note = gr.Textbox(label="备注（可选）", lines=1, scale=2)
                     save_review_btn = gr.Button("保存本次修改", variant="primary", size="sm")
 
+            with gr.Accordion("赛后身份与队伍确认 / Post-match identity", open=False):
+                gr.Markdown(
+                    "仅用于赛后人工确认或纠错：可把同一人的分段 Track ID 标为同一个 person_id。"
+                    "team_id 仅可为 team_a/team_b，不能从当前球场半区自动推断。"
+                )
+                with gr.Row():
+                    identity_reload_btn = gr.Button("读取 Track ID", size="sm")
+                    identity_save_btn = gr.Button("保存身份/队伍绑定", variant="primary", size="sm")
+                identity_table = gr.Dataframe(
+                    headers=["track_id", "person_id（可选）", "team_id（team_a/team_b）", "detected", "predicted", "missing", "distance_m"],
+                    datatype=["str", "str", "str", "number", "number", "number", "number"],
+                    interactive=True,
+                    label="空间追踪身份绑定（不改原始 detections.jsonl）",
+                    max_height=260,
+                )
+                identity_notice = gr.Markdown("先选择分析结果后，点击“读取 Track ID”。")
+
         console_open_state = gr.State(value=False)
         console_trigger = gr.Button(
             "打开后台输出", size="sm", elem_id="backend-console-trigger",
@@ -1341,6 +1469,18 @@ def build_ui():
             fn=get_backend_logs,
             outputs=[console_output],
             show_progress="hidden",
+        )
+
+        identity_reload_btn.click(
+            fn=_match_identity_table,
+            inputs=[review_analysis_dir],
+            outputs=[identity_table, identity_notice],
+            show_progress="hidden",
+        )
+        identity_save_btn.click(
+            fn=_save_match_identity_table,
+            inputs=[review_analysis_dir, identity_table],
+            outputs=[identity_notice],
         )
 
         refresh_review_runs.click(
@@ -1477,7 +1617,7 @@ def build_ui():
             fn=run_full_analysis,
             inputs=[
                 analysis_ready_state, video_input, template_path_state, corners_state,
-                pose_family, pose_mode, language, audio, output_video_style,
+                pose_family, pose_mode, language, audio, match_mode, output_video_style,
                 pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
                 show_skeletons, show_player_trajectories,
                 show_court_trajectory, show_shuttlecock_trajectory,

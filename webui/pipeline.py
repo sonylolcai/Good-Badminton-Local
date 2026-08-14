@@ -441,6 +441,9 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     pose_conf = float(options.get("pose_conf", 0.15))
     far_player_enhancement = bool(options.get("far_player_enhancement", False))
     far_pose_roi = options.get("far_pose_roi", (0.12, 0.30, 0.86, 0.82))
+    match_mode = options.get("match_mode", "singles")
+    tracker_backend = options.get("tracker_backend", "court_association")
+    enable_bytetrack = bool(options.get("enable_bytetrack", False))
 
     system = BadmintonAnalysisSystem(
         video_path,
@@ -465,6 +468,9 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         pose_conf=pose_conf,
         far_player_enhancement=far_player_enhancement,
         far_pose_roi=far_pose_roi,
+        match_mode=match_mode,
+        tracker_backend=tracker_backend,
+        enable_bytetrack=enable_bytetrack,
     )
     system.keep_audio = keep_audio
     system.process_video(progress_callback=progress_cb)
@@ -498,6 +504,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         "video": web_video_path,
         "metadata": system.metadata_path,
         "detections": system.detections_path,
+        "derived": getattr(system, "offline_artifacts", None),
         "visualizations": [],
         "warnings": warnings,
     }

@@ -71,7 +71,9 @@ class BadmintonAnalysisSystem:
                  yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True,
                  output_video_style='annotated', pose_imgsz=1280,
                  pose_conf=0.15, far_player_enhancement=False,
-                 far_pose_roi=(0.12, 0.30, 0.86, 0.82), net_image_line=None):
+                 far_pose_roi=(0.12, 0.30, 0.86, 0.82), net_image_line=None,
+                 match_mode='singles', tracker_backend='court_association',
+                 enable_bytetrack=False):
         self.video_path = video_path
         self.show_display = show_display
         self.language = language
@@ -88,6 +90,13 @@ class BadmintonAnalysisSystem:
         self.far_player_enhancement = bool(far_player_enhancement)
         self.far_pose_roi = tuple(float(value) for value in far_pose_roi)
         self.net_image_line = net_image_line
+        if match_mode not in {'singles', 'doubles'}:
+            raise ValueError("match_mode must be 'singles' or 'doubles'.")
+        if tracker_backend not in {'court_association', 'bytetrack'}:
+            raise ValueError("tracker_backend must be 'court_association' or 'bytetrack'.")
+        self.match_mode = match_mode
+        self.tracker_backend = tracker_backend
+        self.enable_bytetrack = bool(enable_bytetrack)
         if output_video_style not in {'annotated', 'skeleton'}:
             raise ValueError(
                 "output_video_style must be 'annotated' or 'skeleton'."
@@ -229,7 +238,12 @@ class BadmintonAnalysisSystem:
         self.player_tracker = PlayerTracker(corners=corners, threshold=mid_height, history_size=30,
                                           detection_writer=self.detection_writer, fps=fps)
         self.fixed_camera_match = FixedCameraMatchPipeline(
-            corners, fps=fps, net_image_line=self.net_image_line
+            corners,
+            fps=fps,
+            net_image_line=self.net_image_line,
+            match_mode=self.match_mode,
+            tracker_backend=self.tracker_backend,
+            enable_bytetrack=self.enable_bytetrack,
         )
         self._write_metadata(fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height)
         
@@ -320,6 +334,11 @@ class BadmintonAnalysisSystem:
                     "identity_key": "track_id",
                     "zone_policy": "zone_id is transient court space; never identity, team, or side",
                     "legacy_compatibility": "players.upper/lower retained for existing consumers only",
+                    "match_mode": self.match_mode,
+                    "max_players_per_team": 1 if self.match_mode == 'singles' else 2,
+                    "backend": self.tracker_backend,
+                    "bytetrack_enabled": self.tracker_backend == 'bytetrack',
+                    "state_policy": "detected is a measurement; predicted/missing are explicit temporal states and not detector facts",
                 },
                 "shuttlecock": {
                     "max_prediction_frames": self.shuttlecock_tracker.max_prediction_frames,
@@ -437,7 +456,8 @@ class BadmintonAnalysisSystem:
                 if self.show_player_stats and self.output_video_style == "annotated"
                 else None
             ),
-            rally_count=self.rally_count
+            rally_count=self.rally_count,
+            spatial_tracks=spatial_state.get("tracks", []),
         )
         t1 = time.time()
         players_draw_elapsed = t1 - t0
@@ -473,6 +493,14 @@ class BadmintonAnalysisSystem:
             court_xy = self.court_mapper.image_to_court(image_xy)
             if len(court_xy) != 2:
                 continue
+            bbox = detection.get("bbox")
+            bbox_xyxy = None
+            if bbox is not None:
+                try:
+                    bbox_xyxy = [float(value) for value in bbox[:4]]
+                except (TypeError, ValueError):
+                    bbox_xyxy = None
+            hands_image = self._pose_hands(detection.get("keypoints"))
             observations.append(
                 {
                     "image_xy": image_xy,
@@ -480,10 +508,35 @@ class BadmintonAnalysisSystem:
                     "confidence": detection.get("confidence", 0.0),
                     "location_method": detection.get("location_method"),
                     "location_confidence": detection.get("location_confidence"),
+                    "location_degraded": detection.get("location_degraded", False),
                     "source": detection.get("source"),
+                    "bbox_xyxy": bbox_xyxy,
+                    "hands_image": hands_image,
                 }
             )
         return observations
+
+    @staticmethod
+    def _pose_hands(keypoints):
+        """Extract visible wrist locations as optional hit-attribution evidence."""
+        if keypoints is None:
+            return {"left": None, "right": None}
+        try:
+            values = list(keypoints)
+        except TypeError:
+            return {"left": None, "right": None}
+
+        def point_at(index):
+            if len(values) <= index:
+                return None
+            try:
+                point = values[index]
+                x, y = float(point[0]), float(point[1])
+            except (TypeError, ValueError, IndexError):
+                return None
+            return [x, y] if x > 1 and y > 1 else None
+
+        return {"left": point_at(9), "right": point_at(10)}
 
     def _spatial_shuttle_input(self, ball_position, ball_detection):
         """Only actual ball observations may contribute to analytic evidence."""
@@ -605,6 +658,24 @@ class BadmintonAnalysisSystem:
         if self.detection_writer is not None:
             self.detection_writer.close()
             self.detection_writer = None
+        try:
+            from .analysis.offline_shot_reconstruction import generate_offline_artifacts
+
+            self.offline_artifacts = generate_offline_artifacts(
+                self.detections_path,
+                fps=getattr(self, "fps", None),
+            )
+            print(
+                "Offline shuttle reconstruction: "
+                f"{self.offline_artifacts['frame_count']} frames, "
+                f"{self.offline_artifacts['event_count']} candidate events"
+            )
+        except Exception as exc:
+            # The annotated video and immutable detections are still usable if
+            # a post-processing artifact fails. Do not silently claim derived
+            # shot data exists; leave a visible console diagnostic instead.
+            self.offline_artifacts = {"status": "failed", "error": str(exc)}
+            print(f"Offline shuttle reconstruction failed: {exc}")
 
         if hasattr(self, 'video_writer') and self.video_writer is not None:
             self.video_writer.release()

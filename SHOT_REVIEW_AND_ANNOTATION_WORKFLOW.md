@@ -28,6 +28,17 @@ WebUI 的“球路复核”Tab 会列出 `outputs/**/detections.jsonl` 所在的
 
 因此，只有人工标为 `confirmed` 或 `corrected` 的样本，才可在未来进入球种统计、训练集或评测集。`uncertain` 和 `excluded` 保留为质量数据，不能被当成反例或运动员失误。
 
+## 离线轨迹重建（v2）
+
+视频分析完成后，系统会在不改写 `detections.jsonl` 的前提下生成：
+
+- `derived/shuttle_tracks_v2.jsonl`：每个分析帧都有 `detected`、`reconstructed`、`unknown_gap`、`missing` 或 `rejected_artifact` 状态；`reconstructed` 只能来自短时间、前后真实观测都存在且速度合理的双向插值。
+- `derived/shot_events_v2.jsonl`：机器候选的触球时间、球员/手部/空间证据、下一次触球推断的接球者、球种候选和统计资格。机器候选的 `eligible_for_statistics` 固定为 `false`。
+
+连续重复、低置信且贴近画面边缘的点会标为 `rejected_artifact`，但“球在画面上方”本身不是拒绝理由，避免误删高远球。长空洞或物理速度不一致的空洞保持 `unknown_gap`，不会被补成看似真实的球轨迹。
+
+复核页重新生成候选时优先读取上述派生产物，同时保留已有人工修正和人工补拍。人工补拍的时间置信度只代表“复核者确认了该时间点”，不代表模型看到球；轨迹质量、事件来源、标签来源和人工决定保持独立字段。
+
 ## 人工复核步骤
 
 1. 打开整场视频并拖动到触球附近；右侧卡片会显示截至当前时间最近一次触球的自动建议或人工结论。
