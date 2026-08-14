@@ -346,7 +346,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                 break
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
         if updated or status["phase"] == "preparing":
-            yield None, None, None, None, status.copy()
+            yield None, None, None, None, None, None, status.copy()
         time.sleep(0.4)
 
     if "error" in outcome:
@@ -365,10 +365,67 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             metadata_content = json.load(f)
 
     detections_file = result["detections"] if os.path.isfile(result["detections"]) else None
+    rally_summary, rally_rows = _rally_summary_from_result(result, metadata_content)
 
     status["phase"] = "succeeded"
     status["elapsed_seconds"] = round(time.monotonic() - started, 1)
-    yield output_video, viz_images or None, metadata_content, detections_file, status.copy()
+    yield output_video, viz_images or None, metadata_content, detections_file, rally_summary, rally_rows, status.copy()
+
+
+def _rally_summary_from_result(result, metadata):
+    """Build a compact, review-only rally table from local derived artifacts.
+
+    A remote result may carry server-side absolute artifact paths in its
+    metadata.  The WebUI therefore first resolves the local download folder,
+    and only rebuilds the small derived files from immutable detections when a
+    legacy GPU service did not return them.
+    """
+    metadata = metadata or {}
+    detections_path = Path(result.get("detections") or "")
+    if not detections_path.is_file():
+        return "### 回合与拍数\n未找到本地检测数据，暂时无法生成候选回合。", []
+    derived = metadata.get("derived") or result.get("derived") or {}
+    rally_path = Path(derived.get("rallies_path") or "")
+    local_rally_path = detections_path.parent / "derived" / "rallies_v2.jsonl"
+    if not rally_path.is_file() and local_rally_path.is_file():
+        rally_path = local_rally_path
+    if not rally_path.is_file():
+        from badminton_analysis.analysis.offline_shot_reconstruction import generate_offline_artifacts
+
+        derived = generate_offline_artifacts(detections_path)
+        rally_path = Path(derived["rallies_path"])
+        metadata["derived"] = derived
+        metadata_path = Path(result.get("metadata") or "")
+        if metadata_path.is_file():
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        with rally_path.open(encoding="utf-8") as source:
+            rallies = [json.loads(line) for line in source if line.strip()]
+    except (OSError, ValueError) as error:
+        return f"### 回合与拍数\n读取候选回合失败：`{error}`", []
+
+    rows = [
+        [
+            item.get("rally_id"),
+            round(float(item.get("start_time_sec", 0.0)), 2),
+            round(float(item.get("end_time_sec", 0.0)), 2),
+            int(item.get("shot_count", 0)),
+            int(item.get("observed_shot_count", 0)),
+            int(item.get("motion_inferred_shot_count", 0)),
+            item.get("end_reason"),
+            round(float(item.get("confidence", 0.0)), 3),
+        ]
+        for item in rallies
+    ]
+    shot_count = sum(int(item.get("shot_count", 0)) for item in rallies)
+    inferred_count = sum(int(item.get("motion_inferred_shot_count", 0)) for item in rallies)
+    return (
+        "### 回合与拍数（候选，待人工复核）\n"
+        f"共 **{len(rallies)}** 个候选回合、**{shot_count}** 个候选拍；"
+        f"其中 **{inferred_count}** 拍由缺球动作约束补出。"
+        "回合边界、球种和二维球速都不会进入得分或能力统计，直到人工确认。",
+        rows,
+    )
 
 
 _UI_TEXT = {
@@ -1272,6 +1329,14 @@ def build_ui():
                     output_gallery = gr.Gallery(label=t["out_gallery"], columns=2, height="auto")
                     output_metadata = gr.JSON(label=t["out_metadata"])
                     output_detections = gr.File(label=t["out_detections"])
+                    output_rally_summary = gr.Markdown("### 回合与拍数\n完成分析后显示候选回合与每回合拍数。")
+                    output_rallies = gr.Dataframe(
+                        headers=["回合", "开始(s)", "结束(s)", "候选拍数", "可见球候选", "缺球补拍", "结束依据", "置信度"],
+                        datatype=["str", "number", "number", "number", "number", "number", "str", "number"],
+                        interactive=False,
+                        label="候选回合明细（所有结果均待人工复核）",
+                        max_height=300,
+                    )
 
         with review_tab:
             gr.Markdown(
@@ -1624,7 +1689,10 @@ def build_ui():
                 show_player_stats, show_pose_roi, visualize_positions,
                 yolo_pose_model, ball_model,
             ],
-            outputs=[output_video, output_gallery, output_metadata, output_detections, output_status],
+            outputs=[
+                output_video, output_gallery, output_metadata, output_detections,
+                output_rally_summary, output_rallies, output_status,
+            ],
         )
 
     return demo
