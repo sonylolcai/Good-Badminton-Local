@@ -22,7 +22,8 @@ from typing import Iterable
 DERIVED_DIRNAME = "derived"
 SHUTTLE_TRACK_FILENAME = "shuttle_tracks_v2.jsonl"
 SHOT_EVENT_FILENAME = "shot_events_v2.jsonl"
-DERIVATION_VERSION = "2.0"
+RALLY_FILENAME = "rallies_v2.jsonl"
+DERIVATION_VERSION = "2.1"
 
 
 def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
@@ -37,18 +38,30 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
     width, height = video_dimensions(detections_path.parent)
     track_rows = reconstruct_shuttle_track(rows, fps=fps, width=width, height=height)
     events = build_shot_events(rows, track_rows, fps=fps)
+    events = infer_missing_shuttle_events(rows, events)
+    events = refresh_event_evidence(events, track_rows)
+    rallies = build_rallies(track_rows, events)
     track_path = output_dir / SHUTTLE_TRACK_FILENAME
     event_path = output_dir / SHOT_EVENT_FILENAME
+    rally_path = output_dir / RALLY_FILENAME
     write_jsonl(track_path, track_rows)
     write_jsonl(event_path, events)
+    write_jsonl(rally_path, rallies)
     return {
         "version": DERIVATION_VERSION,
         "tracks_path": str(track_path),
         "events_path": str(event_path),
+        "rallies_path": str(rally_path),
         "frame_count": len(track_rows),
         "event_count": len(events),
+        "rally_count": len(rallies),
+        "observed_shot_count": sum(event.get("event_origin") == "machine_candidate" for event in events),
+        "inferred_shot_count": sum(event.get("event_origin") == "motion_constraint_candidate" for event in events),
         "fps": fps,
-        "policy": "raw detections are immutable; only short, bounded gaps may be reconstructed",
+        "policy": (
+            "raw detections are immutable; only short, bounded gaps may be reconstructed; "
+            "rallies and missing-shuttle hits are review candidates, never score evidence"
+        ),
     }
 
 
@@ -195,18 +208,172 @@ def build_shot_events(raw_rows, track_rows, fps=30.0):
             }
         )
 
-    for current, following in zip(events, events[1:]):
-        next_hitter = following["hitter"]
-        if next_hitter.get("track_id") and next_hitter["track_id"] != current["hitter"].get("track_id"):
-            current["receiver"] = {
-                "track_id": next_hitter["track_id"],
-                "confidence": round(min(0.45, next_hitter.get("confidence", 0.0)), 4),
-                "source": "next_hit_candidate",
-            }
+    return refresh_event_evidence(events, track_rows)
+
+
+def refresh_event_evidence(events, track_rows):
+    """Recompute per-shot evidence after candidates have been inserted.
+
+    A shot's flight window ends at the next candidate hit, rather than at an
+    arbitrary fixed duration.  This avoids accidentally using the next shot's
+    shuttle points to describe the current shot.
+    """
+    ordered = sorted(events, key=lambda item: (float(item["hit_time_sec"]), int(item.get("frame", 0))))
+    for index, current in enumerate(ordered):
+        following = ordered[index + 1] if index + 1 < len(ordered) else None
+        if current.get("event_origin") != "motion_constraint_candidate":
+            current["trajectory"] = _event_trajectory_evidence(
+                track_rows,
+                current["hit_time_sec"],
+                until_time_sec=following["hit_time_sec"] if following else None,
+            )
+        current["receiver"] = {"track_id": None, "confidence": 0.0, "source": "not_yet_inferred"}
+        if following and following.get("event_origin") != "motion_constraint_candidate":
+            next_hitter = following.get("hitter") or {}
+            if next_hitter.get("track_id") and next_hitter["track_id"] != (current.get("hitter") or {}).get("track_id"):
+                current["receiver"] = {
+                    "track_id": next_hitter["track_id"],
+                    "confidence": round(min(0.45, next_hitter.get("confidence", 0.0)), 4),
+                    "source": "next_hit_candidate",
+                }
         current["proposal"] = _propose_from_space(current, following)
-    if events:
-        events[-1]["proposal"] = _propose_from_space(events[-1], None)
-    return events
+    return _renumber_events(ordered)
+
+
+def infer_missing_shuttle_events(raw_rows, events, min_gap_sec=0.45, max_gap_sec=4.0):
+    """Insert a low-confidence singles-only *candidate* for a missing return.
+
+    The rule is deliberately narrow: two supported hits by the same player,
+    a unique other visible track, and an explicit singles mode are required.
+    It does not invent a shuttle point, a speed, a score, or a doubles hitter.
+    A real pose-action classifier can later provide stronger evidence.
+    """
+    if not events or _match_mode(raw_rows) != "singles":
+        return list(events)
+    ordered = sorted(events, key=lambda item: float(item["hit_time_sec"]))
+    inferred = []
+    for before, after in zip(ordered, ordered[1:]):
+        before_hitter = (before.get("hitter") or {}).get("track_id")
+        after_hitter = (after.get("hitter") or {}).get("track_id")
+        elapsed = float(after["hit_time_sec"]) - float(before["hit_time_sec"])
+        if not before_hitter or before_hitter != after_hitter or not min_gap_sec <= elapsed <= max_gap_sec:
+            continue
+        visible_tracks = _visible_detected_track_ids(raw_rows, before["hit_time_sec"], after["hit_time_sec"])
+        opponents = sorted(visible_tracks.difference({before_hitter}))
+        if len(opponents) != 1:
+            continue
+        hit_time = round((float(before["hit_time_sec"]) + float(after["hit_time_sec"])) / 2.0, 6)
+        inferred.append(
+            {
+                "schema_version": DERIVATION_VERSION,
+                "event_id": "pending_inferred",
+                "frame": _nearest_frame(raw_rows, hit_time),
+                "hit_time_sec": hit_time,
+                "status": "candidate",
+                "candidate_source": "motion_inferred_missing_shuttle",
+                "candidate_reason": (
+                    "same supported singles hitter appears before and after an unobserved interval; "
+                    "the unique opponent is a return candidate, not a detector measurement"
+                ),
+                "event_origin": "motion_constraint_candidate",
+                "time_confidence": 0.15,
+                "trajectory": _missing_shuttle_trajectory(),
+                "hitter": {
+                    "track_id": opponents[0],
+                    "confidence": 0.15,
+                    "source": "singles_alternation_constraint",
+                    "measurement_status": "inferred",
+                },
+                "receiver": {"track_id": None, "confidence": 0.0, "source": "not_yet_inferred"},
+                "proposal": _proposal("unknown", 0.0, "Missing shuttle evidence; human review required."),
+                "decision": {"status": "pending", "label_source": "machine", "eligible_for_statistics": False},
+            }
+        )
+    return _renumber_events(sorted([*ordered, *inferred], key=lambda item: float(item["hit_time_sec"])))
+
+
+def build_rallies(
+    track_rows,
+    events,
+    stationary_speed_px_s=45.0,
+    stationary_min_duration_sec=0.75,
+    max_unobserved_between_rallies_sec=4.0,
+):
+    """Segment a reviewable rally sequence and annotate every shot candidate.
+
+    A long run of slow, continuous shuttle observations is the preferred
+    boundary.  A long interval with no accepted/reconstructed shuttle evidence
+    is only a low-confidence fallback boundary, never a score decision.
+    """
+    ordered = sorted(events, key=lambda item: float(item["hit_time_sec"]))
+    if not ordered:
+        return []
+    stationary_windows = _stationary_windows(
+        track_rows,
+        speed_limit_px_s=stationary_speed_px_s,
+        min_duration_sec=stationary_min_duration_sec,
+    )
+    groups = []
+    current = [ordered[0]]
+    boundary_reasons = []
+    for event in ordered[1:]:
+        previous = current[-1]
+        boundary = _boundary_between_events(
+            track_rows,
+            stationary_windows,
+            previous_time=float(previous["hit_time_sec"]),
+            next_time=float(event["hit_time_sec"]),
+            max_unobserved_sec=max_unobserved_between_rallies_sec,
+        )
+        if boundary:
+            groups.append(current)
+            boundary_reasons.append(boundary)
+            current = [event]
+        else:
+            current.append(event)
+    groups.append(current)
+
+    video_end = max((float(item.get("time_sec", 0.0)) for item in track_rows), default=float(ordered[-1]["hit_time_sec"]))
+    rallies = []
+    for index, group in enumerate(groups, start=1):
+        following_boundary = boundary_reasons[index - 1] if index - 1 < len(boundary_reasons) else None
+        terminal_boundary = following_boundary or _terminal_boundary_after_event(
+            stationary_windows,
+            last_event_time=float(group[-1]["hit_time_sec"]),
+        )
+        end_time = terminal_boundary["end_time_sec"] if terminal_boundary else video_end
+        end_reason = terminal_boundary["reason"] if terminal_boundary else "video_end_without_confirmed_terminal_event"
+        observed = sum(item.get("event_origin") != "motion_constraint_candidate" for item in group)
+        inferred = len(group) - observed
+        rally_id = f"rally_{index:04d}"
+        for shot_index, event in enumerate(group, start=1):
+            event["rally_id"] = rally_id
+            event["shot_index_in_rally"] = shot_index
+        confidence = 0.25 + min(0.35, 0.07 * observed) - min(0.12, 0.04 * inferred)
+        if terminal_boundary and terminal_boundary["reason"] == "shuttle_stationary_or_slow":
+            confidence += 0.12
+        rallies.append(
+            {
+                "schema_version": DERIVATION_VERSION,
+                "rally_id": rally_id,
+                "status": "candidate",
+                "start_time_sec": round(float(group[0]["hit_time_sec"]), 6),
+                "end_time_sec": round(float(end_time), 6),
+                "end_reason": end_reason,
+                "shot_count": len(group),
+                "observed_shot_count": observed,
+                "motion_inferred_shot_count": inferred,
+                "shot_event_ids": [item["event_id"] for item in group],
+                "confidence": round(max(0.0, min(0.75, confidence)), 4),
+                "score": {
+                    "status": "unknown",
+                    "winner_track_id": None,
+                    "included_in_player_statistics": False,
+                    "reason": "Rally segmentation and shot candidates are not score evidence.",
+                },
+            }
+        )
+    return rallies
 
 
 def edge_static_artifacts(candidates, width=None, height=None, min_repeat=3, max_confidence=0.60):
@@ -351,30 +518,60 @@ def _hitter_evidence(raw, track_row, preferred_track_id):
     }
 
 
-def _event_trajectory_evidence(track_rows, hit_time_sec):
-    after = [item for item in track_rows if hit_time_sec <= item["time_sec"] <= hit_time_sec + 1.8 and item["status"] in {"detected", "reconstructed"}]
+def _event_trajectory_evidence(track_rows, hit_time_sec, until_time_sec=None):
+    """Describe one shot using its first two post-contact shuttle points.
+
+    ``outbound_speed_px_s`` is intentionally an image-plane value.  A fixed
+    monocular camera cannot turn it into an authoritative shuttle speed in
+    metres per second without a calibrated 3D reconstruction.
+    """
+    window_end = min(
+        float(hit_time_sec) + 1.8,
+        float(until_time_sec) if until_time_sec is not None else math.inf,
+    )
+    after = [
+        item for item in track_rows
+        if hit_time_sec <= item["time_sec"] < window_end and item["status"] in {"detected", "reconstructed"}
+    ]
     if len(after) < 2:
         return {
             "observation_count": len(after),
             "detected_count": sum(item["status"] == "detected" for item in after),
             "reconstructed_count": sum(item["status"] == "reconstructed" for item in after),
             "outbound_speed_px_s": None,
+            "outbound_speed": {
+                "value": None,
+                "unit": "px/s",
+                "basis": "first_two_post_hit_trajectory_points",
+                "confidence": 0.0,
+                "point_statuses": [item["status"] for item in after],
+            },
             "flight_duration_sec": None,
             "quality": "insufficient",
             "limitations": ["Insufficient post-hit shuttle evidence; leave the shot label unknown."],
         }
-    speeds = []
-    for before, current in zip(after, after[1:]):
-        elapsed = current["time_sec"] - before["time_sec"]
-        if elapsed > 0:
-            speeds.append(_distance(before["image_xy"], current["image_xy"]) / elapsed)
+    first, second = after[0], after[1]
+    elapsed = float(second["time_sec"]) - float(first["time_sec"])
+    speed = _distance(first["image_xy"], second["image_xy"]) / elapsed if elapsed > 0 else None
     detected_count = sum(item["status"] == "detected" for item in after)
     reconstructed_count = sum(item["status"] == "reconstructed" for item in after)
+    speed_confidence = min(float(first["confidence"]), float(second["confidence"]))
+    if "reconstructed" in {first["status"], second["status"]}:
+        speed_confidence *= 0.45
     return {
         "observation_count": len(after),
         "detected_count": detected_count,
         "reconstructed_count": reconstructed_count,
-        "outbound_speed_px_s": round(max(speeds) if speeds else 0.0, 2),
+        "outbound_speed_px_s": round(speed, 2) if speed is not None else None,
+        "outbound_speed": {
+            "value": round(speed, 2) if speed is not None else None,
+            "unit": "px/s",
+            "basis": "first_two_post_hit_trajectory_points",
+            "confidence": round(max(0.0, min(0.75, speed_confidence)), 4),
+            "point_statuses": [first["status"], second["status"]],
+            "point_frames": [first["frame"], second["frame"]],
+            "point_times_sec": [first["time_sec"], second["time_sec"]],
+        },
         "flight_duration_sec": round(after[-1]["time_sec"] - after[0]["time_sec"], 4),
         "image_displacement_px": round(_distance(after[0]["image_xy"], after[-1]["image_xy"]), 2),
         "quality": "moderate" if detected_count >= 3 else "weak",
@@ -383,6 +580,121 @@ def _event_trajectory_evidence(track_rows, hit_time_sec):
             "Reconstructed points are context, not detector measurements.",
         ],
     }
+
+
+def _missing_shuttle_trajectory():
+    return {
+        "observation_count": 0,
+        "detected_count": 0,
+        "reconstructed_count": 0,
+        "outbound_speed_px_s": None,
+        "outbound_speed": {
+            "value": None,
+            "unit": "px/s",
+            "basis": "no_shuttle_measurement",
+            "confidence": 0.0,
+            "point_statuses": [],
+        },
+        "flight_duration_sec": None,
+        "quality": "insufficient",
+        "limitations": [
+            "No accepted shuttle observations in this inferred return interval.",
+            "This is a motion-constraint candidate, not a reconstructed ball trajectory.",
+        ],
+    }
+
+
+def _match_mode(rows):
+    modes = {
+        ((row.get("spatial") or {}).get("match") or {}).get("mode")
+        for row in rows
+        if ((row.get("spatial") or {}).get("match") or {}).get("mode")
+    }
+    return next(iter(modes)) if len(modes) == 1 else None
+
+
+def _visible_detected_track_ids(rows, start_time_sec, end_time_sec):
+    visible = set()
+    for row in rows:
+        time_sec = float(row.get("time_sec", 0.0))
+        if start_time_sec <= time_sec <= end_time_sec:
+            visible.update(
+                str(track["track_id"])
+                for track in ((row.get("spatial") or {}).get("tracks") or [])
+                if track.get("track_id") and track.get("status") == "detected"
+            )
+    return visible
+
+
+def _nearest_frame(rows, time_sec):
+    if not rows:
+        return 0
+    nearest = min(rows, key=lambda item: abs(float(item.get("time_sec", 0.0)) - float(time_sec)))
+    return int(nearest.get("frame", 0))
+
+
+def _renumber_events(events):
+    for index, event in enumerate(events, start=1):
+        event["event_id"] = f"shot_{index:04d}"
+    return events
+
+
+def _stationary_windows(track_rows, speed_limit_px_s, min_duration_sec, max_point_gap_sec=0.25):
+    """Find sustained low-speed intervals in continuous shuttle evidence."""
+    observed = [item for item in track_rows if item.get("status") in {"detected", "reconstructed"}]
+    windows = []
+    run_start = None
+    previous = None
+    for current in observed:
+        if previous is None:
+            previous = current
+            continue
+        elapsed = float(current["time_sec"]) - float(previous["time_sec"])
+        speed = _distance(previous["image_xy"], current["image_xy"]) / elapsed if elapsed > 0 else math.inf
+        slow_and_continuous = 0 < elapsed <= max_point_gap_sec and speed <= speed_limit_px_s
+        if slow_and_continuous:
+            run_start = previous if run_start is None else run_start
+        elif run_start is not None:
+            if float(previous["time_sec"]) - float(run_start["time_sec"]) >= min_duration_sec:
+                windows.append({"start_time_sec": float(run_start["time_sec"]), "end_time_sec": float(previous["time_sec"])})
+            run_start = None
+        previous = current
+    if run_start is not None and previous is not None:
+        if float(previous["time_sec"]) - float(run_start["time_sec"]) >= min_duration_sec:
+            windows.append({"start_time_sec": float(run_start["time_sec"]), "end_time_sec": float(previous["time_sec"])})
+    return windows
+
+
+def _boundary_between_events(track_rows, stationary_windows, previous_time, next_time, max_unobserved_sec):
+    for window in stationary_windows:
+        if previous_time < window["start_time_sec"] < next_time:
+            return {
+                "reason": "shuttle_stationary_or_slow",
+                "end_time_sec": window["start_time_sec"],
+            }
+    if next_time - previous_time < max_unobserved_sec:
+        return None
+    has_evidence = any(
+        previous_time < float(item.get("time_sec", 0.0)) < next_time
+        and item.get("status") in {"detected", "reconstructed"}
+        for item in track_rows
+    )
+    if not has_evidence:
+        return {
+            "reason": "long_unobserved_interval_candidate_boundary",
+            "end_time_sec": previous_time,
+        }
+    return None
+
+
+def _terminal_boundary_after_event(stationary_windows, last_event_time):
+    for window in stationary_windows:
+        if window["start_time_sec"] > last_event_time:
+            return {
+                "reason": "shuttle_stationary_or_slow",
+                "end_time_sec": window["start_time_sec"],
+            }
+    return None
 
 
 def _propose_from_space(event, following):

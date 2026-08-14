@@ -5,7 +5,9 @@ from pathlib import Path
 
 from badminton_analysis.analysis.offline_shot_reconstruction import (
     build_shot_events,
+    build_rallies,
     generate_offline_artifacts,
+    infer_missing_shuttle_events,
     reconstruct_shuttle_track,
     write_jsonl,
 )
@@ -49,6 +51,8 @@ class OfflineShotReconstructionTests(unittest.TestCase):
         self.assertEqual(events[0]["hitter"]["track_id"], "track_001")
         self.assertEqual(events[0]["receiver"]["track_id"], "track_002")
         self.assertEqual(events[0]["proposal"]["label"], "lift")
+        self.assertEqual(events[0]["trajectory"]["outbound_speed"]["basis"], "first_two_post_hit_trajectory_points")
+        self.assertEqual(events[0]["trajectory"]["outbound_speed"]["unit"], "px/s")
         self.assertFalse(events[0]["decision"]["eligible_for_statistics"])
 
     def test_generator_writes_separate_derived_files(self):
@@ -59,18 +63,83 @@ class OfflineShotReconstructionTests(unittest.TestCase):
 
             self.assertTrue(Path(result["tracks_path"]).is_file())
             self.assertTrue(Path(result["events_path"]).is_file())
+            self.assertTrue(Path(result["rallies_path"]).is_file())
             self.assertEqual(result["frame_count"], 1)
 
+    def test_stationary_shuttle_boundary_counts_shots_in_one_candidate_rally(self):
+        rows = [
+            self._row(1, [100, 100], accepted=True, confidence=0.9, hit="track_001", zone="front_center"),
+            self._row(2, [130, 120], accepted=True, confidence=0.9),
+            self._row(3, [165, 145], accepted=True, confidence=0.9),
+            self._row(5, [220, 210], accepted=True, confidence=0.9, hit="track_002", zone="rear_center"),
+            self._row(6, [230, 220], accepted=True, confidence=0.9),
+            self._row(7, [232, 220], accepted=True, confidence=0.9),
+            self._row(8, [233, 220], accepted=True, confidence=0.9),
+            self._row(9, [233, 220], accepted=True, confidence=0.9),
+            self._row(10, [233, 220], accepted=True, confidence=0.9),
+        ]
+        tracks = reconstruct_shuttle_track(rows, fps=10)
+        events = build_shot_events(rows, tracks, fps=10)
+        rallies = build_rallies(
+            tracks,
+            events,
+            stationary_speed_px_s=30.0,
+            stationary_min_duration_sec=0.25,
+        )
+
+        self.assertEqual(len(rallies), 1)
+        self.assertEqual(rallies[0]["shot_count"], 2)
+        self.assertEqual(rallies[0]["end_reason"], "shuttle_stationary_or_slow")
+        self.assertEqual(events[0]["rally_id"], "rally_0001")
+        self.assertEqual(events[1]["shot_index_in_rally"], 2)
+
+    def test_same_singles_hitter_can_create_low_confidence_missing_return_candidate(self):
+        rows = [
+            self._row(
+                1, None, hit="track_001", zone="front_center", match_mode="singles",
+                visible_tracks=["track_001", "track_002"],
+            ),
+            self._row(
+                11, None, hit="track_001", zone="rear_center", match_mode="singles",
+                visible_tracks=["track_001", "track_002"],
+            ),
+        ]
+        events = build_shot_events(rows, reconstruct_shuttle_track(rows, fps=10), fps=10)
+        inferred = infer_missing_shuttle_events(rows, events)
+
+        self.assertEqual(len(inferred), 3)
+        missing_return = inferred[1]
+        self.assertEqual(missing_return["candidate_source"], "motion_inferred_missing_shuttle")
+        self.assertEqual(missing_return["event_origin"], "motion_constraint_candidate")
+        self.assertEqual(missing_return["hitter"]["track_id"], "track_002")
+        self.assertIsNone(missing_return["trajectory"]["outbound_speed"]["value"])
+        self.assertFalse(missing_return["decision"]["eligible_for_statistics"])
+
+    def test_missing_shuttle_rule_does_not_assign_a_doubles_hitter(self):
+        rows = [
+            self._row(
+                1, None, hit="track_001", zone="front_center", match_mode="doubles",
+                visible_tracks=["track_001", "track_002", "track_003", "track_004"],
+            ),
+            self._row(
+                11, None, hit="track_001", zone="rear_center", match_mode="doubles",
+                visible_tracks=["track_001", "track_002", "track_003", "track_004"],
+            ),
+        ]
+        events = build_shot_events(rows, reconstruct_shuttle_track(rows, fps=10), fps=10)
+
+        self.assertEqual(len(infer_missing_shuttle_events(rows, events)), 2)
+
     @staticmethod
-    def _row(frame, point, accepted=False, confidence=0.0, hit=None, zone=None):
+    def _row(frame, point, accepted=False, confidence=0.0, hit=None, zone=None, match_mode=None, visible_tracks=None):
         tracks = []
-        if hit:
+        for track_id in visible_tracks or ([hit] if hit else []):
             tracks.append(
                 {
-                    "track_id": hit,
+                    "track_id": track_id,
                     "status": "detected",
                     "confidence": 0.9,
-                    "zone_id": zone,
+                    "zone_id": zone if track_id == hit else "rear_center",
                     "court_xy_m": [3.0, 3.0],
                     "location_evidence": {"hands_image": {"left": [point[0] if point else 0, point[1] if point else 0], "right": None}},
                 }
@@ -85,6 +154,7 @@ class OfflineShotReconstructionTests(unittest.TestCase):
                 "confidence": confidence,
             },
             "spatial": {
+                "match": {"mode": match_mode} if match_mode else {},
                 "tracks": tracks,
                 "hit_events": ([{"status": "candidate", "hitter_track_id": hit, "confidence": 0.4, "reason": "synthetic"}] if hit else []),
             },

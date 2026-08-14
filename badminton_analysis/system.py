@@ -1,5 +1,6 @@
 ﻿import os
 import tempfile
+import json
 from tkinter import filedialog
 import tkinter as tk
 import time
@@ -665,10 +666,20 @@ class BadmintonAnalysisSystem:
                 self.detections_path,
                 fps=getattr(self, "fps", None),
             )
+            # ``metadata.json`` is the WebUI's compact result manifest.  Keep
+            # derived paths/counts here so a finished run exposes its candidate
+            # rally and shot summary without modifying immutable detections.
+            if os.path.isfile(self.metadata_path):
+                with open(self.metadata_path, "r", encoding="utf-8") as source:
+                    metadata = json.load(source)
+                metadata["derived"] = self.offline_artifacts
+                write_json(self.metadata_path, metadata)
             print(
                 "Offline shuttle reconstruction: "
                 f"{self.offline_artifacts['frame_count']} frames, "
-                f"{self.offline_artifacts['event_count']} candidate events"
+                f"{self.offline_artifacts['event_count']} candidate shots, "
+                f"{self.offline_artifacts.get('rally_count', 0)} candidate rallies, "
+                f"{self.offline_artifacts.get('inferred_shot_count', 0)} motion-inferred shots"
             )
         except Exception as exc:
             # The annotated video and immutable detections are still usable if

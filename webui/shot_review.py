@@ -228,6 +228,7 @@ def candidate_source_display(source):
         "spatial_hit_candidate": "人体/空间接近",
         "trajectory_turn": "轨迹方向变化",
         "trajectory_gap_transition": "短暂断检衔接",
+        "motion_inferred_missing_shuttle": "单打缺球动作约束候选",
         "hand_proximity_fallback": "手部接近（回退）",
         "manual_timeline": "人工补拍",
         "manual_merge": "人工合并",
@@ -474,6 +475,8 @@ def _candidate_from_derived_event(event):
         "hitter": event.get("hitter") or {},
         "receiver": event.get("receiver") or {},
         "event_origin": event.get("event_origin"),
+        "rally_id": event.get("rally_id"),
+        "shot_index_in_rally": event.get("shot_index_in_rally"),
         "image_plane_only": True,
         "decision_contract": "machine candidate only; not eligible for statistics until confirmed human review",
     })
