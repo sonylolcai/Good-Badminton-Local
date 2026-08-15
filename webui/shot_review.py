@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,7 @@ SESSION_FILENAME = "shot_candidates.json"
 ANNOTATIONS_FILENAME = "annotations.jsonl"
 CLIP_SECONDS_BEFORE = 1.0
 CLIP_SECONDS_AFTER = 1.8
+_RUN_TIMESTAMP_PATTERN = re.compile(r"(?<!\d)(20\d{6}_\d{6}(?:_\d{6})?)(?!\d)")
 
 
 def utc_now():
@@ -58,7 +60,13 @@ def utc_now():
 
 
 def find_analysis_runs(base_dir="outputs"):
-    """Return finished-analysis folders that contain the raw detection evidence."""
+    """Return finished-analysis folders in stable analysis-time order.
+
+    Directory mtime is not a valid "latest analysis" signal: opening a review
+    session or creating derived files changes it.  New folders use a timestamp
+    prefix; legacy folders are recognised by the timestamp that used to live at
+    the end of their name, with mtime retained only as a fallback.
+    """
     root = Path(base_dir)
     if not root.is_dir():
         return []
@@ -68,7 +76,43 @@ def find_analysis_runs(base_dir="outputs"):
         if "shot_review" in parent.parts:
             continue
         runs.append(parent)
-    return [str(path) for path in sorted(set(runs), key=lambda item: Path(item).stat().st_mtime, reverse=True)]
+    return [str(path) for path in sorted(set(runs), key=_analysis_run_sort_key, reverse=True)]
+
+
+def analysis_run_label(path):
+    """Return a timestamp-first dropdown label without renaming legacy data."""
+    path = Path(path)
+    timestamp = _analysis_run_timestamp(path) or datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d_%H%M%S")
+    name = path.name
+    display_name = _RUN_TIMESTAMP_PATTERN.sub("", name).strip("_ -") or name
+    if "remote_jobs" in path.parts:
+        source = "远端 GPU"
+    else:
+        source = "本地"
+    return f"{timestamp} · {source} · {display_name}"
+
+
+def _analysis_run_sort_key(path):
+    path = Path(path)
+    timestamp = _analysis_run_timestamp(path)
+    try:
+        modified_at = path.stat().st_mtime
+    except OSError:
+        modified_at = 0.0
+    # Timestamp-bearing names are analysis directories.  Unknown legacy/test
+    # names sort below them, instead of a review-generated file moving to top.
+    return (1 if timestamp else 0, timestamp or "", modified_at, str(path))
+
+
+def _analysis_run_timestamp(path):
+    # Prefer the leaf name, then allow the remote task folder immediately above
+    # a future nested output directory.  It also supports the old timestamp
+    # suffix without needing risky filesystem renames.
+    for candidate in (Path(path), Path(path).parent):
+        match = _RUN_TIMESTAMP_PATTERN.search(candidate.name)
+        if match:
+            return match.group(1)
+    return None
 
 
 def default_analysis_run(base_dir="outputs"):

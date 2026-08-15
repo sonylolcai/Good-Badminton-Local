@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -19,6 +20,7 @@ _MAX_WEBUI_OUTPUTS = 10
 _MAX_GENERATED_TEMPLATES = 20
 _MAX_COURT_FRAME_SAMPLES = 24
 _COURT_DETECTION_SIZE = (1080, 720)
+_SAFE_OUTPUT_STEM_PATTERN = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 _dependencies_loaded = False
 
@@ -35,13 +37,13 @@ def imread_safe(path, flags=cv2.IMREAD_COLOR):
     return img
 
 
-def _cleanup_old_outputs(base_dir="outputs", prefix="webui_", keep=_MAX_WEBUI_OUTPUTS):
+def _cleanup_old_outputs(base_dir="outputs", keep=_MAX_WEBUI_OUTPUTS):
     """Remove oldest webui output directories beyond *keep* count."""
     if not os.path.isdir(base_dir):
         return
     dirs = []
     for name in os.listdir(base_dir):
-        if name.startswith(prefix):
+        if _is_webui_output_directory(name):
             full = os.path.join(base_dir, name)
             if os.path.isdir(full):
                 dirs.append((os.path.getmtime(full), full))
@@ -73,6 +75,19 @@ def _cleanup_generated_templates(base_dir=os.path.join("outputs", "court_templat
             os.remove(path)
         except OSError:
             pass
+
+
+def _is_webui_output_directory(name):
+    """Recognise both legacy ``webui_*`` and timestamp-first result folders."""
+    return name.startswith("webui_") or bool(re.match(r"^20\d{6}_\d{6}_webui_", name))
+
+
+def _default_analysis_output_dir(video_path, timestamp):
+    """Create a readable result folder whose first sortable field is time."""
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    safe_name = _SAFE_OUTPUT_STEM_PATTERN.sub("_", video_name).strip(" ._") or "video"
+    # Leave room for the output root and generated artifacts on Windows.
+    return os.path.join("outputs", f"{timestamp}_webui_{safe_name[:80]}")
 
 
 def _ensure_dependencies():
@@ -414,8 +429,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     mid_height = mapper.mid_height
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
-    output_dir = output_dir or os.path.join("outputs", f"webui_{video_name}_{timestamp}")
+    output_dir = output_dir or _default_analysis_output_dir(video_path, timestamp)
     os.makedirs(output_dir, exist_ok=True)
 
     with open(os.path.join(output_dir, "court_annotations.txt"), "w") as f:

@@ -27,6 +27,7 @@ from webui.shot_review import (
     REVIEW_DECISIONS,
     SHOT_TYPES,
     add_manual_candidate,
+    analysis_run_label,
     candidate_at_table_row,
     candidate_choices,
     candidate_table,
@@ -680,7 +681,7 @@ def _switch_language(lang):
 
 def _review_run_choices():
     """Return newest-first analysis folders eligible for shot review."""
-    return [(Path(path).name, path) for path in find_analysis_runs("outputs")]
+    return [(analysis_run_label(path), path) for path in find_analysis_runs("outputs")]
 
 
 def _identity_claim_path(analysis_dir):
@@ -1549,6 +1550,15 @@ def build_ui():
         )
 
         refresh_review_runs.click(
+            fn=_review_refresh_runs,
+            inputs=[review_analysis_dir],
+            outputs=[review_analysis_dir],
+            show_progress="hidden",
+        )
+        # A job can finish while the analysis tab remains open. Refresh choices
+        # when the reviewer enters this tab so last night's result is visible
+        # without restarting the WebUI; keep an existing selection intact.
+        review_tab.select(
             fn=_review_refresh_runs,
             inputs=[review_analysis_dir],
             outputs=[review_analysis_dir],

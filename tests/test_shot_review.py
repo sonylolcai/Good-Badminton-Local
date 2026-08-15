@@ -5,9 +5,11 @@ from pathlib import Path
 
 from webui.shot_review import (
     add_manual_candidate,
+    analysis_run_label,
     candidate_at_table_row,
     candidate_table,
     create_or_load_review_session,
+    find_analysis_runs,
     merge_review_candidates,
     save_human_review,
     split_review_candidate,
@@ -30,6 +32,24 @@ def _row(frame, time_sec, ball, hit_events=None):
 
 
 class ShotReviewTests(unittest.TestCase):
+    def test_review_results_sort_by_analysis_timestamp_not_review_file_mtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_run = root / "webui_legacy_match_20260814_231420"
+            new_run = root / "20260815_000100_webui_new_match"
+            old_run.mkdir()
+            new_run.mkdir()
+            (old_run / "detections.jsonl").write_text("{}\n", encoding="utf-8")
+            (new_run / "detections.jsonl").write_text("{}\n", encoding="utf-8")
+            # A later human review must not make an older analysis appear new.
+            (old_run / "shot_review").mkdir()
+            (old_run / "shot_review" / "annotations.jsonl").write_text("{}\n", encoding="utf-8")
+
+            runs = find_analysis_runs(root)
+
+            self.assertEqual([Path(item).name for item in runs], [new_run.name, old_run.name])
+            self.assertTrue(analysis_run_label(new_run).startswith("20260815_000100 · 本地 ·"))
+
     def _write_detections(self, root):
         rows = [
             _row(100, 4.0, [100, 100], [{"status": "candidate", "hitter_track_id": "track_a", "confidence": 0.3}]),
