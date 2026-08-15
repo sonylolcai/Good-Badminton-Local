@@ -7,6 +7,7 @@ from badminton_analysis.analysis.offline_shot_reconstruction import (
     build_rallies_from_manual_terminals,
     build_shot_events,
     build_rallies,
+    detect_rally_terminal_candidates,
     evaluate_rally_terminal_predictions,
     generate_offline_artifacts,
     infer_missing_shuttle_events,
@@ -66,6 +67,7 @@ class OfflineShotReconstructionTests(unittest.TestCase):
             self.assertTrue(Path(result["tracks_path"]).is_file())
             self.assertTrue(Path(result["events_path"]).is_file())
             self.assertTrue(Path(result["rallies_path"]).is_file())
+            self.assertTrue(Path(result["terminal_candidates_path"]).is_file())
             self.assertEqual(result["frame_count"], 1)
 
     def test_stationary_shuttle_boundary_counts_shots_in_one_candidate_rally(self):
@@ -168,6 +170,41 @@ class OfflineShotReconstructionTests(unittest.TestCase):
         self.assertEqual(0.5, report["recall"])
         self.assertEqual(20.0, report["false_positives"][0]["time_sec"])
         self.assertEqual("reference_02", report["missed_references"][0]["terminal_id"])
+
+    def test_high_confidence_terminal_candidate_splits_rallies_without_using_human_reference(self):
+        events = [
+            {"event_id": "shot_0001", "hit_time_sec": 1.0, "event_origin": "observed"},
+            {"event_id": "shot_0002", "hit_time_sec": 5.0, "event_origin": "observed"},
+        ]
+        rallies = build_rallies(
+            [],
+            events,
+            terminal_candidates=[
+                {"time_sec": 3.0, "source": "direction_reversal_after_gap", "confidence": 0.8},
+            ],
+        )
+
+        self.assertEqual(2, len(rallies))
+        self.assertEqual(3.0, rallies[0]["end_time_sec"])
+        self.assertEqual("terminal_evidence_direction_reversal_after_gap", rallies[0]["end_reason"])
+        self.assertEqual(0.8, rallies[0]["terminal_evidence"]["confidence"])
+
+    def test_terminal_candidate_detector_keeps_low_confidence_evidence_separate_from_scores(self):
+        tracks = [
+            {"time_sec": 1.0, "status": "detected", "confidence": 0.9, "image_xy": [100, 100]},
+            {"time_sec": 1.04, "status": "detected", "confidence": 0.9, "image_xy": [120, 120]},
+            {"time_sec": 1.08, "status": "detected", "confidence": 0.9, "image_xy": [140, 140]},
+            {"time_sec": 1.60, "status": "detected", "confidence": 0.9, "image_xy": [100, 100]},
+        ]
+
+        candidates = detect_rally_terminal_candidates(
+            tracks,
+            court_polygon=[[0, 0], [640, 0], [640, 480], [0, 480]],
+        )
+
+        self.assertEqual(1, len(candidates))
+        self.assertEqual("direction_reversal_after_gap", candidates[0]["source"])
+        self.assertFalse(candidates[0]["eligible_for_scoring"])
 
     def test_same_singles_hitter_can_create_low_confidence_missing_return_candidate(self):
         rows = [

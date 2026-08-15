@@ -23,8 +23,9 @@ DERIVED_DIRNAME = "derived"
 SHUTTLE_TRACK_FILENAME = "shuttle_tracks_v2.jsonl"
 SHOT_EVENT_FILENAME = "shot_events_v2.jsonl"
 RALLY_FILENAME = "rallies_v2.jsonl"
+TERMINAL_CANDIDATE_FILENAME = "terminal_candidates_v1.jsonl"
 RALLY_BOUNDARY_REFERENCE_FILENAME = "rally_boundary_reference_user_review.jsonl"
-DERIVATION_VERSION = "2.2"
+DERIVATION_VERSION = "2.3"
 
 
 def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
@@ -41,28 +42,39 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
     events = build_shot_events(rows, track_rows, fps=fps)
     events = infer_missing_shuttle_events(rows, events)
     events = refresh_event_evidence(events, track_rows)
+    court_polygon = _court_polygon_from_metadata(detections_path.parent)
+    terminal_candidates = detect_rally_terminal_candidates(
+        track_rows,
+        raw_rows=rows,
+        court_polygon=court_polygon,
+    )
     # A static visual false-positive is especially harmful here: it turns one
-    # rally into two.  Automatic terminal evidence is therefore allowed only
-    # where the fixed-camera court polygon is available.
+    # rally into two.  Every accepted boundary retains its evidence source and
+    # confidence; manual references are never an input to this calculation.
     rallies = build_rallies(
         track_rows,
         events,
-        court_polygon=_court_polygon_from_metadata(detections_path.parent),
+        court_polygon=court_polygon,
+        terminal_candidates=terminal_candidates,
     )
     track_path = output_dir / SHUTTLE_TRACK_FILENAME
     event_path = output_dir / SHOT_EVENT_FILENAME
     rally_path = output_dir / RALLY_FILENAME
+    terminal_candidate_path = output_dir / TERMINAL_CANDIDATE_FILENAME
     write_jsonl(track_path, track_rows)
     write_jsonl(event_path, events)
     write_jsonl(rally_path, rallies)
+    write_jsonl(terminal_candidate_path, terminal_candidates)
     return {
         "version": DERIVATION_VERSION,
         "tracks_path": str(track_path),
         "events_path": str(event_path),
         "rallies_path": str(rally_path),
+        "terminal_candidates_path": str(terminal_candidate_path),
         "frame_count": len(track_rows),
         "event_count": len(events),
         "rally_count": len(rallies),
+        "terminal_candidate_count": len(terminal_candidates),
         "observed_shot_count": sum(event.get("event_origin") == "machine_candidate" for event in events),
         "inferred_shot_count": sum(event.get("event_origin") == "motion_constraint_candidate" for event in events),
         "fps": fps,
@@ -307,6 +319,8 @@ def build_rallies(
     stationary_min_duration_sec=0.75,
     max_unobserved_between_rallies_sec=4.0,
     court_polygon=None,
+    terminal_candidates=None,
+    min_terminal_confidence=0.65,
 ):
     """Segment a reviewable rally sequence and annotate every shot candidate.
 
@@ -323,6 +337,10 @@ def build_rallies(
         min_duration_sec=stationary_min_duration_sec,
         court_polygon=court_polygon,
     )
+    accepted_terminals = [
+        item for item in terminal_candidates or []
+        if float(item.get("confidence") or 0.0) >= float(min_terminal_confidence)
+    ]
     groups = []
     current = [ordered[0]]
     boundary_reasons = []
@@ -334,6 +352,7 @@ def build_rallies(
             previous_time=float(previous["hit_time_sec"]),
             next_time=float(event["hit_time_sec"]),
             max_unobserved_sec=max_unobserved_between_rallies_sec,
+            terminal_candidates=accepted_terminals,
         )
         if boundary:
             groups.append(current)
@@ -350,6 +369,7 @@ def build_rallies(
         terminal_boundary = following_boundary or _terminal_boundary_after_event(
             stationary_windows,
             last_event_time=float(group[-1]["hit_time_sec"]),
+            terminal_candidates=accepted_terminals,
         )
         end_time = terminal_boundary["end_time_sec"] if terminal_boundary else video_end
         end_reason = terminal_boundary["reason"] if terminal_boundary else "video_end_without_confirmed_terminal_event"
@@ -370,6 +390,11 @@ def build_rallies(
                 "start_time_sec": round(float(group[0]["hit_time_sec"]), 6),
                 "end_time_sec": round(float(end_time), 6),
                 "end_reason": end_reason,
+                "terminal_evidence": {
+                    "status": "candidate" if terminal_boundary else "unknown",
+                    "source": terminal_boundary.get("reason") if terminal_boundary else None,
+                    "confidence": terminal_boundary.get("confidence") if terminal_boundary else 0.0,
+                },
                 "shot_count": len(group),
                 "observed_shot_count": observed,
                 "motion_inferred_shot_count": inferred,
@@ -450,6 +475,184 @@ def build_rallies_from_manual_terminals(events, terminals, video_start_sec=0.0, 
         )
         start_time = end_time
     return reviewed
+
+
+def detect_rally_terminal_candidates(track_rows, raw_rows=None, court_polygon=None):
+    """Find explainable terminal *candidates* from fixed-camera shuttle evidence.
+
+    A badminton shuttle often disappears at landing or after an out call before
+    a long low-speed run is visible.  This function therefore combines several
+    independent visual signatures.  It never reads human boundary references,
+    never assigns a score, and leaves lower-confidence evidence available for
+    review rather than forcing a rally split.
+    """
+    if not court_polygon:
+        return []
+    observed = [
+        item for item in track_rows
+        if item.get("status") == "detected"
+        and float(item.get("confidence") or 0.0) >= 0.20
+        and _valid_point(item.get("image_xy"))
+    ]
+    if len(observed) < 3:
+        return []
+
+    candidates = []
+    ground_edge = _ground_facing_court_edge(court_polygon)
+    for index, (previous, current) in enumerate(zip(observed, observed[1:])):
+        if index == 0:
+            continue
+        before = observed[index - 1]
+        previous_time = float(previous["time_sec"])
+        current_time = float(current["time_sec"])
+        gap_sec = current_time - previous_time
+        before_gap_sec = previous_time - float(before["time_sec"])
+        if ground_edge is not None and _distance_to_segment(previous["image_xy"], *ground_edge) <= 85.0:
+            strict_current_inside = _point_in_or_near_polygon(current["image_xy"], court_polygon, margin=0.0)
+            transition_speed = _distance(previous["image_xy"], current["image_xy"]) / gap_sec
+            if not strict_current_inside and gap_sec <= 0.12 and transition_speed <= 1600.0:
+                candidates.append(
+                    _terminal_candidate(
+                        previous_time,
+                        "ground_facing_boundary_exit",
+                        0.74,
+                        gap_sec=gap_sec,
+                        transition_speed_px_s=transition_speed,
+                    )
+                )
+            elif not strict_current_inside and gap_sec <= 0.50 and transition_speed > 3200.0:
+                candidates.append(
+                    _terminal_candidate(
+                        previous_time,
+                        "implausible_reacquisition_after_descent",
+                        0.70,
+                        gap_sec=gap_sec,
+                        transition_speed_px_s=transition_speed,
+                    )
+                )
+
+        if not (0 < before_gap_sec <= 0.16 and 0.12 <= gap_sec <= 2.50):
+            continue
+        inbound = _velocity(before["image_xy"], previous["image_xy"], before_gap_sec)
+        resumed = _velocity(previous["image_xy"], current["image_xy"], gap_sec)
+        inbound_speed = math.hypot(*inbound)
+        direction_cosine = _cosine(inbound, resumed)
+        inside_previous = _point_in_or_near_polygon(previous["image_xy"], court_polygon)
+        inside_current = _point_in_or_near_polygon(current["image_xy"], court_polygon)
+        hand_distance = _nearest_hand_distance(raw_rows, previous_time, previous["image_xy"])
+
+        if (
+            inside_previous
+            and inside_current
+            and 100.0 <= inbound_speed <= 1500.0
+            and direction_cosine <= -0.50
+            and not (hand_distance is not None and hand_distance <= 30.0)
+        ):
+            confidence = 0.48
+            if gap_sec >= 0.40:
+                confidence += 0.12
+            if float(previous.get("confidence") or 0.0) >= 0.50:
+                confidence += 0.08
+            if direction_cosine <= -0.80:
+                confidence += 0.10
+            candidates.append(
+                _terminal_candidate(
+                    previous_time,
+                    "direction_reversal_after_gap",
+                    confidence,
+                    gap_sec=gap_sec,
+                    inbound_speed_px_s=inbound_speed,
+                    direction_cosine=direction_cosine,
+                    nearest_hand_distance_px=hand_distance,
+                )
+            )
+
+    for window in _stationary_windows(
+        track_rows,
+        speed_limit_px_s=60.0,
+        min_duration_sec=0.14,
+        max_point_gap_sec=0.12,
+        court_polygon=court_polygon,
+    ):
+        end_time = float(window["end_time_sec"])
+        next_observation = next(
+            (
+                item for item in observed
+                if end_time < float(item["time_sec"]) <= end_time + 0.50
+                and not _point_in_or_near_polygon(item["image_xy"], court_polygon, margin=0.0)
+            ),
+            None,
+        )
+        if next_observation is None:
+            continue
+        gap_sec = float(next_observation["time_sec"]) - end_time
+        if not 0.12 <= gap_sec <= 0.50:
+            continue
+        candidates.append(
+            _terminal_candidate(
+                (float(window["start_time_sec"]) + end_time) / 2.0,
+                "short_stationary_then_evidence_break",
+                0.72,
+                stationary_duration_sec=end_time - float(window["start_time_sec"]),
+                gap_sec=gap_sec,
+            )
+        )
+    return _deduplicate_terminal_candidates(candidates)
+
+
+def _terminal_candidate(time_sec, source, confidence, **evidence):
+    return {
+        "schema_version": DERIVATION_VERSION,
+        "status": "candidate",
+        "time_sec": round(float(time_sec), 6),
+        "source": source,
+        "confidence": round(max(0.0, min(0.85, float(confidence))), 4),
+        "evidence": {key: round(float(value), 6) if isinstance(value, (int, float)) else value for key, value in evidence.items()},
+        "eligible_for_scoring": False,
+    }
+
+
+def _deduplicate_terminal_candidates(candidates, merge_window_sec=1.0):
+    """Keep the strongest explanation in a local time cluster, preserving sources."""
+    clusters = []
+    for candidate in sorted(candidates, key=lambda item: float(item["time_sec"])):
+        if clusters and float(candidate["time_sec"]) - float(clusters[-1][-1]["time_sec"]) <= merge_window_sec:
+            clusters[-1].append(candidate)
+        else:
+            clusters.append([candidate])
+    merged = []
+    for index, cluster in enumerate(clusters, start=1):
+        best = max(cluster, key=lambda item: (float(item["confidence"]), -float(item["time_sec"])))
+        merged.append(
+            {
+                **best,
+                "terminal_candidate_id": f"terminal_candidate_{index:04d}",
+                "evidence": {
+                    **(best.get("evidence") or {}),
+                    "merged_sources": [item["source"] for item in cluster],
+                },
+            }
+        )
+    return merged
+
+
+def _ground_facing_court_edge(polygon):
+    if len(polygon) < 3:
+        return None
+    edges = list(zip(polygon, [*polygon[1:], polygon[0]]))
+    return max(edges, key=lambda edge: (float(edge[0][1]) + float(edge[1][1])) / 2.0)
+
+
+def _nearest_hand_distance(raw_rows, time_sec, point):
+    if not raw_rows or not _valid_point(point):
+        return None
+    raw = min(raw_rows, key=lambda item: abs(float(item.get("time_sec", 0.0)) - float(time_sec)))
+    distances = []
+    for player in (raw.get("players") or {}).values():
+        for hand in (player.get("hands") or {}).values():
+            if _valid_point(hand):
+                distances.append(_distance(point, hand))
+    return min(distances) if distances else None
 
 
 def load_rally_boundary_reference(analysis_dir):
@@ -852,7 +1055,21 @@ def _stationary_windows(
     return windows
 
 
-def _boundary_between_events(track_rows, stationary_windows, previous_time, next_time, max_unobserved_sec):
+def _boundary_between_events(
+    track_rows,
+    stationary_windows,
+    previous_time,
+    next_time,
+    max_unobserved_sec,
+    terminal_candidates=None,
+):
+    for candidate in terminal_candidates or []:
+        if previous_time < float(candidate["time_sec"]) < next_time:
+            return {
+                "reason": f"terminal_evidence_{candidate.get('source', 'candidate')}",
+                "end_time_sec": float(candidate["time_sec"]),
+                "confidence": candidate.get("confidence"),
+            }
     for window in stationary_windows:
         if previous_time < window["start_time_sec"] < next_time:
             return {
@@ -865,7 +1082,14 @@ def _boundary_between_events(track_rows, stationary_windows, previous_time, next
     return None
 
 
-def _terminal_boundary_after_event(stationary_windows, last_event_time):
+def _terminal_boundary_after_event(stationary_windows, last_event_time, terminal_candidates=None):
+    for candidate in terminal_candidates or []:
+        if float(candidate["time_sec"]) > last_event_time:
+            return {
+                "reason": f"terminal_evidence_{candidate.get('source', 'candidate')}",
+                "end_time_sec": float(candidate["time_sec"]),
+                "confidence": candidate.get("confidence"),
+            }
     for window in stationary_windows:
         if window["start_time_sec"] > last_event_time:
             return {
