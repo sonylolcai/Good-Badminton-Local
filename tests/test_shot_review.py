@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from webui.shot_review import (
+    add_manual_rally_terminal,
     add_manual_candidate,
     analysis_run_label,
     candidate_at_table_row,
@@ -12,6 +13,7 @@ from webui.shot_review import (
     find_analysis_runs,
     merge_review_candidates,
     rally_playback_state,
+    reviewed_rally_table,
     save_human_review,
     split_review_candidate,
     timeline_state,
@@ -178,3 +180,19 @@ class ShotReviewTests(unittest.TestCase):
             self.assertEqual(expected[0], candidate["shot_id"])
             with self.assertRaises(ValueError):
                 candidate_at_table_row(session, 999)
+
+    def test_human_terminal_facts_override_candidate_rally_display_without_changing_detections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            detections = self._write_detections(directory)
+            before = detections.read_bytes()
+            add_manual_rally_terminal(directory, 4.5, "out_of_bounds", "coach", "visible out")
+            add_manual_rally_terminal(directory, 6.0, "landed_in_bounds", "coach", "visible landing")
+
+            session = create_or_load_review_session(directory)
+            state = rally_playback_state(session, 4.6)
+
+            self.assertEqual(before, detections.read_bytes())
+            self.assertEqual("human_reviewed", state["status"])
+            self.assertEqual(2, state["rally_number"])
+            self.assertEqual(2, state["rally_count"])
+            self.assertEqual(2, len(reviewed_rally_table(session)))

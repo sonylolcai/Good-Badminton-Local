@@ -24,8 +24,10 @@ from pathlib import Path
 import cv2
 
 from badminton_analysis.analysis.offline_shot_reconstruction import (
+    build_rallies_from_manual_terminals,
     generate_offline_artifacts,
     load_jsonl as load_derived_jsonl,
+    write_jsonl,
 )
 from webui.pipeline import _find_ffmpeg
 
@@ -50,13 +52,124 @@ REVIEW_DECISIONS = {
 }
 SESSION_FILENAME = "shot_candidates.json"
 ANNOTATIONS_FILENAME = "annotations.jsonl"
+RALLY_TERMINALS_FILENAME = "rally_terminals.jsonl"
+REVIEWED_RALLIES_FILENAME = "reviewed_rallies_v2.jsonl"
 CLIP_SECONDS_BEFORE = 1.0
 CLIP_SECONDS_AFTER = 1.8
 _RUN_TIMESTAMP_PATTERN = re.compile(r"(?<!\d)(20\d{6}_\d{6}(?:_\d{6})?)(?!\d)")
 
+RALLY_TERMINAL_OUTCOMES = {
+    "out_of_bounds": "球出界",
+    "landed_in_bounds": "球落地（界内）",
+    "landed_out_of_bounds": "球落地（出界）",
+    "landed_unknown": "球落地（界内外待定）",
+}
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def rally_terminal_path(analysis_dir):
+    return Path(analysis_dir).expanduser().resolve() / "shot_review" / RALLY_TERMINALS_FILENAME
+
+
+def reviewed_rallies_path(analysis_dir):
+    return Path(analysis_dir).expanduser().resolve() / "shot_review" / REVIEWED_RALLIES_FILENAME
+
+
+def load_manual_rally_terminals(analysis_dir):
+    """Load append-only human terminal facts, newest duplicate kept only once."""
+    path = rally_terminal_path(analysis_dir)
+    if not path.is_file():
+        return []
+    latest_by_time = {}
+    for item in load_derived_jsonl(path):
+        try:
+            time_sec = round(float(item.get("time_sec")), 3)
+        except (TypeError, ValueError):
+            continue
+        if item.get("outcome") not in RALLY_TERMINAL_OUTCOMES:
+            continue
+        latest_by_time[time_sec] = item
+    return [latest_by_time[key] for key in sorted(latest_by_time)]
+
+
+def rebuild_reviewed_rallies(analysis_dir):
+    """Build the display-only human-reviewed rally timeline beside raw output."""
+    analysis_path = Path(analysis_dir).expanduser().resolve()
+    terminals = load_manual_rally_terminals(analysis_path)
+    output_path = reviewed_rallies_path(analysis_path)
+    if not terminals:
+        if output_path.exists():
+            output_path.unlink()
+        return [], output_path
+    derived = generate_offline_artifacts(analysis_path / "detections.jsonl")
+    events = load_derived_jsonl(derived["events_path"])
+    reviewed = build_rallies_from_manual_terminals(events, terminals)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_jsonl(output_path, reviewed)
+    return reviewed, output_path
+
+
+def add_manual_rally_terminal(analysis_dir, time_sec, outcome, reviewer="", note=""):
+    """Append a reviewer-confirmed terminal boundary without touching raw data."""
+    if outcome not in RALLY_TERMINAL_OUTCOMES:
+        raise ValueError("未知的回合结束类型。")
+    try:
+        time_sec = round(float(time_sec), 3)
+    except (TypeError, ValueError) as error:
+        raise ValueError("回合结束时间必须是有效秒数。") from error
+    if time_sec < 0:
+        raise ValueError("回合结束时间不能小于 0 秒。")
+    path = rally_terminal_path(analysis_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_manual_rally_terminals(analysis_dir)
+    if any(abs(float(item["time_sec"]) - time_sec) <= 0.05 for item in existing):
+        raise ValueError("该时间附近已经有人工确认的回合结束记录。")
+    record = {
+        "schema_version": "1.0",
+        "terminal_id": f"terminal_{len(existing) + 1:04d}",
+        "time_sec": time_sec,
+        "outcome": outcome,
+        "source": "human_review",
+        "reviewer": (reviewer or "").strip(),
+        "note": (note or "").strip(),
+        "recorded_at": utc_now(),
+    }
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record, ensure_ascii=False) + "\n")
+    reviewed, _ = rebuild_reviewed_rallies(analysis_dir)
+    return record, reviewed
+
+
+def reviewed_rally_table(session):
+    """Rows displayed beside the player; machine and human boundaries stay distinct."""
+    rows = []
+    for item in session.get("reviewed_rallies") or []:
+        terminal = item.get("terminal") or {}
+        rows.append([
+            item.get("rally_id"),
+            round(float(item.get("start_time_sec", 0.0)), 2),
+            round(float(item.get("end_time_sec", 0.0)), 2),
+            int(item.get("shot_count", 0)),
+            RALLY_TERMINAL_OUTCOMES.get(terminal.get("outcome"), terminal.get("outcome") or "未知"),
+            "人工确认",
+        ])
+    return rows
+
+
+def _attach_reviewed_rallies(session, analysis_path):
+    """Attach a small reviewed view for playback without rewriting the session."""
+    path = reviewed_rallies_path(analysis_path)
+    if path.is_file():
+        try:
+            session["reviewed_rallies"] = load_derived_jsonl(path)
+        except (OSError, ValueError):
+            session.pop("reviewed_rallies", None)
+    else:
+        session.pop("reviewed_rallies", None)
+    return session
 
 
 def find_analysis_runs(base_dir="outputs"):
@@ -136,7 +249,7 @@ def create_or_load_review_session(analysis_dir, reference_video=None, regenerate
     session_path = review_dir / SESSION_FILENAME
     previous_session = _load_json(session_path) if session_path.is_file() else None
     if previous_session is not None and not regenerate:
-        return previous_session
+        return _attach_reviewed_rallies(previous_session, analysis_path)
 
     rows = _load_detections(detections_path)
     derived = generate_offline_artifacts(detections_path)
@@ -171,7 +284,7 @@ def create_or_load_review_session(analysis_dir, reference_video=None, regenerate
         _preserve_manual_review_work(previous_session, session)
     review_dir.mkdir(parents=True, exist_ok=True)
     _write_json(session_path, session)
-    return session
+    return _attach_reviewed_rallies(session, analysis_path)
 
 
 def review_session_path(analysis_dir):
@@ -245,6 +358,14 @@ def rally_playback_state(session, playback_sec):
     explicit re-segmentation step, so the UI must show that fact instead of
     silently placing it into a neighbouring rally.
     """
+    try:
+        playback_sec = max(0.0, float(playback_sec or 0.0))
+    except (TypeError, ValueError):
+        playback_sec = 0.0
+    reviewed = session.get("reviewed_rallies") or []
+    if reviewed:
+        return _reviewed_rally_playback_state(reviewed, playback_sec)
+
     timeline = timeline_state(session, playback_sec)
     current = timeline["current"]
     if current is None:
@@ -307,6 +428,52 @@ def rally_playback_state(session, playback_sec):
         "rally_count": len(rally_ids),
         "shot_index": current_shot_index,
         "shot_count": max(shot_indexes, default=len(rally_candidates)),
+    }
+
+
+def _reviewed_rally_playback_state(reviewed_rallies, playback_sec):
+    """Use human terminal facts when available, without assigning extra shots."""
+    for index, rally in enumerate(reviewed_rallies, start=1):
+        start = float(rally.get("start_time_sec", 0.0))
+        end = float(rally.get("end_time_sec", start))
+        if start <= playback_sec <= end:
+            event_times = [float(value) for value in rally.get("shot_times_sec") or []]
+            completed = sum(time_sec <= playback_sec for time_sec in event_times)
+            terminal = rally.get("terminal") or {}
+            return {
+                "status": "human_reviewed",
+                "playback_sec": playback_sec,
+                "rally_id": rally.get("rally_id"),
+                "rally_number": index,
+                "rally_count": len(reviewed_rallies),
+                "shot_index": completed,
+                "shot_count": int(rally.get("shot_count", 0)),
+                "terminal_time_sec": end,
+                "terminal_outcome": terminal.get("outcome"),
+            }
+    if playback_sec > float(reviewed_rallies[-1].get("end_time_sec", 0.0)):
+        last = reviewed_rallies[-1]
+        return {
+            "status": "after_last_human_terminal",
+            "playback_sec": playback_sec,
+            "rally_id": last.get("rally_id"),
+            "rally_number": len(reviewed_rallies),
+            "rally_count": len(reviewed_rallies),
+            "shot_index": int(last.get("shot_count", 0)),
+            "shot_count": int(last.get("shot_count", 0)),
+            "terminal_time_sec": float(last.get("end_time_sec", 0.0)),
+            "terminal_outcome": (last.get("terminal") or {}).get("outcome"),
+        }
+    return {
+        "status": "before_first_human_terminal",
+        "playback_sec": playback_sec,
+        "rally_id": None,
+        "rally_number": 1,
+        "rally_count": len(reviewed_rallies),
+        "shot_index": 0,
+        "shot_count": int(reviewed_rallies[0].get("shot_count", 0)),
+        "terminal_time_sec": float(reviewed_rallies[0].get("end_time_sec", 0.0)),
+        "terminal_outcome": (reviewed_rallies[0].get("terminal") or {}).get("outcome"),
     }
 
 

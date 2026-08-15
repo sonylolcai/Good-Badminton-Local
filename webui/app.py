@@ -26,8 +26,10 @@ from webui.pipeline import (
 from webui.remote_gpu import RemoteAnalysisError, remote_gpu_config, run_remote_analysis
 from webui.shot_review import (
     REVIEW_DECISIONS,
+    RALLY_TERMINAL_OUTCOMES,
     SHOT_TYPES,
     add_manual_candidate,
+    add_manual_rally_terminal,
     analysis_run_label,
     candidate_at_table_row,
     candidate_choices,
@@ -39,6 +41,7 @@ from webui.shot_review import (
     merge_review_candidates,
     review_summary,
     rally_playback_state,
+    reviewed_rally_table,
     save_human_review,
     split_review_candidate,
     timeline_state,
@@ -793,9 +796,11 @@ def _review_summary_markdown(session, selected_id=None):
     position = next((index + 1 for index, (_, value) in enumerate(active) if value == selected_id), 0)
     selected = f"当前：**{position} / {summary['candidate_count']}**" if position else f"共 **{summary['candidate_count']}** 个候选"
     completed = summary["confirmed"] + summary["corrected"] + summary["uncertain"] + summary["excluded"]
+    reviewed_count = len(session.get("reviewed_rallies") or [])
+    reviewed = f"　人工确认回合 **{reviewed_count}**" if reviewed_count else ""
     return (
         f"**复核进度**　{selected}　已处理 **{completed}**　待复核 **{summary['pending']}**　"
-        f"确认/修正 **{summary['confirmed'] + summary['corrected']}**　排除 **{summary['excluded']}**"
+        f"确认/修正 **{summary['confirmed'] + summary['corrected']}**　排除 **{summary['excluded']}**{reviewed}"
     )
 
 
@@ -914,7 +919,24 @@ def _review_empty_editor_markdown(playback_sec=0.0):
 def _review_rally_overlay(session, playback_sec):
     """Render the non-authoritative rally counter placed over the match video."""
     state = rally_playback_state(session, playback_sec)
-    if state["status"] == "assigned":
+    if state["status"] == "human_reviewed":
+        rally = f"人工确认回合 {state['rally_number']} / {state['rally_count']}"
+        if state["shot_count"]:
+            shots = f"本回合已到第 {state['shot_index']} / {state['shot_count']} 拍"
+        else:
+            shots = "本回合尚未检测到触球"
+        outcome = RALLY_TERMINAL_OUTCOMES.get(state.get("terminal_outcome"), "人工确认终止")
+        detail = f"终止：{outcome} · {state['terminal_time_sec']:.2f}s"
+    elif state["status"] == "after_last_human_terminal":
+        rally = f"人工确认回合 {state['rally_number']} / {state['rally_count']} 已结束"
+        shots = f"本回合 {state['shot_count']} 拍"
+        outcome = RALLY_TERMINAL_OUTCOMES.get(state.get("terminal_outcome"), "人工确认终止")
+        detail = f"终止：{outcome} · {state['terminal_time_sec']:.2f}s"
+    elif state["status"] == "before_first_human_terminal":
+        rally = f"人工确认回合 1 / {state['rally_count']}"
+        shots = "等待第一拍"
+        detail = f"首个终止点：{state['terminal_time_sec']:.2f}s"
+    elif state["status"] == "assigned":
         rally = f"候选回合 {state['rally_number']} / {state['rally_count']}"
         shots = f"本回合第 {state['shot_index']} / {state['shot_count']} 拍"
         detail = "仅统计当前离线候选；待人工复核"
@@ -993,6 +1015,7 @@ def _review_open_timeline(analysis_dir, reference_video=None):
         gr.update(choices=choices, value=selected_id),
         _review_summary_markdown(session, selected_id),
         candidate_table(session),
+        reviewed_rally_table(session),
         video_path,
         _review_video_fps(video_path),
         _review_match_video_message(session),
@@ -1119,6 +1142,24 @@ def _review_add_at_playback(analysis_dir, playback_sec, reviewer, reference_vide
         _review_live_markdown(session, state["playback_sec"]),
         _review_rally_overlay(session, state["playback_sec"]),
         f"已在 **{state['playback_sec']:.2f}s** 添加人工触球。现在选择球种和复核结果，再保存本次修改。",
+    )
+
+
+def _review_add_terminal_at_playback(analysis_dir, playback_sec, outcome, reviewer, note, reference_video=None):
+    if not analysis_dir:
+        raise gr.Error("请先打开一场分析结果。")
+    try:
+        record, _ = add_manual_rally_terminal(analysis_dir, playback_sec, outcome, reviewer, note)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    outcome_display = RALLY_TERMINAL_OUTCOMES.get(record["outcome"], record["outcome"])
+    return (
+        reviewed_rally_table(session),
+        _review_summary_markdown(session),
+        _review_rally_overlay(session, playback_sec),
+        f"已在 **{record['time_sec']:.2f}s** 标记人工回合结束：**{outcome_display}**。"
+        "该记录写入 `shot_review/rally_terminals.jsonl`，原始检测未修改。",
     )
 
 
@@ -1571,12 +1612,26 @@ def build_ui():
                         max_height=245,
                         elem_id="review-touch-record",
                     )
+                    review_rallies_table = gr.Dataframe(
+                        headers=["回合", "开始(s)", "结束(s)", "候选拍数", "人工终止证据", "来源"],
+                        datatype=["str", "number", "number", "number", "str", "str"],
+                        interactive=False,
+                        label="人工确认回合（优先于自动静止候选）",
+                        max_height=220,
+                    )
                 with gr.Column(scale=2, elem_id="review-editor-panel"):
                     review_current_time = gr.Textbox(label="当前视频时间", value="—", interactive=False)
                     review_live_judgement = gr.Markdown("### 当前球路：等待打开视频")
                     with gr.Row():
                         edit_playback_candidate_btn = gr.Button("编辑当前触球", size="sm")
                         add_playback_candidate_btn = gr.Button("在当前时间添加触球", size="sm")
+                    with gr.Accordion("人工确认回合结束", open=False):
+                        review_terminal_outcome = gr.Dropdown(
+                            choices=[(display, key) for key, display in RALLY_TERMINAL_OUTCOMES.items()],
+                            value="landed_unknown",
+                            label="当前时间的回合终止类型",
+                        )
+                        add_terminal_btn = gr.Button("在当前时间标记回合结束", size="sm")
                     gr.Markdown("### 人工修改")
                     review_shot_id = gr.Dropdown(label="编辑对象（可手动切换）")
                     review_details = gr.Markdown("播放到需处理的触球处，选择“编辑当前触球”或“在当前时间添加触球”。")
@@ -1679,7 +1734,7 @@ def build_ui():
             fn=_review_open_timeline,
             inputs=[review_analysis_dir, review_source_video],
             outputs=[
-                review_shot_id, review_summary_output, review_candidates_table, review_match_video,
+                review_shot_id, review_summary_output, review_candidates_table, review_rallies_table, review_match_video,
                 review_frame_controls, review_video_message, review_current_time, review_live_judgement, review_rally_overlay,
                 review_details, review_label, review_decision, review_reviewer, review_note, review_notice,
             ],
@@ -1688,7 +1743,7 @@ def build_ui():
             fn=_review_open_timeline,
             inputs=[review_analysis_dir, review_source_video],
             outputs=[
-                review_shot_id, review_summary_output, review_candidates_table, review_match_video,
+                review_shot_id, review_summary_output, review_candidates_table, review_rallies_table, review_match_video,
                 review_frame_controls, review_video_message, review_current_time, review_live_judgement, review_rally_overlay,
                 review_details, review_label, review_decision, review_reviewer, review_note, review_notice,
             ],
@@ -1733,6 +1788,15 @@ def build_ui():
                 review_label, review_decision, review_reviewer, review_note, review_live_judgement,
                 review_rally_overlay, review_notice,
             ],
+            show_progress="hidden",
+        )
+        add_terminal_btn.click(
+            fn=_review_add_terminal_at_playback,
+            inputs=[
+                review_analysis_dir, review_playback_clock, review_terminal_outcome,
+                review_reviewer, review_note, review_source_video,
+            ],
+            outputs=[review_rallies_table, review_summary_output, review_rally_overlay, review_notice],
             show_progress="hidden",
         )
         save_review_btn.click(

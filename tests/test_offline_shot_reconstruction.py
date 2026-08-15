@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from badminton_analysis.analysis.offline_shot_reconstruction import (
+    build_rallies_from_manual_terminals,
     build_shot_events,
     build_rallies,
     generate_offline_artifacts,
@@ -85,6 +86,7 @@ class OfflineShotReconstructionTests(unittest.TestCase):
             events,
             stationary_speed_px_s=30.0,
             stationary_min_duration_sec=0.25,
+            court_polygon=[[0, 0], [640, 0], [640, 480], [0, 480]],
         )
 
         self.assertEqual(len(rallies), 1)
@@ -92,6 +94,56 @@ class OfflineShotReconstructionTests(unittest.TestCase):
         self.assertEqual(rallies[0]["end_reason"], "shuttle_stationary_or_slow")
         self.assertEqual(events[0]["rally_id"], "rally_0001")
         self.assertEqual(events[1]["shot_index_in_rally"], 2)
+
+    def test_outside_static_artifact_and_missing_gap_do_not_split_a_rally(self):
+        events = [
+            {"event_id": "shot_0001", "hit_time_sec": 1.0, "event_origin": "observed"},
+            {"event_id": "shot_0002", "hit_time_sec": 9.0, "event_origin": "observed"},
+        ]
+        tracks = [
+            {"time_sec": 2.0, "status": "detected", "confidence": 0.9, "image_xy": [900, 20]},
+            {"time_sec": 2.4, "status": "detected", "confidence": 0.9, "image_xy": [900, 20]},
+            {"time_sec": 2.8, "status": "detected", "confidence": 0.9, "image_xy": [900, 20]},
+            {"time_sec": 3.2, "status": "unknown_gap", "confidence": 0.0, "image_xy": None},
+            {"time_sec": 7.0, "status": "unknown_gap", "confidence": 0.0, "image_xy": None},
+        ]
+
+        rallies = build_rallies(
+            tracks,
+            events,
+            stationary_min_duration_sec=0.5,
+            court_polygon=[[0, 0], [640, 0], [640, 480], [0, 480]],
+        )
+
+        self.assertEqual(1, len(rallies))
+        self.assertEqual("video_end_without_confirmed_terminal_event", rallies[0]["end_reason"])
+        self.assertEqual("rally_0001", events[1]["rally_id"])
+
+    def test_manual_terminal_facts_create_eight_style_reviewed_segments_without_mutating_events(self):
+        events = [
+            {"event_id": "shot_0001", "hit_time_sec": 1.0, "event_origin": "observed"},
+            {"event_id": "shot_0002", "hit_time_sec": 4.0, "event_origin": "motion_constraint_candidate"},
+            {"event_id": "shot_0003", "hit_time_sec": 6.0, "event_origin": "observed"},
+        ]
+        original = copy.deepcopy(events)
+
+        reviewed = build_rallies_from_manual_terminals(
+            events,
+            [
+                {"terminal_id": "terminal_0001", "time_sec": 5.0, "outcome": "out_of_bounds"},
+                {"terminal_id": "terminal_0002", "time_sec": 10.0, "outcome": "landed_in_bounds"},
+            ],
+        )
+
+        self.assertEqual(2, len(reviewed))
+        self.assertEqual((0.0, 5.0, 2), (
+            reviewed[0]["start_time_sec"], reviewed[0]["end_time_sec"], reviewed[0]["shot_count"],
+        ))
+        self.assertEqual((5.0, 10.0, 1), (
+            reviewed[1]["start_time_sec"], reviewed[1]["end_time_sec"], reviewed[1]["shot_count"],
+        ))
+        self.assertEqual("out_of_bounds", reviewed[0]["terminal"]["outcome"])
+        self.assertEqual(events, original)
 
     def test_same_singles_hitter_can_create_low_confidence_missing_return_candidate(self):
         rows = [

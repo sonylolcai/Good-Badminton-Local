@@ -23,7 +23,7 @@ DERIVED_DIRNAME = "derived"
 SHUTTLE_TRACK_FILENAME = "shuttle_tracks_v2.jsonl"
 SHOT_EVENT_FILENAME = "shot_events_v2.jsonl"
 RALLY_FILENAME = "rallies_v2.jsonl"
-DERIVATION_VERSION = "2.1"
+DERIVATION_VERSION = "2.2"
 
 
 def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
@@ -40,7 +40,14 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
     events = build_shot_events(rows, track_rows, fps=fps)
     events = infer_missing_shuttle_events(rows, events)
     events = refresh_event_evidence(events, track_rows)
-    rallies = build_rallies(track_rows, events)
+    # A static visual false-positive is especially harmful here: it turns one
+    # rally into two.  Automatic terminal evidence is therefore allowed only
+    # where the fixed-camera court polygon is available.
+    rallies = build_rallies(
+        track_rows,
+        events,
+        court_polygon=_court_polygon_from_metadata(detections_path.parent),
+    )
     track_path = output_dir / SHUTTLE_TRACK_FILENAME
     event_path = output_dir / SHOT_EVENT_FILENAME
     rally_path = output_dir / RALLY_FILENAME
@@ -298,12 +305,13 @@ def build_rallies(
     stationary_speed_px_s=45.0,
     stationary_min_duration_sec=0.75,
     max_unobserved_between_rallies_sec=4.0,
+    court_polygon=None,
 ):
     """Segment a reviewable rally sequence and annotate every shot candidate.
 
     A long run of slow, continuous shuttle observations is the preferred
-    boundary.  A long interval with no accepted/reconstructed shuttle evidence
-    is only a low-confidence fallback boundary, never a score decision.
+    boundary.  Missing shuttle evidence is not a boundary: it remains unknown
+    until a later terminal observation or a human review is available.
     """
     ordered = sorted(events, key=lambda item: float(item["hit_time_sec"]))
     if not ordered:
@@ -312,6 +320,7 @@ def build_rallies(
         track_rows,
         speed_limit_px_s=stationary_speed_px_s,
         min_duration_sec=stationary_min_duration_sec,
+        court_polygon=court_polygon,
     )
     groups = []
     current = [ordered[0]]
@@ -374,6 +383,72 @@ def build_rallies(
             }
         )
     return rallies
+
+
+def build_rallies_from_manual_terminals(events, terminals, video_start_sec=0.0, video_end_sec=None):
+    """Create a reviewed rally timeline from append-only human terminal facts.
+
+    This is deliberately separate from ``build_rallies``.  A reviewer can
+    confirm that a shuttle landed or went out even when the detector did not
+    see it; that fact must not rewrite raw detections or be presented as a
+    machine terminal decision.
+    """
+    ordered_events = sorted(events, key=lambda item: float(item.get("hit_time_sec", 0.0)))
+    normalized = []
+    for terminal in sorted(terminals, key=lambda item: float(item.get("time_sec", 0.0))):
+        try:
+            time_sec = float(terminal.get("time_sec"))
+        except (TypeError, ValueError):
+            continue
+        if time_sec < float(video_start_sec):
+            continue
+        if normalized and time_sec <= normalized[-1]["time_sec"]:
+            continue
+        normalized.append({**terminal, "time_sec": round(time_sec, 6)})
+
+    reviewed = []
+    start_time = float(video_start_sec)
+    for index, terminal in enumerate(normalized, start=1):
+        end_time = terminal["time_sec"]
+        event_group = [
+            item for item in ordered_events
+            if start_time < float(item.get("hit_time_sec", 0.0)) <= end_time
+        ]
+        observed = sum(item.get("event_origin") != "motion_constraint_candidate" for item in event_group)
+        inferred = len(event_group) - observed
+        outcome = str(terminal.get("outcome") or "unknown_terminal")
+        reviewed.append(
+            {
+                "schema_version": "1.0",
+                "rally_id": f"reviewed_rally_{index:04d}",
+                "status": "human_terminal_reviewed",
+                "start_time_sec": round(start_time, 6),
+                "end_time_sec": end_time,
+                "end_reason": f"human_confirmed_{outcome}",
+                "terminal": {
+                    "source": "human_review",
+                    "terminal_id": terminal.get("terminal_id"),
+                    "outcome": outcome,
+                    "reviewer": terminal.get("reviewer") or "",
+                    "note": terminal.get("note") or "",
+                    "recorded_at": terminal.get("recorded_at"),
+                },
+                "shot_count": len(event_group),
+                "observed_shot_count": observed,
+                "motion_inferred_shot_count": inferred,
+                "shot_event_ids": [item.get("event_id") for item in event_group if item.get("event_id")],
+                "shot_times_sec": [round(float(item.get("hit_time_sec", 0.0)), 6) for item in event_group],
+                "confidence": 1.0,
+                "score": {
+                    "status": "unknown",
+                    "winner_track_id": None,
+                    "included_in_player_statistics": False,
+                    "reason": "Human terminal review confirms only a rally boundary, not score evidence.",
+                },
+            }
+        )
+        start_time = end_time
+    return reviewed
 
 
 def edge_static_artifacts(candidates, width=None, height=None, min_repeat=3, max_confidence=0.60):
@@ -639,9 +714,29 @@ def _renumber_events(events):
     return events
 
 
-def _stationary_windows(track_rows, speed_limit_px_s, min_duration_sec, max_point_gap_sec=0.25):
-    """Find sustained low-speed intervals in continuous shuttle evidence."""
-    observed = [item for item in track_rows if item.get("status") in {"detected", "reconstructed"}]
+def _stationary_windows(
+    track_rows,
+    speed_limit_px_s,
+    min_duration_sec,
+    max_point_gap_sec=0.25,
+    court_polygon=None,
+    min_detection_confidence=0.35,
+):
+    """Find conservative, in-court, raw-detection stationary intervals.
+
+    Reconstructed points and unknown gaps are useful trajectory context but
+    cannot prove that a shuttle landed.  Requiring an available court polygon
+    also prevents a fixed scoreboard/logo point outside the court from ending
+    a rally.
+    """
+    if not court_polygon:
+        return []
+    observed = [
+        item for item in track_rows
+        if item.get("status") == "detected"
+        and float(item.get("confidence") or 0.0) >= min_detection_confidence
+        and _point_in_or_near_polygon(item.get("image_xy"), court_polygon)
+    ]
     windows = []
     run_start = None
     previous = None
@@ -672,18 +767,9 @@ def _boundary_between_events(track_rows, stationary_windows, previous_time, next
                 "reason": "shuttle_stationary_or_slow",
                 "end_time_sec": window["start_time_sec"],
             }
-    if next_time - previous_time < max_unobserved_sec:
-        return None
-    has_evidence = any(
-        previous_time < float(item.get("time_sec", 0.0)) < next_time
-        and item.get("status") in {"detected", "reconstructed"}
-        for item in track_rows
-    )
-    if not has_evidence:
-        return {
-            "reason": "long_unobserved_interval_candidate_boundary",
-            "end_time_sec": previous_time,
-        }
+    # A gap is unknown, not evidence that one rally ended and another began.
+    # Keep this parameter for callers on the previous public signature.
+    _ = (track_rows, max_unobserved_sec)
     return None
 
 
@@ -695,6 +781,46 @@ def _terminal_boundary_after_event(stationary_windows, last_event_time):
                 "end_time_sec": window["start_time_sec"],
             }
     return None
+
+
+def _court_polygon_from_metadata(analysis_dir):
+    metadata_path = Path(analysis_dir) / "metadata.json"
+    if not metadata_path.is_file():
+        return None
+    try:
+        corners = json.loads(metadata_path.read_text(encoding="utf-8")).get("court", {}).get("corners")
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(corners, list) or len(corners) < 3:
+        return None
+    polygon = [[float(point[0]), float(point[1])] for point in corners if _valid_point(point)]
+    return polygon if len(polygon) >= 3 else None
+
+
+def _point_in_or_near_polygon(point, polygon, margin=24.0):
+    if not _valid_point(point):
+        return False
+    x, y = float(point[0]), float(point[1])
+    inside = False
+    for left, right in zip(polygon, [*polygon[1:], polygon[0]]):
+        x1, y1 = float(left[0]), float(left[1])
+        x2, y2 = float(right[0]), float(right[1])
+        if (y1 > y) != (y2 > y):
+            crossing_x = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+            if x < crossing_x:
+                inside = not inside
+        if _distance_to_segment((x, y), (x1, y1), (x2, y2)) <= margin:
+            return True
+    return inside
+
+
+def _distance_to_segment(point, start, end):
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 0:
+        return _distance(point, start)
+    ratio = max(0.0, min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_sq))
+    return _distance(point, (start[0] + ratio * dx, start[1] + ratio * dy))
 
 
 def _propose_from_space(event, following):
