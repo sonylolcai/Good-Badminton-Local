@@ -237,6 +237,79 @@ def timeline_state(session, playback_sec):
     }
 
 
+def rally_playback_state(session, playback_sec):
+    """Describe the candidate rally around a playback time without inventing one.
+
+    ``rally_id`` and ``shot_index_in_rally`` originate in the offline derived
+    artifacts.  A human-added touch has no assigned rally until a future,
+    explicit re-segmentation step, so the UI must show that fact instead of
+    silently placing it into a neighbouring rally.
+    """
+    timeline = timeline_state(session, playback_sec)
+    current = timeline["current"]
+    if current is None:
+        return {
+            "status": "before_first_touch",
+            "playback_sec": timeline["playback_sec"],
+            "rally_id": None,
+            "rally_number": None,
+            "rally_count": 0,
+            "shot_index": 0,
+            "shot_count": 0,
+        }
+
+    evidence = current.get("evidence") or {}
+    rally_id = evidence.get("rally_id")
+    if not rally_id:
+        return {
+            "status": "unassigned_touch",
+            "playback_sec": timeline["playback_sec"],
+            "rally_id": None,
+            "rally_number": None,
+            "rally_count": 0,
+            "shot_index": None,
+            "shot_count": None,
+        }
+
+    candidates = sorted(_active_candidates(session), key=lambda item: float(item["hit_time_sec"]))
+    rally_ids = []
+    rally_candidates = []
+    for candidate in candidates:
+        candidate_rally_id = (candidate.get("evidence") or {}).get("rally_id")
+        if candidate_rally_id and candidate_rally_id not in rally_ids:
+            rally_ids.append(candidate_rally_id)
+        if candidate_rally_id == rally_id:
+            rally_candidates.append(candidate)
+
+    shot_indexes = []
+    for candidate in rally_candidates:
+        try:
+            shot_index = int((candidate.get("evidence") or {}).get("shot_index_in_rally"))
+        except (TypeError, ValueError):
+            continue
+        if shot_index > 0:
+            shot_indexes.append(shot_index)
+    try:
+        current_shot_index = int(evidence.get("shot_index_in_rally"))
+    except (TypeError, ValueError):
+        current_shot_index = 0
+    if current_shot_index <= 0:
+        current_shot_index = next(
+            (index + 1 for index, item in enumerate(rally_candidates) if item["shot_id"] == current["shot_id"]),
+            0,
+        )
+
+    return {
+        "status": "assigned",
+        "playback_sec": timeline["playback_sec"],
+        "rally_id": rally_id,
+        "rally_number": rally_ids.index(rally_id) + 1 if rally_id in rally_ids else None,
+        "rally_count": len(rally_ids),
+        "shot_index": current_shot_index,
+        "shot_count": max(shot_indexes, default=len(rally_candidates)),
+    }
+
+
 def candidate_table(session):
     """Compact table for review triage; detailed evidence stays with the clip."""
     table = []

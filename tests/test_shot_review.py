@@ -11,6 +11,7 @@ from webui.shot_review import (
     create_or_load_review_session,
     find_analysis_runs,
     merge_review_candidates,
+    rally_playback_state,
     save_human_review,
     split_review_candidate,
     timeline_state,
@@ -32,6 +33,37 @@ def _row(frame, time_sec, ball, hit_events=None):
 
 
 class ShotReviewTests(unittest.TestCase):
+    def test_rally_playback_state_exposes_current_rally_and_shot_count(self):
+        def candidate(shot_id, time_sec, rally_id, shot_index):
+            return {
+                "shot_id": shot_id,
+                "hit_time_sec": time_sec,
+                "active": True,
+                "evidence": {
+                    "rally_id": rally_id,
+                    "shot_index_in_rally": shot_index,
+                },
+            }
+
+        session = {
+            "candidates": [
+                candidate("shot_0001", 1.0, "rally_0001", 1),
+                candidate("shot_0002", 2.0, "rally_0001", 2),
+                candidate("shot_0003", 7.0, "rally_0002", 1),
+            ]
+        }
+
+        before = rally_playback_state(session, 0.5)
+        current = rally_playback_state(session, 2.1)
+
+        self.assertEqual("before_first_touch", before["status"])
+        self.assertEqual("assigned", current["status"])
+        self.assertEqual("rally_0001", current["rally_id"])
+        self.assertEqual(1, current["rally_number"])
+        self.assertEqual(2, current["rally_count"])
+        self.assertEqual(2, current["shot_index"])
+        self.assertEqual(2, current["shot_count"])
+
     def test_review_results_sort_by_analysis_timestamp_not_review_file_mtime(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

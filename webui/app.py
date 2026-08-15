@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 from datetime import datetime
+from html import escape
 from pathlib import Path
 
 from webui.log_capture import get_backend_logs, install_backend_log_capture
@@ -37,6 +38,7 @@ from webui.shot_review import (
     find_analysis_runs,
     merge_review_candidates,
     review_summary,
+    rally_playback_state,
     save_human_review,
     split_review_candidate,
     timeline_state,
@@ -900,6 +902,39 @@ def _review_editor_markdown(candidate):
     )
 
 
+def _review_empty_editor_markdown(playback_sec=0.0):
+    return (
+        "### 编辑触球\n"
+        f"当前视频时间：**{float(playback_sec or 0.0):.2f}s**。"
+        "当前时间前没有可编辑的触球；播放到触球处后会自动切换，"
+        "也可以在这里添加人工触球。"
+    )
+
+
+def _review_rally_overlay(session, playback_sec):
+    """Render the non-authoritative rally counter placed over the match video."""
+    state = rally_playback_state(session, playback_sec)
+    if state["status"] == "assigned":
+        rally = f"候选回合 {state['rally_number']} / {state['rally_count']}"
+        shots = f"本回合第 {state['shot_index']} / {state['shot_count']} 拍"
+        detail = "仅统计当前离线候选；待人工复核"
+    elif state["status"] == "unassigned_touch":
+        rally = "候选回合：待重新分段"
+        shots = "当前为人工补拍，尚未归属回合"
+        detail = "不会自动并入相邻回合"
+    else:
+        rally = "候选回合：等待首拍"
+        shots = "当前回合 0 拍"
+        detail = "播放至第一条触球记录后显示"
+    return (
+        "<div class='review-rally-overlay-card'>"
+        f"<strong>{escape(rally)}</strong>"
+        f"<span>{escape(shots)}</span>"
+        f"<small>{escape(detail)}</small>"
+        "</div>"
+    )
+
+
 def _review_live_markdown(session, playback_sec):
     state = timeline_state(session, playback_sec)
     current = state["current"]
@@ -944,14 +979,16 @@ def _review_open_timeline(analysis_dir, reference_video=None):
     if not video_path or not Path(video_path).is_file():
         raise gr.Error("当前结果没有可播放的标注视频。请重新分析或选择可用的视频结果。")
     choices = candidate_choices(session)
-    selected_id = choices[0][1] if choices else None
+    initial_timeline = timeline_state(session, 0.0)
+    initial_candidate = initial_timeline["current"]
+    selected_id = initial_candidate["shot_id"] if initial_candidate else None
     if selected_id:
         candidate = next(item for item in session["candidates"] if item["shot_id"] == selected_id)
         label, decision, reviewer, note = _review_candidate_form(candidate)
         editor_details = _review_editor_markdown(candidate)
     else:
         label, decision, reviewer, note = "unknown", "pending", "", ""
-        editor_details = "尚无自动候选。播放到触球处后点击“在当前时间添加触球”。"
+        editor_details = _review_empty_editor_markdown(0.0)
     return (
         gr.update(choices=choices, value=selected_id),
         _review_summary_markdown(session, selected_id),
@@ -961,6 +998,7 @@ def _review_open_timeline(analysis_dir, reference_video=None):
         _review_match_video_message(session),
         "0.00s",
         _review_live_markdown(session, 0.0),
+        _review_rally_overlay(session, 0.0),
         editor_details,
         label,
         decision,
@@ -970,12 +1008,41 @@ def _review_open_timeline(analysis_dir, reference_video=None):
     )
 
 
-def _review_follow_playback(analysis_dir, playback_sec, reference_video=None):
+def _review_follow_playback(analysis_dir, playback_sec, selected_shot_id=None, reference_video=None):
+    """Keep the editor on the touch at the displayed video time.
+
+    The form is deliberately left alone while the player remains within the
+    same touch candidate, so a reviewer does not lose an unsaved selection.
+    Only a transition to another touch replaces the editor values.
+    """
     if not analysis_dir:
-        return "—", "请先打开一场分析结果。"
+        return (
+            "—", "请先打开一场分析结果。", _review_rally_overlay({"candidates": []}, 0.0),
+            gr.update(value=None), _review_empty_editor_markdown(), "unknown", "pending", "", "",
+        )
     session = create_or_load_review_session(analysis_dir, reference_video)
     state = timeline_state(session, playback_sec)
-    return f"{state['playback_sec']:.2f}s", _review_live_markdown(session, state["playback_sec"])
+    current = state["current"]
+    next_shot_id = current["shot_id"] if current else None
+    updates = [gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()]
+    if next_shot_id != selected_shot_id:
+        if current is None:
+            updates = [
+                gr.update(value=None), _review_empty_editor_markdown(state["playback_sec"]),
+                "unknown", "pending", "", "",
+            ]
+        else:
+            label, decision, reviewer, note = _review_candidate_form(current)
+            updates = [
+                gr.update(value=next_shot_id), _review_editor_markdown(current),
+                label, decision, reviewer, note,
+            ]
+    return (
+        f"{state['playback_sec']:.2f}s",
+        _review_live_markdown(session, state["playback_sec"]),
+        _review_rally_overlay(session, state["playback_sec"]),
+        *updates,
+    )
 
 
 def _review_select_editor(analysis_dir, shot_id, reference_video=None):
@@ -1007,6 +1074,7 @@ def _review_jump_to_table_row(analysis_dir, reference_video, evt: gr.SelectData)
         hit_time,
         f"{hit_time:.2f}s",
         _review_live_markdown(session, hit_time),
+        _review_rally_overlay(session, hit_time),
         gr.update(value=candidate["shot_id"]),
         _review_editor_markdown(candidate),
         label,
@@ -1049,6 +1117,7 @@ def _review_add_at_playback(analysis_dir, playback_sec, reviewer, reference_vide
         reviewer,
         note,
         _review_live_markdown(session, state["playback_sec"]),
+        _review_rally_overlay(session, state["playback_sec"]),
         f"已在 **{state['playback_sec']:.2f}s** 添加人工触球。现在选择球种和复核结果，再保存本次修改。",
     )
 
@@ -1366,12 +1435,54 @@ def build_ui():
             with gr.Row():
                 with gr.Column(scale=3):
                     review_video_message = gr.Markdown()
-                    review_match_video = gr.Video(
-                        label="整场标注视频（可拖动进度条）",
-                        height=440,
-                        include_audio=True,
-                        elem_id="review-match-video",
-                    )
+                    with gr.Group(elem_id="review-video-stage"):
+                        review_match_video = gr.Video(
+                            label="整场标注视频（可拖动进度条）",
+                            height=440,
+                            include_audio=True,
+                            elem_id="review-match-video",
+                        )
+                        review_rally_overlay = gr.HTML(
+                            value=(
+                                "<div class='review-rally-overlay-card'>"
+                                "<strong>候选回合：等待打开视频</strong>"
+                                "<span>当前回合 0 拍</span>"
+                                "</div>"
+                            ),
+                            elem_id="review-rally-overlay",
+                            html_template="${value}",
+                            css_template="""
+                                #review-video-stage {
+                                    position: relative !important;
+                                    overflow: hidden;
+                                }
+                                #review-rally-overlay {
+                                    position: absolute !important;
+                                    right: 16px;
+                                    bottom: 18px;
+                                    z-index: 10;
+                                    width: auto !important;
+                                    margin: 0 !important;
+                                    pointer-events: none;
+                                }
+                                #review-rally-overlay .review-rally-overlay-card {
+                                    display: flex;
+                                    flex-direction: column;
+                                    gap: 3px;
+                                    min-width: 180px;
+                                    padding: 9px 11px;
+                                    border: 1px solid rgba(144, 163, 255, 0.8);
+                                    border-radius: 8px;
+                                    background: rgba(8, 13, 30, 0.82);
+                                    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+                                    color: #fff;
+                                    text-align: right;
+                                }
+                                #review-rally-overlay strong { font-size: 14px; }
+                                #review-rally-overlay span { color: #dce5ff; font-size: 13px; }
+                                #review-rally-overlay small { color: #aebce7; font-size: 11px; }
+                            """,
+                        )
                     review_playback_clock = gr.HTML(
                         value=0.0,
                         elem_id="review-playback-clock",
@@ -1569,8 +1680,8 @@ def build_ui():
             inputs=[review_analysis_dir, review_source_video],
             outputs=[
                 review_shot_id, review_summary_output, review_candidates_table, review_match_video,
-                review_frame_controls, review_video_message, review_current_time, review_live_judgement, review_details,
-                review_label, review_decision, review_reviewer, review_note, review_notice,
+                review_frame_controls, review_video_message, review_current_time, review_live_judgement, review_rally_overlay,
+                review_details, review_label, review_decision, review_reviewer, review_note, review_notice,
             ],
         )
         rebuild_review_btn.click(
@@ -1578,14 +1689,17 @@ def build_ui():
             inputs=[review_analysis_dir, review_source_video],
             outputs=[
                 review_shot_id, review_summary_output, review_candidates_table, review_match_video,
-                review_frame_controls, review_video_message, review_current_time, review_live_judgement, review_details,
-                review_label, review_decision, review_reviewer, review_note, review_notice,
+                review_frame_controls, review_video_message, review_current_time, review_live_judgement, review_rally_overlay,
+                review_details, review_label, review_decision, review_reviewer, review_note, review_notice,
             ],
         )
         review_playback_clock.input(
             fn=_review_follow_playback,
-            inputs=[review_analysis_dir, review_playback_clock, review_source_video],
-            outputs=[review_current_time, review_live_judgement],
+            inputs=[review_analysis_dir, review_playback_clock, review_shot_id, review_source_video],
+            outputs=[
+                review_current_time, review_live_judgement, review_rally_overlay,
+                review_shot_id, review_details, review_label, review_decision, review_reviewer, review_note,
+            ],
             show_progress="hidden",
             queue=False,
         )
@@ -1600,7 +1714,7 @@ def build_ui():
             inputs=[review_analysis_dir, review_source_video],
             outputs=[
                 review_match_video, review_seek_request, review_current_time, review_live_judgement,
-                review_shot_id, review_details, review_label, review_decision,
+                review_rally_overlay, review_shot_id, review_details, review_label, review_decision,
                 review_reviewer, review_note, review_notice,
             ],
             show_progress="hidden",
@@ -1617,7 +1731,7 @@ def build_ui():
             outputs=[
                 review_shot_id, review_summary_output, review_candidates_table, review_details,
                 review_label, review_decision, review_reviewer, review_note, review_live_judgement,
-                review_notice,
+                review_rally_overlay, review_notice,
             ],
             show_progress="hidden",
         )
