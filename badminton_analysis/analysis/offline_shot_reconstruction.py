@@ -23,6 +23,7 @@ DERIVED_DIRNAME = "derived"
 SHUTTLE_TRACK_FILENAME = "shuttle_tracks_v2.jsonl"
 SHOT_EVENT_FILENAME = "shot_events_v2.jsonl"
 RALLY_FILENAME = "rallies_v2.jsonl"
+RALLY_BOUNDARY_REFERENCE_FILENAME = "rally_boundary_reference_user_review.jsonl"
 DERIVATION_VERSION = "2.2"
 
 
@@ -449,6 +450,97 @@ def build_rallies_from_manual_terminals(events, terminals, video_start_sec=0.0, 
         )
         start_time = end_time
     return reviewed
+
+
+def load_rally_boundary_reference(analysis_dir):
+    """Load human terminal facts used only to evaluate automatic splitting.
+
+    The reference is intentionally stored outside ``shot_review`` so opening a
+    review session cannot accidentally turn it into an active manual override.
+    """
+    path = Path(analysis_dir) / "evaluation" / RALLY_BOUNDARY_REFERENCE_FILENAME
+    return load_jsonl(path) if path.is_file() else []
+
+
+def evaluate_rally_terminal_predictions(rallies, reference_terminals, tolerance_sec=0.60):
+    """Measure candidate terminal boundaries without using references as input.
+
+    Matching is one-to-one and time-tolerant.  A video-end marker is not a
+    terminal prediction, and neither are human-reviewed segments; this keeps
+    the report honest about what the automatic splitter actually found.
+    """
+    tolerance_sec = max(0.0, float(tolerance_sec))
+    predictions = []
+    for rally in rallies:
+        reason = str(rally.get("end_reason") or "")
+        if reason.startswith("video_end_") or reason.startswith("human_confirmed_"):
+            continue
+        try:
+            predictions.append(
+                {
+                    "rally_id": rally.get("rally_id"),
+                    "time_sec": round(float(rally["end_time_sec"]), 6),
+                    "reason": reason or "unspecified_candidate_boundary",
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    references = []
+    for terminal in reference_terminals:
+        try:
+            references.append(
+                {
+                    "terminal_id": terminal.get("terminal_id"),
+                    "time_sec": round(float(terminal["time_sec"]), 6),
+                    "outcome": terminal.get("outcome"),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    predictions.sort(key=lambda item: item["time_sec"])
+    references.sort(key=lambda item: item["time_sec"])
+    unmatched_reference_indexes = set(range(len(references)))
+    matches = []
+    false_positives = []
+    for prediction in predictions:
+        nearby = [
+            index for index in unmatched_reference_indexes
+            if abs(references[index]["time_sec"] - prediction["time_sec"]) <= tolerance_sec
+        ]
+        if not nearby:
+            false_positives.append(prediction)
+            continue
+        index = min(nearby, key=lambda item: abs(references[item]["time_sec"] - prediction["time_sec"]))
+        reference = references[index]
+        unmatched_reference_indexes.remove(index)
+        matches.append(
+            {
+                "prediction": prediction,
+                "reference": reference,
+                "absolute_error_sec": round(abs(reference["time_sec"] - prediction["time_sec"]), 6),
+            }
+        )
+
+    missed_references = [references[index] for index in sorted(unmatched_reference_indexes)]
+    precision = len(matches) / len(predictions) if predictions else None
+    recall = len(matches) / len(references) if references else None
+    return {
+        "schema_version": "1.0",
+        "tolerance_sec": tolerance_sec,
+        "prediction_count": len(predictions),
+        "reference_count": len(references),
+        "matched_count": len(matches),
+        "precision": round(precision, 4) if precision is not None else None,
+        "recall": round(recall, 4) if recall is not None else None,
+        "mean_absolute_error_sec": round(
+            sum(item["absolute_error_sec"] for item in matches) / len(matches), 6
+        ) if matches else None,
+        "matches": matches,
+        "false_positives": false_positives,
+        "missed_references": missed_references,
+    }
 
 
 def edge_static_artifacts(candidates, width=None, height=None, min_repeat=3, max_confidence=0.60):

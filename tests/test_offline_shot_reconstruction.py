@@ -7,6 +7,7 @@ from badminton_analysis.analysis.offline_shot_reconstruction import (
     build_rallies_from_manual_terminals,
     build_shot_events,
     build_rallies,
+    evaluate_rally_terminal_predictions,
     generate_offline_artifacts,
     infer_missing_shuttle_events,
     reconstruct_shuttle_track,
@@ -144,6 +145,29 @@ class OfflineShotReconstructionTests(unittest.TestCase):
         ))
         self.assertEqual("out_of_bounds", reviewed[0]["terminal"]["outcome"])
         self.assertEqual(events, original)
+
+    def test_terminal_evaluation_compares_auto_candidates_without_using_references_as_predictions(self):
+        report = evaluate_rally_terminal_predictions(
+            [
+                {"rally_id": "rally_0001", "end_time_sec": 10.2, "end_reason": "shuttle_stationary_or_slow"},
+                {"rally_id": "rally_0002", "end_time_sec": 20.0, "end_reason": "shuttle_stationary_or_slow"},
+                {"rally_id": "rally_0003", "end_time_sec": 30.0, "end_reason": "video_end_without_confirmed_terminal_event"},
+                {"rally_id": "reviewed_rally_0001", "end_time_sec": 40.0, "end_reason": "human_confirmed_out"},
+            ],
+            [
+                {"terminal_id": "reference_01", "time_sec": 10.0, "outcome": "out_of_bounds"},
+                {"terminal_id": "reference_02", "time_sec": 40.0, "outcome": "landed_in_bounds"},
+            ],
+            tolerance_sec=0.5,
+        )
+
+        self.assertEqual(2, report["prediction_count"])
+        self.assertEqual(2, report["reference_count"])
+        self.assertEqual(1, report["matched_count"])
+        self.assertEqual(0.5, report["precision"])
+        self.assertEqual(0.5, report["recall"])
+        self.assertEqual(20.0, report["false_positives"][0]["time_sec"])
+        self.assertEqual("reference_02", report["missed_references"][0]["terminal_id"])
 
     def test_same_singles_hitter_can_create_low_confidence_missing_return_candidate(self):
         rows = [

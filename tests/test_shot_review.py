@@ -196,3 +196,17 @@ class ShotReviewTests(unittest.TestCase):
             self.assertEqual(2, state["rally_number"])
             self.assertEqual(2, state["rally_count"])
             self.assertEqual(2, len(reviewed_rally_table(session)))
+
+    def test_evaluation_reference_is_not_loaded_as_an_active_manual_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_detections(directory)
+            evaluation = Path(directory) / "evaluation"
+            evaluation.mkdir()
+            (evaluation / "rally_boundary_reference_user_review.jsonl").write_text(
+                json.dumps({"time_sec": 4.5, "outcome": "out_of_bounds"}) + "\n",
+                encoding="utf-8",
+            )
+
+            session = create_or_load_review_session(directory)
+
+            self.assertNotIn("reviewed_rallies", session)
