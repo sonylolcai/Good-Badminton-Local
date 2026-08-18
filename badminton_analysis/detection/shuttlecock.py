@@ -355,10 +355,13 @@ class ShuttlecockTracker:
 
         for i, point in enumerate(points):
             radius = int(3 + (i / len(points)) * 4)
-            cv2.circle(frame, point, radius, color, thickness=-1, lineType=cv2.LINE_AA)
+            pixel_point = self._as_drawable_pixel(point)
+            if pixel_point is not None:
+                cv2.circle(frame, pixel_point, radius, color, thickness=-1, lineType=cv2.LINE_AA)
 
-        latest_point = points[-1]
-        cv2.circle(frame, latest_point, 6, (0, 165, 255), thickness=-1, lineType=cv2.LINE_AA)
+        latest_point = self._as_drawable_pixel(points[-1])
+        if latest_point is not None:
+            cv2.circle(frame, latest_point, 6, (0, 165, 255), thickness=-1, lineType=cv2.LINE_AA)
 
         if self.show_performance_stats:
             print(f"Drawing shuttlecock trajectory took {time.time() - t0:.2f} sec")
@@ -387,3 +390,23 @@ class ShuttlecockTracker:
 
     def get_last_detection(self):
         return dict(self.last_detection)
+
+    @staticmethod
+    def _as_drawable_pixel(point):
+        """Return an OpenCV-compatible integer point without changing evidence.
+
+        TrackNet's raw measurements intentionally remain floating-point in the
+        tracker and the persisted data.  OpenCV drawing functions, however,
+        accept only integer pixel coordinates.  This conversion belongs at the
+        rendering boundary so a drawing failure cannot discard or rewrite a
+        valid measurement.
+        """
+        if not isinstance(point, (list, tuple, np.ndarray)) or len(point) != 2:
+            return None
+        try:
+            x, y = float(point[0]), float(point[1])
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(x) or not np.isfinite(y):
+            return None
+        return int(round(x)), int(round(y))

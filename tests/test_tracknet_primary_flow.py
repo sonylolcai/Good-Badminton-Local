@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from badminton_analysis.detection.shuttlecock import ShuttlecockTracker
 from badminton_analysis.detection.tracknet_v3 import TrackNetV3RawMeasurements
 
@@ -54,6 +56,25 @@ class TrackNetPrimaryFlowTests(unittest.TestCase):
         self.assertTrue(state["accepted"])
         self.assertEqual(state["source"], "tracknet_v3_raw")
         self.assertEqual(state["measurement_kind"], "temporal_heatmap")
+
+    def test_tracknet_float_measurements_render_without_rewriting_raw_evidence(self):
+        """TrackNet floats are valid data but must be integer pixels for OpenCV."""
+        tracker = ShuttlecockTracker(yolo_ball_model=None)
+        original = [100.5, 200.25]
+        tracker.update_external_measurement({
+            "visible": True,
+            "image": original,
+            "source": "tracknet_v3_raw",
+            "measurement_kind": "temporal_heatmap",
+            "confidence": 0.5,
+            "confidence_status": "uncalibrated_binary_visibility_threshold_0.5",
+        })
+
+        frame = np.zeros((300, 300, 3), dtype=np.uint8)
+        tracker.handle_visualization(frame)
+
+        self.assertEqual(tracker.get_last_detection()["image"], original)
+        self.assertGreater(int(frame.sum()), 0)
 
 
 if __name__ == "__main__":
