@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -23,6 +24,62 @@ _COURT_DETECTION_SIZE = (1080, 720)
 _SAFE_OUTPUT_STEM_PATTERN = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 _dependencies_loaded = False
+
+
+def _prepare_tracknet_v3_raw(video_path, output_dir):
+    """Run the configured GPU TrackNet runtime and return its immutable CSV.
+
+    Good-Badminton intentionally does not package TrackNetV3 source code or
+    checkpoints.  The API host owns those external files and exposes their
+    locations through environment variables.  This fails loudly on a CPU-only
+    workstation instead of silently substituting the legacy YOLO ball model.
+    """
+    tracknet_root = os.environ.get("GOOD_BADMINTON_TRACKNET_ROOT")
+    checkpoint = os.environ.get("GOOD_BADMINTON_TRACKNET_CHECKPOINT")
+    runtime_python = os.environ.get("GOOD_BADMINTON_TRACKNET_PYTHON", os.sys.executable)
+    if not tracknet_root or not checkpoint:
+        raise RuntimeError(
+            "TrackNetV3 未配置：需要 GOOD_BADMINTON_TRACKNET_ROOT 和 "
+            "GOOD_BADMINTON_TRACKNET_CHECKPOINT。当前本机不能自动回退到 YOLO。"
+        )
+    tracknet_root_path = Path(tracknet_root)
+    checkpoint_path = Path(checkpoint)
+    if not (tracknet_root_path / "predict.py").is_file() or not checkpoint_path.is_file():
+        raise RuntimeError("TrackNetV3 源码或权重路径无效；请检查 GPU 服务环境变量。")
+
+    project_root = Path(__file__).resolve().parents[1]
+    runner = project_root / "evaluation" / "shuttle_tracknet_ab" / "run_tracknet_v3.py"
+    fast_predictor = project_root / "evaluation" / "shuttle_tracknet_ab" / "fast_predict_tracknet_v3.py"
+    if not runner.is_file() or not fast_predictor.is_file():
+        raise RuntimeError("当前部署包缺少 TrackNetV3 主流程工具。")
+
+    target_dir = Path(output_dir) / "tracknet_v3"
+    batch_size = int(os.environ.get("GOOD_BADMINTON_TRACKNET_BATCH_SIZE", "16"))
+    background_samples = int(os.environ.get("GOOD_BADMINTON_TRACKNET_BACKGROUND_SAMPLES", "120"))
+    if batch_size <= 0 or background_samples <= 0:
+        raise RuntimeError("TrackNetV3 批量大小和背景采样数必须为正整数。")
+    command = [
+        runtime_python,
+        str(runner),
+        "--video", str(Path(video_path).resolve()),
+        "--tracknet-root", str(tracknet_root_path.resolve()),
+        "--tracknet-python", runtime_python,
+        "--tracknet-checkpoint", str(checkpoint_path.resolve()),
+        "--fast-predictor", str(fast_predictor),
+        "--output-dir", str(target_dir),
+        "--batch-size", str(batch_size),
+        "--background-sample-count", str(background_samples),
+        "--overwrite",
+    ]
+    print("TrackNetV3 primary shuttle detector:", subprocess.list2cmdline(command))
+    try:
+        subprocess.run(command, cwd=str(project_root), check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"TrackNetV3 推理失败（退出码 {exc.returncode}）。") from exc
+    csv_path = target_dir / "tracknet_raw" / f"{Path(video_path).stem}_ball.csv"
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        raise RuntimeError("TrackNetV3 未生成原始球点 CSV。")
+    return str(csv_path)
 
 
 def imread_safe(path, flags=cv2.IMREAD_COLOR):
@@ -391,7 +448,7 @@ def _max_template_match_score(video_path, template_path, max_samples=24):
 
 
 def run_analysis(video_path, template_path, corners, options, progress_cb=None,
-                 output_dir=None, cleanup_outputs=True):
+                 state_cb=None, output_dir=None, cleanup_outputs=True):
     """Run the full analysis pipeline headlessly.
 
     Args:
@@ -451,13 +508,26 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     show_pose_roi = options.get("show_pose_roi", True)
     visualize_positions = options.get("visualize_positions", True)
     output_video_style = options.get("output_video_style", "annotated")
-    pose_imgsz = int(options.get("pose_imgsz", 1280))
+    pose_imgsz = int(options.get("pose_imgsz", 960))
+    pose_sample_hz = float(options.get("pose_sample_hz", 10.0))
     pose_conf = float(options.get("pose_conf", 0.15))
     far_player_enhancement = bool(options.get("far_player_enhancement", False))
     far_pose_roi = options.get("far_pose_roi", (0.12, 0.30, 0.86, 0.82))
     match_mode = options.get("match_mode", "singles")
     tracker_backend = options.get("tracker_backend", "court_association")
     enable_bytetrack = bool(options.get("enable_bytetrack", False))
+    lock_match_roster = bool(options.get("lock_match_roster", True))
+    roster_stable_frames = int(options.get("roster_stable_frames", 2))
+    shuttle_detector = options.get("shuttle_detector", "yolo")
+    if shuttle_detector not in {"yolo", "tracknet_v3"}:
+        raise ValueError("shuttle_detector must be 'yolo' or 'tracknet_v3'.")
+    tracknet_measurements_path = None
+    if shuttle_detector == "tracknet_v3":
+        if state_cb is not None:
+            state_cb({"phase": "tracknet_preprocessing"})
+        tracknet_measurements_path = _prepare_tracknet_v3_raw(video_path, output_dir)
+    if state_cb is not None:
+        state_cb({"phase": "human_tracking"})
 
     system = BadmintonAnalysisSystem(
         video_path,
@@ -479,15 +549,33 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         show_pose_roi=show_pose_roi,
         output_video_style=output_video_style,
         pose_imgsz=pose_imgsz,
+        pose_sample_hz=pose_sample_hz,
         pose_conf=pose_conf,
         far_player_enhancement=far_player_enhancement,
         far_pose_roi=far_pose_roi,
         match_mode=match_mode,
         tracker_backend=tracker_backend,
         enable_bytetrack=enable_bytetrack,
+        lock_match_roster=lock_match_roster,
+        roster_stable_frames=roster_stable_frames,
+        shuttle_detector=shuttle_detector,
+        tracknet_measurements_path=tracknet_measurements_path,
     )
     system.keep_audio = keep_audio
-    system.process_video(progress_callback=progress_cb)
+    system.process_video(progress_callback=progress_cb, state_callback=state_cb)
+
+    # This is an opaque business correlation key, not an identity input for
+    # visual tracking. Storing it in the result manifest lets the business
+    # service attach post-match claims without exposing its participant list to
+    # the GPU worker.
+    match_session_ref = options.get("match_session_ref")
+    if match_session_ref and os.path.isfile(system.metadata_path):
+        import json
+        with open(system.metadata_path, "r", encoding="utf-8") as source:
+            metadata = json.load(source)
+        metadata.setdefault("match_context", {})["match_session_ref"] = str(match_session_ref)
+        from badminton_analysis.data.writer import write_json
+        write_json(system.metadata_path, metadata)
 
     warnings = []
     has_detections = os.path.isfile(system.detections_path) and os.path.getsize(system.detections_path) > 0
@@ -518,6 +606,8 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         "video": web_video_path,
         "metadata": system.metadata_path,
         "detections": system.detections_path,
+        "tracknet_raw_csv": tracknet_measurements_path,
+        "performance_report": (getattr(system, "performance_report", None) or {}).get("report_path"),
         "derived": getattr(system, "offline_artifacts", None),
         "visualizations": [],
         "warnings": warnings,

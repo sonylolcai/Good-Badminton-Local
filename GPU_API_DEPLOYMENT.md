@@ -240,11 +240,152 @@ curl -fsS http://xn-g.suanjiayun.com:52028/api/v1/health
 
 返回 `status: ok` 说明公网 `52028` 已转发到容器内 `8080`。启动命令和 `.gpu-api.env` 的 `PORT` 必须保持为 `8080`；不要将程序改回 `8001`。
 
-### 后续升级方式
+### 固定目录的一键覆盖升级（当前标准）
 
-该实例无法从 GitHub 拉取分支，因此不能直接 `git pull`。每次升级建议由本地从指定提交打包源码 zip，经平台上传后解压到新目录（例如 `/root/good-badminton-source-<commit>`）；在新目录安装/复用依赖、启动到临时端口并执行健康检查后，再停止旧 PID 并切换正式端口。这保留可回退的旧目录和旧进程。
+该实例无法从 GitHub 拉取分支，因此不能直接 `git pull`。从现在起不再保留一串
+`good-badminton-source-<commit>` 目录，也不在服务器手工打补丁。统一使用下面三个
+固定路径：
 
-只有纯 Python 代码的小修复，也可以上传补丁文件并在实例内 `patch -p1`；但涉及依赖、模型、部署脚本或多个文件时，一律上传完整、带提交号的源码包，减少版本漂移。
+| 路径 | 作用 | 覆盖升级时是否删除 |
+| --- | --- | --- |
+| `/root/good-badminton-gpu-api-upload.zip` | 每次从 Windows 上传的固定包名 | 被新上传文件替换 |
+| `/root/good-badminton-gpu-api` | 当前运行的应用代码、日志和 PID | 会整体删除后重新解压 |
+| `/root/good-badminton-gpu-api-state` | API Key、`api_data/` 任务与产物、`weights/` 权重 | **绝不删除** |
+
+本地先从当前工作区制作上传包。该命令会包含所有已跟踪代码的当前修改（即使还没有
+提交），但不会把 `.gpu-api.env`、模型权重、虚拟环境、任务数据或未跟踪实验文件放进包：
+
+```powershell
+cd 'S:\Code Base\MiniProgram\bdTeach\Good-Badminton'
+powershell -ExecutionPolicy Bypass -File .\deploy\package_gpu_api.ps1
+```
+
+把生成的 `deploy\good-badminton-gpu-api-upload.zip` 上传到服务器固定位置：
+
+```text
+/root/good-badminton-gpu-api-upload.zip
+```
+
+然后在服务器运行唯一的升级命令：
+
+```bash
+bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh
+```
+
+若这是第一次切换到固定目录（即 `/root/good-badminton-gpu-api` 还不存在），从固定
+ZIP 中直接执行同一脚本即可，不需要另上传 `.sh` 文件：
+
+```bash
+unzip -p /root/good-badminton-gpu-api-upload.zip \
+  good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash
+```
+
+该脚本会先检查 ZIP 路径安全、Python 依赖和 CUDA；停止旧 API；**只删除**固定应用
+目录；解压新代码；把持久密钥、权重和任务目录重新挂载到新代码；启动 `8080` 并通过
+`/api/v1/health` 验证。任一步骤失败会停止而不会删除状态目录。首次运行时，脚本会创建
+持久 `.gpu-api.env`，但不会在终端输出 API Key；需要将该密钥同步到业务/WebUI 的密钥配置。
+
+若服务器目前仍运行旧式目录（例如 `/root/good-badminton-source-2ff758c`），首次切换
+时在运行脚本前设置它。脚本会先迁移旧目录中的 `.gpu-api.env`、`api_data/` 和 `weights/`，
+健康检查通过后再删除旧目录：
+
+```bash
+unzip -p /root/good-badminton-gpu-api-upload.zip \
+  good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh > /tmp/good-badminton-refresh.sh
+GOOD_BADMINTON_LEGACY_APP_DIR=/root/good-badminton-source-2ff758c \
+GOOD_BADMINTON_REMOVE_LEGACY_APP=1 \
+  bash /tmp/good-badminton-refresh.sh
+rm -f /tmp/good-badminton-refresh.sh
+```
+
+将示例中的旧目录替换为实际 `uvicorn` 进程的工作目录；不要猜路径。若旧进程没有
+`.gpu-api.pid`，先手动停止已确认属于 Good-Badminton 的旧 `uvicorn` 进程，再执行迁移，
+避免两个程序争抢 `8080` 端口。
+
+首次切换还会校验羽毛球模型在固定持久路径中存在：
+
+```text
+/root/good-badminton-gpu-api-state/weights/yolo11s-ball.pt
+```
+
+旧目录里已有 `weights/` 时脚本会自动迁移；否则只需手工上传一次到上面的路径。脚本
+会在删除旧代码目录**之前**因缺权重而失败，不会生成“健康但实际无法分析视频”的假部署。
+
+云平台的开机启动命令也固定为：
+
+```bash
+GOOD_BADMINTON_ENV_FILE=/root/good-badminton-gpu-api-state/.gpu-api.env \
+  bash /root/good-badminton-gpu-api/deploy/start_gpu_api_container.sh \
+  /root/good-badminton-gpu-api
+```
+
+这套流程适合现有已安装依赖的 GPU 实例。若更换了 Python 大版本、CUDA 运行时或新增
+Python 依赖，先单独完成一次依赖安装和小视频验收，再使用固定目录流程日常升级。
+
+### TrackNetV3 A/B：独立候选模型，不替换 YOLO
+
+TrackNetV3 不能填入 WebUI 的 `yolo11s-ball.pt` 输入框；它是独立的连续帧轨迹程序。
+首次 A/B 时，在 Windows 下载官方 [TrackNetV3 源码](https://github.com/qaz812345/TrackNetV3)
+的 Code ZIP，并下载该仓库 README 链接的 `TrackNetV3_ckpts.zip`（内含
+`TrackNet_best.pt`，以及通常包含的 `InpaintNet_best.pt`）。上游 README 指定将检查点
+放到 `ckpts/` 后以 `predict.py` 推理；其公布的开发环境较旧，因此必须以服务器实际
+GPU 小视频验收为准，不能假定与当前 Python/Torch 一定兼容。
+
+本地先把 A/B 工具包含进一次应用升级包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\package_gpu_api.ps1 -IncludeTrackNetABTools
+```
+
+按固定升级流程刷新 GPU 应用代码。然后把下面两份文件上传到服务器：
+
+```text
+/root/good-badminton-tracknet-upload/TrackNetV3-source.zip
+/root/good-badminton-tracknet-upload/TrackNetV3_ckpts.zip
+```
+
+在服务器进行一次安装和预检（不会停止或修改现有 GPU API）：
+
+```bash
+bash /root/good-badminton-gpu-api/deploy/setup_tracknet_v3_ab.sh
+```
+
+`run_tracknet_v3_ab.sh` 对普通的 2–5 分钟视频默认使用官方 TrackNetV3 权重与连续
+`weight` 集成，但将背景改为均匀抽样中值（默认 120 帧）并将每帧缩放限制为一次。它会在
+CSV 同目录写入 `tracknet_execution.json`，明确记录该预处理差异。首轮只产生原始 TrackNet
+候选 B；默认不跑 InpaintNet B*，避免将轨迹补全误读为额外真实检测。
+
+可按显存和视频稳定性调整批量或背景样本数：
+
+```bash
+TRACKNET_BATCH_SIZE=8 TRACKNET_BACKGROUND_SAMPLE_COUNT=180 \
+  bash /root/good-badminton-gpu-api/deploy/run_tracknet_v3_ab.sh <video> <detections.jsonl>
+```
+
+只有原始 B 在人工标签上通过 A/B 门槛后，才按需运行更慢的 B*：
+
+```bash
+TRACKNET_RECTIFICATION=1 \
+  bash /root/good-badminton-gpu-api/deploy/run_tracknet_v3_ab.sh <video> <detections.jsonl>
+```
+
+该 B* 调用官方 `predict.py`，会重新执行原始处理，且只可用于人工复核；A/B 报告必须记录
+批量、背景样本数和是否启用轨迹修复，不能把 B 与 B* 混为相同类型的检测证据。
+
+完成后，使用与 YOLO 完全相同的原视频及其对应的 `detections.jsonl` 跑 TrackNet 原始
+结果。第三个参数只在人工标注完成后提供；没有人工真值时脚本只产出可复核的原始 CSV，
+不会宣称 TrackNet 更好：
+
+```bash
+bash /root/good-badminton-gpu-api/deploy/run_tracknet_v3_ab.sh \
+  /absolute/path/to/original.mp4 \
+  /absolute/path/to/detections.jsonl
+```
+
+TrackNet 源码与权重会固定保存在
+`/root/good-badminton-gpu-api-state/models/tracknetv3/`；每次 A/B 输出写到
+`/root/good-badminton-gpu-api-state/tracknet_ab/`。原始 YOLO 输出、正式 API 和 WebUI
+模型路径均不会被覆盖。
 
 ### 模型权重属于独立发布物
 

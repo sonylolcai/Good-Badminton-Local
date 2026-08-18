@@ -16,7 +16,7 @@ from ..court.reference import BADMINTON_COURT_LENGTH, BADMINTON_COURT_WIDTH
 from ..tracking.bytetrack_adapter import ByteTrackAdapter
 
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 
 
 class CourtSpace:
@@ -58,11 +58,14 @@ class _Track:
     image_xy: Optional[Tuple[float, float]]
     confidence: float
     last_frame: int
+    last_observation_frame: int
     velocity_mps: Tuple[float, float] = (0.0, 0.0)
     missed_frames: int = 0
     observations: int = 1
     last_evidence: dict = field(default_factory=dict)
     association_key: Optional[str] = None
+    association_source: str = "court_association"
+    image_history: list = field(default_factory=list)
 
 
 class CourtMultiObjectTracker:
@@ -83,6 +86,10 @@ class CourtMultiObjectTracker:
         max_speed_mps=10.0,
         match_mode="singles",
         max_retained_missing_frames=None,
+        lock_match_roster=False,
+        expected_roster_count=None,
+        roster_stable_frames=2,
+        roster_reacquire_seconds=1.0,
     ):
         if match_mode not in {"singles", "doubles"}:
             raise ValueError("match_mode must be 'singles' or 'doubles'")
@@ -95,18 +102,89 @@ class CourtMultiObjectTracker:
         self.max_speed_mps = float(max_speed_mps)
         self.match_mode = match_mode
         self.max_players_per_team = 1 if match_mode == "singles" else 2
+        self.lock_match_roster = bool(lock_match_roster)
+        self.expected_roster_count = int(
+            expected_roster_count or (2 if match_mode == "singles" else 4)
+        )
+        if self.expected_roster_count <= 0:
+            raise ValueError("expected_roster_count must be positive")
+        self.roster_stable_frames = max(1, int(roster_stable_frames))
+        # Keep the normal short prediction window unchanged, then allow one
+        # additional bounded window for a real detection to reclaim a locked
+        # roster ID. Beyond this, a location-only guess is not trustworthy.
+        self.roster_reacquire_frames = self.max_missed_frames + max(
+            1,
+            int(round(float(roster_reacquire_seconds) * self.fps)),
+        )
         self.tracks = {}
         self._next_id = 1
         self.identity_claims = {}
         self.team_claims = {}
         self._association_keys = {}
         self.track_metrics = {}
+        self.roster_status = "bootstrapping" if self.lock_match_roster else "disabled"
+        self.roster_locked_frame = None
+        self.roster_track_ids = []
+        self._roster_stable_observation_frames = 0
+        self._last_roster_candidate_count = 0
+        self._last_roster_reason = "awaiting_stable_on_court_detections" if self.lock_match_roster else "disabled"
+        self._last_unassigned_observation_count = 0
 
     def update(self, frame_index, observations):
-        observations = [item for item in observations if item.get("court_xy") is not None]
+        observations = [
+            item for item in observations
+            if item.get("court_xy") is not None
+            and self.court_space.contains(item["court_xy"], margin_m=0.35)
+        ]
+        if self.lock_match_roster and self.roster_status != "locked":
+            return self._bootstrap_roster(frame_index, observations)
+
+        return self._update_locked_or_open_tracks(frame_index, observations)
+
+    def _bootstrap_roster(self, frame_index, observations):
+        """Lock the match roster only after a stable, complete on-court sample.
+
+        A camera may initially see only one singles player or briefly include a
+        referee.  Locking that frame would permanently encode a bad roster, so
+        the tracker waits for the configured count on consecutive frames.
+        """
+        self._last_roster_candidate_count = len(observations)
+        self._last_unassigned_observation_count = 0
+        if len(observations) != self.expected_roster_count:
+            self._roster_stable_observation_frames = 0
+            self._last_roster_reason = (
+                "waiting_for_expected_on_court_count"
+                f" (observed={len(observations)}, expected={self.expected_roster_count})"
+            )
+            return self.snapshot(frame_index)
+
+        self._roster_stable_observation_frames += 1
+        if self._roster_stable_observation_frames < self.roster_stable_frames:
+            self._last_roster_reason = "awaiting_second_stable_roster_observation"
+            return self.snapshot(frame_index)
+
+        # The first IDs are deterministic labels only; they do not claim a
+        # real name, team, or image-side identity.  Court coordinates make the
+        # ordering independent of whether the camera is rear, side, or oblique.
+        ordered = sorted(
+            observations,
+            key=lambda item: (float(item["court_xy"][1]), float(item["court_xy"][0])),
+        )
+        for observation in ordered:
+            self._create_track(frame_index, observation, association_source="roster_bootstrap")
+        self.roster_track_ids = sorted(self.tracks)
+        self.roster_status = "locked"
+        self.roster_locked_frame = int(frame_index)
+        self._last_roster_reason = "stable_expected_on_court_count"
+        return self.snapshot(frame_index)
+
+    def _update_locked_or_open_tracks(self, frame_index, observations):
         unmatched_track_ids = set(self.tracks)
         unmatched_observations = set(range(len(observations)))
         assignments = []
+        assignment_sources = {}
+        self._last_roster_candidate_count = len(observations)
+        self._last_unassigned_observation_count = 0
 
         # A confirmed ByteTrack key takes priority over metric association.
         # It may revive a temporarily missing court track after an occlusion.
@@ -116,6 +194,7 @@ class CourtMultiObjectTracker:
             if track_id not in unmatched_track_ids or index not in unmatched_observations:
                 continue
             assignments.append((track_id, index))
+            assignment_sources[(track_id, index)] = "bytetrack"
             unmatched_track_ids.remove(track_id)
             unmatched_observations.remove(index)
 
@@ -124,30 +203,52 @@ class CourtMultiObjectTracker:
         # has exactly the same identity behavior as a rear view.
         candidates = []
         for track_id, track in self.tracks.items():
-            if track_id not in unmatched_track_ids or track.missed_frames > self.max_missed_frames:
+            if track_id not in unmatched_track_ids:
                 continue
+            if track.missed_frames > self.max_missed_frames:
+                if not (
+                    self.lock_match_roster
+                    and track.missed_frames <= self.roster_reacquire_frames
+                ):
+                    continue
+                source = "roster_reassociation"
+                gate = self._roster_reassociation_gate(track)
+            else:
+                source = "court_association"
+                gate = self._association_gate(track, frame_index)
             predicted = self._predict_position(track, frame_index)
             for index, observation in enumerate(observations):
                 distance = self._distance(predicted, observation["court_xy"])
-                if distance <= self._association_gate(track, frame_index):
-                    candidates.append((distance, track_id, index))
-        for _distance, track_id, index in sorted(candidates):
+                if distance <= gate:
+                    candidates.append((distance, track_id, index, source))
+        for _distance, track_id, index, source in sorted(candidates):
             if track_id not in unmatched_track_ids or index not in unmatched_observations:
                 continue
             assignments.append((track_id, index))
+            assignment_sources[(track_id, index)] = source
             unmatched_track_ids.remove(track_id)
             unmatched_observations.remove(index)
 
         for track_id, index in assignments:
-            self._apply_observation(self.tracks[track_id], frame_index, observations[index])
-        for index in sorted(unmatched_observations):
-            self._create_track(frame_index, observations[index])
+            self._apply_observation(
+                self.tracks[track_id],
+                frame_index,
+                observations[index],
+                association_source=assignment_sources[(track_id, index)],
+            )
+        if self.lock_match_roster:
+            # The roster is a match fact: detections outside it are retained as
+            # a count in the evidence, but may not silently become a new player.
+            self._last_unassigned_observation_count = len(unmatched_observations)
+        else:
+            for index in sorted(unmatched_observations):
+                self._create_track(frame_index, observations[index])
         for track_id in list(unmatched_track_ids):
             track = self.tracks[track_id]
             track.missed_frames += max(1, frame_index - track.last_frame)
             track.last_frame = frame_index
             self.track_metrics[track_id]["missing_frames"] += 1
-            if track.missed_frames > self.max_retained_missing_frames:
+            if not self.lock_match_roster and track.missed_frames > self.max_retained_missing_frames:
                 if track.association_key:
                     self._association_keys.pop(track.association_key, None)
                 del self.tracks[track_id]
@@ -211,6 +312,9 @@ class CourtMultiObjectTracker:
             court_xy = self._predict_position(track, frame_index) if predicted else track.court_xy
             if predicted:
                 self.track_metrics[track_id]["predicted_frames"] += 1
+            location_evidence = dict(track.last_evidence)
+            location_evidence["measurement_frame"] = int(track.last_observation_frame)
+            location_evidence["is_current_measurement"] = not predicted and not missing
             records.append(
                 {
                     "track_id": track.track_id,
@@ -225,24 +329,54 @@ class CourtMultiObjectTracker:
                     "missed_frames": track.missed_frames,
                     "association": {
                         "key": track.association_key,
-                        "source": "bytetrack" if str(track.association_key or "").startswith("bytetrack_") else "court_association",
+                        "source": track.association_source,
                     },
-                    "location_evidence": dict(track.last_evidence),
+                    "location_evidence": location_evidence,
+                    "trajectory_image": [self._as_list(point) for point in track.image_history],
                 }
             )
         return records
 
-    def _create_track(self, frame_index, observation):
+    def roster_summary(self):
+        """Expose roster state without turning a transient zone into identity."""
+        return {
+            "enabled": self.lock_match_roster,
+            "status": self.roster_status,
+            "expected_player_count": self.expected_roster_count if self.lock_match_roster else None,
+            "observed_on_court_candidate_count": self._last_roster_candidate_count,
+            "stable_observation_frames": self._roster_stable_observation_frames,
+            "stable_frames_required": self.roster_stable_frames if self.lock_match_roster else None,
+            "locked_frame": self.roster_locked_frame,
+            "track_ids": list(self.roster_track_ids),
+            "unassigned_observation_count": self._last_unassigned_observation_count,
+            "reason": self._last_roster_reason,
+            "policy": (
+                "Roster members are fixed after bootstrap. Extra detections are not new players; "
+                "detected, predicted, and missing remain explicit evidence states."
+                if self.lock_match_roster else "Roster locking disabled for backward-compatible callers."
+            ),
+        }
+
+    def _create_track(self, frame_index, observation, association_source="court_association"):
         track_id = f"track_{self._next_id:03d}"
         self._next_id += 1
+        image_xy = self._tuple_or_none(observation.get("image_xy"))
+        if (
+            association_source == "court_association"
+            and str(observation.get("association_key") or "").startswith("bytetrack_")
+        ):
+            association_source = "bytetrack"
         self.tracks[track_id] = _Track(
             track_id=track_id,
             court_xy=tuple(float(value) for value in observation["court_xy"]),
-            image_xy=self._tuple_or_none(observation.get("image_xy")),
+            image_xy=image_xy,
             confidence=float(observation.get("confidence", 0.0)),
             last_frame=int(frame_index),
+            last_observation_frame=int(frame_index),
             last_evidence=self._evidence(observation),
             association_key=observation.get("association_key"),
+            association_source=association_source,
+            image_history=[image_xy] if image_xy is not None else [],
         )
         if observation.get("association_key"):
             self._association_keys[observation["association_key"]] = track_id
@@ -254,7 +388,7 @@ class CourtMultiObjectTracker:
             "zone_frames": {self.court_space.zone_for(observation["court_xy"]): 1},
         }
 
-    def _apply_observation(self, track, frame_index, observation):
+    def _apply_observation(self, track, frame_index, observation, association_source="court_association"):
         new_xy = tuple(float(value) for value in observation["court_xy"])
         distance = self._distance(track.court_xy, new_xy)
         elapsed = max(1, int(frame_index) - track.last_frame) / self.fps
@@ -264,11 +398,16 @@ class CourtMultiObjectTracker:
             track.velocity_mps = velocity
         track.court_xy = new_xy
         track.image_xy = self._tuple_or_none(observation.get("image_xy"))
+        if track.image_xy is not None:
+            track.image_history.append(track.image_xy)
+            track.image_history = track.image_history[-30:]
         track.confidence = float(observation.get("confidence", 0.0))
         track.last_frame = int(frame_index)
+        track.last_observation_frame = int(frame_index)
         track.missed_frames = 0
         track.observations += 1
         track.last_evidence = self._evidence(observation)
+        track.association_source = association_source
         association_key = observation.get("association_key")
         if association_key:
             if track.association_key and track.association_key != association_key:
@@ -288,6 +427,15 @@ class CourtMultiObjectTracker:
     def _association_gate(self, track, frame_index):
         elapsed = max(1, int(frame_index) - track.last_frame) / self.fps
         return max(0.8, self.max_speed_mps * elapsed + 0.35)
+
+    def _roster_reassociation_gate(self, track):
+        """A conservative, short-gap recovery gate for a locked roster.
+
+        The rule allows a player who reappears after a brief detector gap to
+        reclaim the existing ID.  It intentionally stops before a long gap;
+        such a recovery requires ByteTrack evidence or remains ``missing``.
+        """
+        return min(3.5, max(1.2, 0.35 + self.max_speed_mps * self.roster_reacquire_frames / self.fps))
 
     @staticmethod
     def _distance(left, right):
@@ -317,8 +465,37 @@ class CourtMultiObjectTracker:
             "source": observation.get("source"),
             "bbox_xyxy": CourtMultiObjectTracker._as_list(bbox),
             "hands_image": observation.get("hands_image"),
+            "keypoints_image": CourtMultiObjectTracker._points_or_none(
+                observation.get("keypoints_image")
+            ),
+            "keypoint_scores": CourtMultiObjectTracker._numbers_or_none(
+                observation.get("keypoint_scores")
+            ),
             "degraded": bool(observation.get("location_degraded", False)),
         }
+
+    @staticmethod
+    def _points_or_none(value):
+        if value is None:
+            return None
+        try:
+            points = []
+            for point in value:
+                if len(point) < 2:
+                    return None
+                points.append([round(float(point[0]), 3), round(float(point[1]), 3)])
+            return points
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _numbers_or_none(value):
+        if value is None:
+            return None
+        try:
+            return [round(float(item), 4) for item in value]
+        except (TypeError, ValueError):
+            return None
 
 
 class MonocularShuttleReconstructor:
@@ -450,6 +627,8 @@ class FixedCameraMatchPipeline:
         tracker_backend="court_association",
         enable_bytetrack=False,
         byte_tracker_factory=None,
+        lock_match_roster=False,
+        roster_stable_frames=2,
     ):
         if tracker_backend not in {"court_association", "bytetrack"}:
             raise ValueError("tracker_backend must be 'court_association' or 'bytetrack'")
@@ -469,7 +648,14 @@ class FixedCameraMatchPipeline:
             if tracker_backend == "bytetrack"
             else None
         )
-        self.tracker = CourtMultiObjectTracker(self.court_space, fps=fps, match_mode=match_mode)
+        self.tracker = CourtMultiObjectTracker(
+            self.court_space,
+            fps=fps,
+            match_mode=match_mode,
+            lock_match_roster=lock_match_roster,
+            expected_roster_count=2 if match_mode == "singles" else 4,
+            roster_stable_frames=roster_stable_frames,
+        )
         self.shuttle = MonocularShuttleReconstructor()
         self.rallies = RallyStateMachine(fps=fps)
         self._last_frame = 0
@@ -493,6 +679,7 @@ class FixedCameraMatchPipeline:
                 "max_players_per_team": self.tracker.max_players_per_team,
                 "identity_policy": "track_id is persistent; court_end and zone_id are transient; team_id requires confirmation",
             },
+            "match_roster": self.tracker.roster_summary(),
             "tracking": {
                 "backend": self.tracker_backend,
                 "measurement_statuses": ["detected", "predicted", "missing"],
@@ -518,6 +705,7 @@ class FixedCameraMatchPipeline:
                 "backend": self.tracker_backend,
                 "bytetrack_evaluation_gate": self.tracker_backend == "bytetrack",
             },
+            "match_roster": self.tracker.roster_summary(),
             "player_style_inputs": self.tracker.summaries(),
             "rallies": self.rallies.finalize(self._last_frame),
             "score_policy": "unknown scores are excluded from ability, win/loss, challenge, leaderboard, and key-point statistics",

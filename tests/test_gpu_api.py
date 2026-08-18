@@ -93,6 +93,80 @@ class GpuApiTests(unittest.TestCase):
         self.assertEqual(recovered.json()["job_id"], job_id)
         self.assertTrue(recovered.json()["receipt"]["reused"])
 
+    def test_job_accepts_fixed_roster_options(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-roster"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": (
+                    '{"match_mode":"doubles","lock_match_roster":true,'
+                    '"roster_stable_frames":3}'
+                ),
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "queued")
+
+    def test_job_accepts_tracknet_as_explicit_primary_shuttle_source(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-tracknet"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"shuttle_detector":"tracknet_v3"}',
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        job = response.json()
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["result"], None)
+        stored = self.app.state.job_manager.get_job(job["job_id"])
+        self.assertEqual(stored["options"]["shuttle_detector"], "tracknet_v3")
+
+    def test_job_uses_960_and_10hz_pose_defaults(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-defaults"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={"court_corners": "[[1,1],[2,1],[2,2],[1,2]]"},
+        )
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["options"]["pose_imgsz"], 960)
+        self.assertEqual(stored["options"]["pose_sample_hz"], 10.0)
+        self.assertEqual(stored["tracking"]["phase"], "waiting_for_analysis")
+
+    def test_job_keeps_an_opaque_match_reference_without_participant_identity(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-context"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"match_session_ref":"match_check_batch_20260818"}',
+            },
+        )
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["input"]["match_session_ref"], "match_check_batch_20260818")
+
 
 if __name__ == "__main__":
     unittest.main()

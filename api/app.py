@@ -147,6 +147,7 @@ def _job_response(job, receipt_reused=None):
         "progress": job.get("progress"),
         "error": job.get("error"),
         "execution": job.get("execution"),
+        "tracking": job.get("tracking"),
         "result": result,
         "state_history": job.get("state_history", []),
     }
@@ -200,10 +201,21 @@ def _parse_options(value):
         "show_pose_roi": False,
         "visualize_positions": True,
         "output_video_style": "skeleton",
-        "pose_imgsz": 1280,
+        # Fixed-camera matches use 10 Hz pose evidence by default. 960 keeps
+        # distant-player detail while leaving capacity for TrackNet and the
+        # post-match report on a 24 GB GPU.
+        "pose_imgsz": 960,
+        "pose_sample_hz": 10.0,
         "pose_conf": 0.15,
         "far_player_enhancement": False,
         "far_pose_roi": [0.12, 0.30, 0.86, 0.82],
+        "match_mode": "singles",
+        "lock_match_roster": True,
+        "roster_stable_frames": 2,
+        "shuttle_detector": "tracknet_v3",
+        # Opaque business-session reference only. Participant check IDs remain
+        # on the business service and never become visual identity evidence.
+        "match_session_ref": None,
     }
     unsupported = set(received).difference(defaults)
     if unsupported:
@@ -211,10 +223,28 @@ def _parse_options(value):
     options = {**defaults, **received}
     if options["pose_imgsz"] not in {640, 960, 1280}:
         raise HTTPException(status_code=422, detail="pose_imgsz must be 640, 960, or 1280")
+    if not 1.0 <= float(options["pose_sample_hz"]) <= 30.0:
+        raise HTTPException(status_code=422, detail="pose_sample_hz must be between 1 and 30")
     if not 0 < float(options["pose_conf"]) <= 1:
         raise HTTPException(status_code=422, detail="pose_conf must be in (0, 1]")
     if options["output_video_style"] not in {"annotated", "skeleton"}:
         raise HTTPException(status_code=422, detail="output_video_style must be annotated or skeleton")
+    if options["match_mode"] not in {"singles", "doubles"}:
+        raise HTTPException(status_code=422, detail="match_mode must be singles or doubles")
+    if options["shuttle_detector"] not in {"yolo", "tracknet_v3"}:
+        raise HTTPException(status_code=422, detail="shuttle_detector must be yolo or tracknet_v3")
+    if int(options["roster_stable_frames"]) < 1 or int(options["roster_stable_frames"]) > 10:
+        raise HTTPException(status_code=422, detail="roster_stable_frames must be between 1 and 10")
+    if options["match_session_ref"] is not None and not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,128}", str(options["match_session_ref"])
+    ):
+        raise HTTPException(status_code=422, detail="match_session_ref must be a safe opaque reference")
+    options["lock_match_roster"] = bool(options["lock_match_roster"])
+    options["roster_stable_frames"] = int(options["roster_stable_frames"])
+    options["pose_sample_hz"] = float(options["pose_sample_hz"])
+    options["match_session_ref"] = (
+        str(options["match_session_ref"]) if options["match_session_ref"] is not None else None
+    )
     return options
 
 

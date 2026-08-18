@@ -160,6 +160,7 @@ def _wait_for_job(config, job_id, progress_cb=None, status_cb=None):
             "mode": "remote_gpu", "phase": state, "job_id": job_id,
             "processed_frames": details.get("processed_frames", 0),
             "total_frames": details.get("total_frames"), "ratio": details.get("ratio", 0.0),
+            "tracking": job.get("tracking"),
         })
         if progress_cb:
             ratio = float(details.get("ratio") or 0.0)
@@ -194,6 +195,7 @@ def recover_remote_task(business_task_id, remote_job_id, output_dir, status_cb=N
         "mode": "remote_gpu", "phase": job.get("status"), "job_id": job_id,
         "processed_frames": details.get("processed_frames", 0),
         "total_frames": details.get("total_frames"), "ratio": details.get("ratio", 0.0),
+        "tracking": job.get("tracking"),
         "recovered": True,
     })
     if job.get("status") != "succeeded":
@@ -242,6 +244,8 @@ def _download_result(config, job_id, result, output_dir):
         "video": downloaded.get("annotated_video"),
         "metadata": metadata_path,
         "detections": downloaded.get("detections"),
+        "tracknet_raw_csv": downloaded.get("tracknet_raw_csv"),
+        "performance_report": downloaded.get("performance_report"),
         "visualizations": [path for name, path in downloaded.items() if name.startswith("visualization_")],
         "warnings": (result.get("result") or {}).get("warnings", []),
         "execution": metadata["execution"],

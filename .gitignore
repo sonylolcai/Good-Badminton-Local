@@ -18,6 +18,8 @@ api_data/
 .gpu-api.env
 .webui-remote-gpu.env
 *.log
+# Local deployment artifact: upload it to the GPU provider, never commit it.
+deploy/good-badminton-gpu-api-upload.zip
 
 # Model weights are intentionally not published
 weights/*

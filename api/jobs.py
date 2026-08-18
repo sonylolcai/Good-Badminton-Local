@@ -65,10 +65,16 @@ class AnalysisJobManager:
             "started_at": None,
             "finished_at": None,
             "progress": {"processed_frames": 0, "total_frames": None, "ratio": 0.0},
+            "tracking": {
+                "phase": "waiting_for_analysis",
+                "match_roster": None,
+                "track_candidates": [],
+            },
             "input": {
                 "video_filename": Path(video_path).name,
                 "template_filename": Path(template_path).name,
                 "court_corners": corners,
+                "match_session_ref": options.get("match_session_ref"),
             },
             "options": options,
             "request": {"idempotency_key": idempotency_key, "accepted_at": accepted_at},
@@ -151,6 +157,16 @@ class AnalysisJobManager:
             }
             self._write_job(current)
 
+        def analysis_state(update):
+            current = self.get_job(job_id)
+            if current is None:
+                return
+            current["tracking"] = {
+                **(current.get("tracking") or {}),
+                **dict(update or {}),
+            }
+            self._write_job(current)
+
         try:
             # Lazy import keeps /health inexpensive and avoids model imports
             # before the worker actually receives a GPU task.
@@ -162,6 +178,7 @@ class AnalysisJobManager:
                 corners,
                 options,
                 progress_cb=progress,
+                state_cb=analysis_state,
                 output_dir=output_dir,
                 cleanup_outputs=False,
             )
@@ -195,6 +212,8 @@ class AnalysisJobManager:
             "annotated_video": result.get("video"),
             "metadata": result.get("metadata"),
             "detections": result.get("detections"),
+            "tracknet_raw_csv": result.get("tracknet_raw_csv"),
+            "performance_report": result.get("performance_report"),
         }
         spatial_summary = output_path / "spatial_match_summary.json"
         if spatial_summary.is_file():
@@ -242,6 +261,7 @@ class AnalysisJobManager:
             ".mp4": "video/mp4",
             ".json": "application/json",
             ".jsonl": "application/x-ndjson",
+            ".csv": "text/csv",
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",

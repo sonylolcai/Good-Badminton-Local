@@ -94,6 +94,8 @@ class PlayerTracker:
             "status": "missing",
             "confidence": None,
             "source": None,
+            "measurement_kind": None,
+            "confidence_status": None,
             "gap_frames": 0,
             "accepted": False,
         }
@@ -103,6 +105,8 @@ class PlayerTracker:
                     "status": ball_detection.get("status", "missing"),
                     "confidence": ball_detection.get("confidence"),
                     "source": ball_detection.get("source"),
+                    "measurement_kind": ball_detection.get("measurement_kind"),
+                    "confidence_status": ball_detection.get("confidence_status"),
                     "gap_frames": int(ball_detection.get("gap_frames", 0)),
                     "accepted": bool(ball_detection.get("accepted", False)),
                     "visible": bool(ball_detection.get("visible", False)),

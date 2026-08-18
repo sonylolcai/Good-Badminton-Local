@@ -74,6 +74,77 @@ class MultiTrackModeTests(unittest.TestCase):
         self.assertEqual(missing["status"], "missing")
         self.assertEqual(missing["confidence"], 0.0)
 
+    def test_locked_singles_roster_waits_for_two_people_then_rejects_new_tracks(self):
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            roster_stable_frames=2,
+        )
+        only_one = pipeline.update(1, [self._observation((2.0, 2.0), None)], None)
+        self.assertEqual(only_one["match_roster"]["status"], "bootstrapping")
+        self.assertEqual(only_one["match_roster"]["observed_on_court_candidate_count"], 1)
+        self.assertEqual(only_one["tracks"], [])
+
+        first_complete = pipeline.update(
+            2,
+            [self._observation((2.0, 2.0), None), self._observation((4.0, 11.0), None)],
+            None,
+        )
+        self.assertEqual(first_complete["match_roster"]["status"], "bootstrapping")
+        locked = pipeline.update(
+            3,
+            [self._observation((2.1, 2.0), None), self._observation((4.0, 10.9), None)],
+            None,
+        )
+        track_ids = [item["track_id"] for item in locked["tracks"]]
+        self.assertEqual(locked["match_roster"]["status"], "locked")
+        self.assertEqual(locked["match_roster"]["track_ids"], track_ids)
+        self.assertEqual(len(track_ids), 2)
+
+        # A third person-shaped detection is evidence for review, not a new
+        # match participant. The locked roster still has exactly two IDs.
+        after_extra_detection = pipeline.update(
+            4,
+            [
+                self._observation((2.2, 2.0), None),
+                self._observation((4.0, 10.8), None),
+                self._observation((3.0, 6.7), None),
+            ],
+            None,
+        )
+        self.assertEqual([item["track_id"] for item in after_extra_detection["tracks"]], track_ids)
+        self.assertEqual(after_extra_detection["match_roster"]["unassigned_observation_count"], 1)
+
+    def test_locked_roster_reassociates_brief_gap_without_creating_a_new_id(self):
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            roster_stable_frames=1,
+        )
+        initial = pipeline.update(
+            1,
+            [self._observation((2.0, 2.0), None), self._observation((4.0, 11.0), None)],
+            None,
+        )
+        track_ids = [item["track_id"] for item in initial["tracks"]]
+        for frame_index in range(2, 15):
+            pipeline.update(frame_index, [], None)
+        recovered = pipeline.update(
+            15,
+            [self._observation((2.3, 2.0), None), self._observation((4.1, 10.8), None)],
+            None,
+        )
+        self.assertEqual([item["track_id"] for item in recovered["tracks"]], track_ids)
+        self.assertEqual(len(recovered["tracks"]), 2)
+        self.assertIn(
+            "roster_reassociation",
+            {item["association"]["source"] for item in recovered["tracks"]},
+        )
+
     def test_bytetrack_is_not_enabled_without_recorded_gate(self):
         with self.assertRaisesRegex(ValueError, "evaluation-gated"):
             FixedCameraMatchPipeline(self.CORNERS, fps=10, tracker_backend="bytetrack")

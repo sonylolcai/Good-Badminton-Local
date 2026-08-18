@@ -213,7 +213,7 @@ def ensure_court_for_analysis(video_file, template_path, corners, click_corners,
 
 def run_full_analysis(analysis_ready, video_file, template_path, corners,
                       pose_family, pose_mode, language, audio, match_mode,
-                      output_video_style,
+                      output_video_style, shuttle_detector,
                       pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
                       show_skeletons, show_player_trajectories,
                       show_court_trajectory, show_shuttlecock_trajectory,
@@ -248,8 +248,12 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "language": language,
         "audio": audio,
         "match_mode": match_mode,
+        "lock_match_roster": True,
+        "roster_stable_frames": 2,
         "output_video_style": output_video_style,
+        "shuttle_detector": shuttle_detector,
         "pose_imgsz": int(pose_imgsz),
+        "pose_sample_hz": 10.0,
         "pose_conf": float(pose_conf),
         "far_player_enhancement": far_player_enhancement,
         "far_pose_roi": parsed_far_roi,
@@ -300,6 +304,11 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                 publish({"mode": "remote_gpu", "phase": "succeeded", "business_task_id": business_task_id})
             except RemoteAnalysisError as remote_exc:
                 fallback_reason = str(remote_exc)
+                if shuttle_detector == "tracknet_v3":
+                    raise RuntimeError(
+                        "远程 TrackNetV3 主流程失败；为避免悄悄改用 YOLO，本次不会本地回退。"
+                        f" 原因：{fallback_reason}"
+                    ) from remote_exc
                 print(f"Remote GPU analysis failed; falling back locally: {fallback_reason}")
                 ledger.record_terminal(
                     business_task_id, status="local_fallback", error={"message": fallback_reason}
@@ -352,7 +361,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                 break
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
         if updated or status["phase"] == "preparing":
-            yield None, None, None, None, None, None, status.copy()
+            yield None, None, None, None, None, None, None, None, status.copy()
         time.sleep(0.4)
 
     if "error" in outcome:
@@ -371,11 +380,23 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             metadata_content = json.load(f)
 
     detections_file = result["detections"] if os.path.isfile(result["detections"]) else None
+    tracknet_raw_file = result.get("tracknet_raw_csv")
+    if tracknet_raw_file and not os.path.isfile(tracknet_raw_file):
+        tracknet_raw_file = None
+    performance_report_file = result.get("performance_report")
+    if performance_report_file and not os.path.isfile(performance_report_file):
+        performance_report_file = None
     rally_summary, rally_rows = _rally_summary_from_result(result, metadata_content)
 
     status["phase"] = "succeeded"
     status["elapsed_seconds"] = round(time.monotonic() - started, 1)
-    yield output_video, viz_images or None, metadata_content, detections_file, rally_summary, rally_rows, status.copy()
+    roster = ((metadata_content or {}).get("temporal_tracking") or {}).get("players", {}).get("match_roster")
+    if roster is not None:
+        status["match_roster"] = roster
+    yield (
+        output_video, viz_images or None, metadata_content, detections_file,
+        tracknet_raw_file, performance_report_file, rally_summary, rally_rows, status.copy(),
+    )
 
 
 def _rally_summary_from_result(result, metadata):
@@ -1396,8 +1417,17 @@ def build_ui():
                     # Preserve the analysis callback contract while preventing
                     # accidental Skeleton-only output in the normal workflow.
                     output_video_style = gr.State(value="annotated")
+                    shuttle_detector = gr.Dropdown(
+                        choices=[
+                            ("TrackNetV3 原始轨迹（GPU 主流程）", "tracknet_v3"),
+                            ("YOLO 羽毛球检测（旧路径）", "yolo"),
+                        ],
+                        value="tracknet_v3",
+                        label="羽毛球检测来源",
+                        info="TrackNet 失败时会明确报错，不会静默改用 YOLO。",
+                    )
                     pose_imgsz = gr.Dropdown(
-                        choices=[640, 960, 1280], value=1280, label=t["pose_imgsz"],
+                        choices=[640, 960, 1280], value=960, label=t["pose_imgsz"],
                     )
                     pose_conf = gr.Slider(
                         minimum=0.10, maximum=0.50, step=0.01, value=0.15,
@@ -1440,6 +1470,8 @@ def build_ui():
                     output_gallery = gr.Gallery(label=t["out_gallery"], columns=2, height="auto")
                     output_metadata = gr.JSON(label=t["out_metadata"])
                     output_detections = gr.File(label=t["out_detections"])
+                    output_tracknet_raw = gr.File(label="TrackNetV3 原始球点 CSV（可下载复核）")
+                    output_performance_report = gr.File(label="运动表现报告（含大模型状态）")
                     output_rally_summary = gr.Markdown("### 回合与拍数\n完成分析后显示候选回合与每回合拍数。")
                     output_rallies = gr.Dataframe(
                         headers=["回合", "开始(s)", "结束(s)", "候选拍数", "可见球候选", "缺球补拍", "结束依据", "置信度"],
@@ -1870,7 +1902,7 @@ def build_ui():
             fn=run_full_analysis,
             inputs=[
                 analysis_ready_state, video_input, template_path_state, corners_state,
-                pose_family, pose_mode, language, audio, match_mode, output_video_style,
+                pose_family, pose_mode, language, audio, match_mode, output_video_style, shuttle_detector,
                 pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
                 show_skeletons, show_player_trajectories,
                 show_court_trajectory, show_shuttlecock_trajectory,
@@ -1878,7 +1910,8 @@ def build_ui():
                 yolo_pose_model, ball_model,
             ],
             outputs=[
-                output_video, output_gallery, output_metadata, output_detections,
+                output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
+                output_performance_report,
                 output_rally_summary, output_rallies, output_status,
             ],
         )

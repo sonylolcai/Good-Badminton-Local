@@ -147,6 +147,10 @@ class PlayerPoseVisualizer:
         detections = getter()
         return detections if isinstance(detections, list) else []
 
+    def clear_current_pose_data(self):
+        """Clear evidence for a source frame deliberately skipped by sampling."""
+        self.current_pose_data = None
+
     @staticmethod
     def _bbox_from_keypoints(keypoints):
         points = np.asarray(keypoints, dtype=float)
@@ -272,7 +276,11 @@ class PlayerPoseVisualizer:
 
         t0 = time.time()
         if spatial_tracks is not None:
-            self._draw_spatial_tracks(frame, spatial_tracks)
+            self._draw_spatial_tracks(
+                frame,
+                spatial_tracks,
+                draw_trajectory=self.show_player_trajectories,
+            )
         else:
             # Compatibility rendering for older callers. New analysis passes
             # spatial tracks and never uses upper/lower as an identity source.
@@ -301,8 +309,14 @@ class PlayerPoseVisualizer:
                 print(f"Drawing player stats took {time.time() - t0:.2f} sec")
 
     @staticmethod
-    def _draw_spatial_tracks(frame, tracks):
-        """Draw all player tracks and label measured versus temporal state."""
+    def _draw_spatial_tracks(frame, tracks, draw_trajectory=True):
+        """Draw roster-backed player boxes, IDs, and evidence-aware movement.
+
+        A detected box is a real pose measurement. Predicted tracks use a
+        dashed last-known box and missing tracks deliberately have no box, so
+        the annotated video never presents an inferred location as a person
+        that the detector actually observed.
+        """
         colors = {
             "detected": (0, 255, 0),
             "predicted": (0, 210, 255),
@@ -315,6 +329,27 @@ class PlayerPoseVisualizer:
             status = track.get("status", "missing")
             color = colors.get(status, colors["missing"])
             position = (int(image_xy[0]), int(image_xy[1]))
+            trajectory = [
+                (int(point[0]), int(point[1]))
+                for point in (track.get("trajectory_image") or [])
+                if point is not None and len(point) >= 2
+            ]
+            if draw_trajectory and len(trajectory) >= 2:
+                cv2.polylines(frame, [np.asarray(trajectory, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
+
+            bbox = (track.get("location_evidence") or {}).get("bbox_xyxy")
+            if bbox is not None and len(bbox) >= 4:
+                try:
+                    x1, y1, x2, y2 = (int(round(float(value))) for value in bbox[:4])
+                except (TypeError, ValueError):
+                    x1 = y1 = x2 = y2 = 0
+                if x2 > x1 and y2 > y1:
+                    if status == "detected":
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+                    elif status == "predicted":
+                        PlayerPoseVisualizer._draw_dashed_rectangle(
+                            frame, (x1, y1), (x2, y2), color
+                        )
             cv2.circle(frame, position, 6, color, -1, cv2.LINE_AA)
             label = str(track.get("track_id", "track"))
             if track.get("team_id"):
@@ -331,6 +366,23 @@ class PlayerPoseVisualizer:
                 1,
                 cv2.LINE_AA,
             )
+
+    @staticmethod
+    def _draw_dashed_rectangle(frame, top_left, bottom_right, color, segment=8, gap=5):
+        """Render a predicted box without making it look like a measurement."""
+        x1, y1 = top_left
+        x2, y2 = bottom_right
+        for start, end in (((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)), ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))):
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            length = max(abs(dx), abs(dy))
+            if length <= 0:
+                continue
+            for offset in range(0, length, segment + gap):
+                next_offset = min(length, offset + segment)
+                p1 = (int(start[0] + dx * offset / length), int(start[1] + dy * offset / length))
+                p2 = (int(start[0] + dx * next_offset / length), int(start[1] + dy * next_offset / length))
+                cv2.line(frame, p1, p2, color, 1, cv2.LINE_AA)
 
     def _draw_skeleton_on_frame(self, frame, keypoints, offset_x, offset_y):
         for person in self._normalize_people(keypoints):
