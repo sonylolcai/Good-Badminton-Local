@@ -85,7 +85,7 @@ class PlayerTracker:
         return [float(x), float(y)]
 
     def write_detection_record(self, frame_index, players_record, ball_image_position, detect_frame_count,
-                               ball_detection=None):
+                               ball_detection=None, spatial_state=None):
         if self.detection_writer is None:
             return
 
@@ -94,6 +94,8 @@ class PlayerTracker:
             "status": "missing",
             "confidence": None,
             "source": None,
+            "measurement_kind": None,
+            "confidence_status": None,
             "gap_frames": 0,
             "accepted": False,
         }
@@ -103,6 +105,8 @@ class PlayerTracker:
                     "status": ball_detection.get("status", "missing"),
                     "confidence": ball_detection.get("confidence"),
                     "source": ball_detection.get("source"),
+                    "measurement_kind": ball_detection.get("measurement_kind"),
+                    "confidence_status": ball_detection.get("confidence_status"),
                     "gap_frames": int(ball_detection.get("gap_frames", 0)),
                     "accepted": bool(ball_detection.get("accepted", False)),
                     "visible": bool(ball_detection.get("visible", False)),
@@ -114,17 +118,22 @@ class PlayerTracker:
             )
 
         record = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "frame": int(frame_index),
             "time_sec": round(frame_index / self.fps, 6) if self.fps else None,
             "detect_frame": int(detect_frame_count),
             "players": players_record,
             "shuttlecock": shuttlecock_record,
         }
+        if spatial_state is not None:
+            # The v1 upper/lower records are retained for existing consumers.
+            # All new tracking and spatial analytics must read this field:
+            # persistent identity is track_id and zone_id is only instantaneous.
+            record["spatial"] = spatial_state
         self.detection_writer.write(record)
 
     def update(self, frame_index, centroids, ball_image_position, left_hand_positions, right_hand_positions,
-               detect_frame_count, pose_detections=None, ball_detection=None):
+               detect_frame_count, pose_detections=None, ball_detection=None, spatial_state=None):
         players_record = self._initialize_player_record()
         pose_detections = pose_detections or []
 
@@ -173,6 +182,7 @@ class PlayerTracker:
             ball_image_position,
             detect_frame_count,
             ball_detection=ball_detection,
+            spatial_state=spatial_state,
         )
         return self.players
 

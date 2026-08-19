@@ -1,6 +1,12 @@
 import json
 import os
+import queue
+import threading
+import time
 import traceback
+from datetime import datetime
+from html import escape
+from pathlib import Path
 
 from webui.log_capture import get_backend_logs, install_backend_log_capture
 
@@ -10,6 +16,7 @@ import cv2
 import gradio as gr
 import numpy as np
 
+from badminton_analysis.cancellation import AnalysisCancelled
 from webui.pipeline import (
     _max_template_match_score,
     imread_safe,
@@ -17,9 +24,48 @@ from webui.pipeline import (
     prepare_court_from_video,
     run_analysis,
 )
+from webui.remote_gpu import RemoteAnalysisError, remote_gpu_config, run_remote_analysis
+from webui.shot_review import (
+    REVIEW_DECISIONS,
+    RALLY_TERMINAL_OUTCOMES,
+    SHOT_TYPES,
+    add_manual_candidate,
+    add_manual_rally_terminal,
+    analysis_run_label,
+    candidate_at_table_row,
+    candidate_choices,
+    candidate_table,
+    candidate_view,
+    create_or_load_review_session,
+    default_analysis_run,
+    find_analysis_runs,
+    merge_review_candidates,
+    review_summary,
+    rally_playback_state,
+    reviewed_rally_table,
+    save_human_review,
+    split_review_candidate,
+    timeline_state,
+)
+from webui.task_ledger import BusinessTaskLedger
+from webui.task_control import AnalysisTaskController
 
 _MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MB
+_ANALYSIS_TASKS = AnalysisTaskController()
+
+
+def _write_execution_metadata(result, execution):
+    """Persist the execution origin so local fallback is never invisible."""
+    metadata_path = result.get("metadata")
+    if not metadata_path or not os.path.isfile(metadata_path):
+        return
+    with open(metadata_path, "r", encoding="utf-8") as source:
+        metadata = json.load(source)
+    metadata["execution"] = execution
+    with open(metadata_path, "w", encoding="utf-8") as output:
+        json.dump(metadata, output, ensure_ascii=False, indent=2)
+        output.write("\n")
 
 
 def _validate_file_size(path, max_bytes, label="File"):
@@ -169,8 +215,8 @@ def ensure_court_for_analysis(video_file, template_path, corners, click_corners,
 
 
 def run_full_analysis(analysis_ready, video_file, template_path, corners,
-                      pose_family, pose_mode, language, audio,
-                      output_video_style,
+                      pose_family, pose_mode, language, audio, match_mode,
+                      output_video_style, shuttle_detector,
                       pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
                       show_skeletons, show_player_trajectories,
                       show_court_trajectory, show_shuttlecock_trajectory,
@@ -204,8 +250,16 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "pose_mode": pose_mode,
         "language": language,
         "audio": audio,
+        "match_mode": match_mode,
+        "lock_match_roster": True,
+        "roster_stable_frames": 2,
         "output_video_style": output_video_style,
+        "shuttle_detector": shuttle_detector,
         "pose_imgsz": int(pose_imgsz),
+        # A 10 Hz measurement is enough for fixed-camera movement analysis
+        # and keeps 30/60 FPS input within the production compute budget.
+        # Full-frame evidence remains an explicit API-only 0 Hz option.
+        "pose_sample_hz": 10.0,
         "pose_conf": float(pose_conf),
         "far_player_enhancement": far_player_enhancement,
         "far_pose_roi": parsed_far_roi,
@@ -220,20 +274,203 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "ball_model": ball_model or "weights/yolo11s-ball.pt",
     }
 
-    def progress_cb(frame, total):
-        progress(frame / total, desc=f"Processing frame {frame}/{total}")
+    task_handle = _ANALYSIS_TASKS.start()
+    events = queue.Queue()
+    finished = threading.Event()
+    outcome = {}
+    started = time.monotonic()
 
-    try:
-        result = run_analysis(
-            video_path=video_file,
-            template_path=template_path,
-            corners=corners,
-            options=options,
-            progress_cb=progress_cb,
-        )
-    except Exception as exc:
-        traceback.print_exc()
-        raise gr.Error(f"分析失败：{exc}") from exc
+    def publish(event):
+        events.put(event)
+
+    def worker():
+        ledger = None
+        business_task_id = None
+        try:
+            remote_output_dir = os.path.join(
+                "outputs", "remote_jobs", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            )
+            ledger = BusinessTaskLedger()
+            business_task_id = ledger.start_task(
+                output_dir=remote_output_dir,
+                remote_base_url=remote_gpu_config()["base_url"],
+            )
+
+            def remote_status(event):
+                ledger.record_remote_event(business_task_id, event)
+                publish({**event, "business_task_id": business_task_id})
+
+            try:
+                result = run_remote_analysis(
+                    video_path=video_file, template_path=template_path, corners=corners,
+                    options=options, output_dir=remote_output_dir, status_cb=remote_status,
+                    business_task_id=business_task_id,
+                    cancel_cb=task_handle.is_cancelled,
+                )
+                outcome["result"] = result
+                trace_record = ledger.archive_performance_trace(
+                    business_task_id,
+                    result.get("performance_trace"),
+                )
+                ledger.record_terminal(
+                    business_task_id,
+                    status="succeeded",
+                    details={"performance_trace": trace_record} if trace_record else None,
+                )
+                publish({"mode": "remote_gpu", "phase": "succeeded", "business_task_id": business_task_id})
+            except RemoteAnalysisError as remote_exc:
+                remote_trace_record = ledger.archive_performance_trace(
+                    business_task_id,
+                    getattr(remote_exc, "performance_trace_path", None),
+                )
+                if task_handle.is_cancelled():
+                    message = f"本地已停止等待，但远端 GPU 中断未确认：{remote_exc}"
+                    outcome["interrupt_unconfirmed"] = message
+                    if ledger is not None and business_task_id is not None:
+                        ledger.record_terminal(
+                            business_task_id,
+                            status="interrupted_unconfirmed",
+                            error={"type": "RemoteCancellationUnconfirmed", "message": message},
+                            details={"performance_trace": remote_trace_record} if remote_trace_record else None,
+                        )
+                    publish({
+                        "phase": "interrupted_unconfirmed",
+                        "message": message,
+                        "business_task_id": business_task_id,
+                    })
+                    return
+                fallback_reason = str(remote_exc)
+                if shuttle_detector == "tracknet_v3":
+                    raise RuntimeError(
+                        "远程 TrackNetV3 主流程失败；为避免悄悄改用 YOLO，本次不会本地回退。"
+                        f" 原因：{fallback_reason}"
+                    ) from remote_exc
+                print(f"Remote GPU analysis failed; falling back locally: {fallback_reason}")
+                ledger.record_terminal(
+                    business_task_id,
+                    status="local_fallback",
+                    error={"message": fallback_reason},
+                    details={"performance_trace": remote_trace_record} if remote_trace_record else None,
+                )
+                publish({
+                    "mode": "local_fallback", "phase": "local_analyzing",
+                    "fallback_reason": fallback_reason, "business_task_id": business_task_id,
+                })
+
+                def local_progress(frame, total):
+                    publish({
+                        "mode": "local_fallback", "phase": "local_analyzing",
+                        "processed_frames": frame, "total_frames": total,
+                        "ratio": round(frame / total, 4) if total else 0.0,
+                        "fallback_reason": fallback_reason,
+                    })
+
+                result = run_analysis(
+                    video_path=video_file, template_path=template_path, corners=corners,
+                    options=options, progress_cb=local_progress,
+                    cancel_cb=task_handle.is_cancelled,
+                )
+                _write_execution_metadata(result, {
+                    "mode": "local_fallback", "fallback_used": True,
+                    "remote_failure": fallback_reason,
+                })
+                outcome["result"] = result
+                ledger.record_terminal(business_task_id, status="succeeded")
+                publish({
+                    "mode": "local_fallback", "phase": "succeeded",
+                    "fallback_reason": fallback_reason, "business_task_id": business_task_id,
+                })
+        except AnalysisCancelled as exc:
+            outcome["cancelled"] = str(exc)
+            if ledger is not None and business_task_id is not None:
+                trace_record = ledger.archive_performance_trace(
+                    business_task_id,
+                    getattr(exc, "performance_trace_path", None),
+                )
+                ledger.record_terminal(
+                    business_task_id,
+                    status="cancelled",
+                    error={"type": "TaskCancelled", "message": str(exc)},
+                    details={"performance_trace": trace_record} if trace_record else None,
+                )
+            publish({"phase": "cancelled", "message": str(exc), "business_task_id": business_task_id})
+        except Exception as exc:
+            traceback.print_exc()
+            outcome["error"] = exc
+            if ledger is not None and business_task_id is not None:
+                ledger.record_terminal(business_task_id, status="failed", error={"message": str(exc)})
+            publish({"phase": "failed", "error": str(exc), "business_task_id": business_task_id})
+        finally:
+            # Finalize only after every success/failure/cancellation path has
+            # written its durable terminal ledger event.  This is deliberately
+            # outside the remote client so a single document can cover client
+            # upload, GPU timing, polling, result transfer and local storage.
+            if ledger is not None and business_task_id is not None:
+                try:
+                    task = ledger.get(business_task_id) or {}
+                    if task.get("status") in {"succeeded", "failed", "cancelled", "interrupted_unconfirmed"}:
+                        end_to_end_trace = ledger.finalize_end_to_end_trace(business_task_id)
+                        if outcome.get("result") is not None and end_to_end_trace:
+                            outcome["result"]["end_to_end_trace"] = end_to_end_trace.get("result_copy_path")
+                        publish({
+                            "mode": "remote_gpu",
+                            "phase": task.get("status"),
+                            "business_task_id": business_task_id,
+                            "end_to_end_trace": end_to_end_trace,
+                        })
+                except Exception:
+                    # Observability must never conceal the original analysis
+                    # outcome.  The traceback still makes a broken trace
+                    # implementation diagnosable from the business process.
+                    traceback.print_exc()
+            finished.set()
+            _ANALYSIS_TASKS.finish(task_handle)
+
+    threading.Thread(target=worker, name="webui-analysis-status", daemon=True).start()
+    status = {"mode": "remote_gpu", "phase": "preparing", "elapsed_seconds": 0}
+    while not finished.is_set() or not events.empty():
+        updated = False
+        while True:
+            try:
+                status.update(events.get_nowait())
+                updated = True
+            except queue.Empty:
+                break
+        status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        if task_handle.is_cancelled() and status.get("phase") not in {"cancelled", "succeeded", "failed"}:
+            status["phase"] = "cancelling"
+            status["cancellation_requested"] = True
+        if updated or status["phase"] == "preparing":
+            yield None, None, None, None, None, None, None, None, status.copy()
+        time.sleep(0.4)
+
+    if "cancelled" in outcome:
+        status.update({"phase": "cancelled", "message": outcome["cancelled"]})
+        status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        yield None, None, None, None, None, None, None, None, status.copy()
+        return
+    if "interrupt_unconfirmed" in outcome:
+        status.update({
+            "phase": "interrupted_unconfirmed",
+            "message": outcome["interrupt_unconfirmed"],
+        })
+        status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        yield None, None, None, None, None, None, None, None, status.copy()
+        return
+    if "error" in outcome:
+        # Preserve the failure in the visible progress panel.  Raising a
+        # Gradio exception immediately can replace the last streamed JSON with
+        # a short toast, which made transport failures impossible to diagnose.
+        status.update({
+            "phase": "failed",
+            "error": str(outcome["error"]),
+            "error_type": type(outcome["error"]).__name__,
+            "action": "请查看 error 字段；若为上传/连接失败，请先恢复 127.0.0.1:8080 SSH 隧道。",
+        })
+        status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        yield None, None, None, None, None, None, None, None, status.copy()
+        return
+    result = outcome["result"]
 
     for warning in result.get("warnings", []):
         gr.Warning(warning)
@@ -247,8 +484,95 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             metadata_content = json.load(f)
 
     detections_file = result["detections"] if os.path.isfile(result["detections"]) else None
+    tracknet_raw_file = result.get("tracknet_raw_csv")
+    if tracknet_raw_file and not os.path.isfile(tracknet_raw_file):
+        tracknet_raw_file = None
+    performance_report_file = result.get("performance_report")
+    if performance_report_file and not os.path.isfile(performance_report_file):
+        performance_report_file = None
+    rally_summary, rally_rows = _rally_summary_from_result(result, metadata_content)
 
-    return output_video, viz_images or None, metadata_content, detections_file
+    status["phase"] = "succeeded"
+    status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+    roster = ((metadata_content or {}).get("temporal_tracking") or {}).get("players", {}).get("match_roster")
+    if roster is not None:
+        status["match_roster"] = roster
+    yield (
+        output_video, viz_images or None, metadata_content, detections_file,
+        tracknet_raw_file, performance_report_file, rally_summary, rally_rows, status.copy(),
+    )
+
+
+def interrupt_active_analysis(language="zh"):
+    """Signal the active WebUI task; its worker exits at the next safe checkpoint."""
+    active = _ANALYSIS_TASKS.request_cancel()
+    if active is None:
+        return {
+            "phase": "idle",
+            "message": "当前没有可中断的分析任务。" if language == "zh" else "No analysis task is running.",
+        }
+    return {
+        "phase": "cancelling",
+        "message": "已请求中断；正在等待当前帧或子进程安全退出。" if language == "zh"
+        else "Interrupt requested; waiting for the current frame or child process to exit safely.",
+        **active,
+    }
+
+
+def _rally_summary_from_result(result, metadata):
+    """Build a compact, review-only rally table from local derived artifacts.
+
+    A remote result may carry server-side absolute artifact paths in its
+    metadata.  The WebUI therefore first resolves the local download folder,
+    and only rebuilds the small derived files from immutable detections when a
+    legacy GPU service did not return them.
+    """
+    metadata = metadata or {}
+    detections_path = Path(result.get("detections") or "")
+    if not detections_path.is_file():
+        return "### 回合与拍数\n未找到本地检测数据，暂时无法生成候选回合。", []
+    derived = metadata.get("derived") or result.get("derived") or {}
+    rally_path = Path(derived.get("rallies_path") or "")
+    local_rally_path = detections_path.parent / "derived" / "rallies_v2.jsonl"
+    if not rally_path.is_file() and local_rally_path.is_file():
+        rally_path = local_rally_path
+    if not rally_path.is_file():
+        from badminton_analysis.analysis.offline_shot_reconstruction import generate_offline_artifacts
+
+        derived = generate_offline_artifacts(detections_path)
+        rally_path = Path(derived["rallies_path"])
+        metadata["derived"] = derived
+        metadata_path = Path(result.get("metadata") or "")
+        if metadata_path.is_file():
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        with rally_path.open(encoding="utf-8") as source:
+            rallies = [json.loads(line) for line in source if line.strip()]
+    except (OSError, ValueError) as error:
+        return f"### 回合与拍数\n读取候选回合失败：`{error}`", []
+
+    rows = [
+        [
+            item.get("rally_id"),
+            round(float(item.get("start_time_sec", 0.0)), 2),
+            round(float(item.get("end_time_sec", 0.0)), 2),
+            int(item.get("shot_count", 0)),
+            int(item.get("observed_shot_count", 0)),
+            int(item.get("motion_inferred_shot_count", 0)),
+            item.get("end_reason"),
+            round(float(item.get("confidence", 0.0)), 3),
+        ]
+        for item in rallies
+    ]
+    shot_count = sum(int(item.get("shot_count", 0)) for item in rallies)
+    inferred_count = sum(int(item.get("motion_inferred_shot_count", 0)) for item in rallies)
+    return (
+        "### 回合与拍数（候选，待人工复核）\n"
+        f"共 **{len(rallies)}** 个候选回合、**{shot_count}** 个候选拍；"
+        f"其中 **{inferred_count}** 拍由缺球动作约束补出。"
+        "回合边界、球种和二维球速都不会进入得分或能力统计，直到人工确认。",
+        rows,
+    )
 
 
 _UI_TEXT = {
@@ -285,8 +609,10 @@ _UI_TEXT = {
         "apply_btn": "应用手动角点",
         "step2": "### 第二步 — 运行分析",
         "run_btn": "运行分析",
+        "interrupt_btn": "中断当前任务",
         "results": "### 结果",
         "out_video": "标注视频",
+        "out_status": "分析进度（执行任务）",
         "out_gallery": "热力图和散点图",
         "out_metadata": "元数据",
         "out_detections": "检测数据 (JSONL)",
@@ -335,8 +661,10 @@ _UI_TEXT = {
         "apply_btn": "Apply Manual Corners",
         "step2": "### Step 2 — Run Analysis",
         "run_btn": "Run Analysis",
+        "interrupt_btn": "Interrupt Current Task",
         "results": "### Results",
         "out_video": "Annotated Video",
+        "out_status": "Analysis Progress (Execution Job)",
         "out_gallery": "Heatmaps & Scatter Plots",
         "out_metadata": "Metadata",
         "out_detections": "Detections (JSONL)",
@@ -421,6 +749,31 @@ _APP_CSS = """
 @media (prefers-reduced-motion: reduce) {
   #backend-console-panel { animation: none; }
 }
+#review-touch-record {
+  margin-top: 8px;
+}
+#review-touch-record .table-wrap {
+  max-height: 245px;
+}
+#review-editor-panel .block-label {
+  margin-bottom: 2px;
+}
+#review-editor-panel .prose {
+  margin: 2px 0;
+}
+#review-frame-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 2px;
+}
+#review-frame-controls button {
+  min-width: 96px;
+}
+#review-frame-controls .frame-rate-hint {
+  color: #667085;
+  font-size: 0.82rem;
+}
 """
 
 
@@ -444,7 +797,6 @@ def _switch_language(lang):
         gr.update(label=t["pose_family"]),
         gr.update(label=t["pose_mode"]),
         gr.update(label=t["audio"]),
-        gr.update(label=t["output_style"]),
         gr.update(label=t["pose_imgsz"]),
         gr.update(label=t["pose_conf"]),
         gr.update(label=t["far_player_enhancement"]),
@@ -466,12 +818,675 @@ def _switch_language(lang):
         gr.update(value=t["apply_btn"]),
         gr.update(value=t["step2"]),
         gr.update(value=t["run_btn"]),
+        gr.update(value=t["interrupt_btn"]),
         gr.update(value=t["results"]),
+        gr.update(label=t["out_status"]),
         gr.update(label=t["out_video"]),
         gr.update(label=t["out_gallery"]),
         gr.update(label=t["out_metadata"]),
         gr.update(label=t["out_detections"]),
     ]
+
+
+def _review_run_choices():
+    """Return newest-first analysis folders eligible for shot review."""
+    return [(analysis_run_label(path), path) for path in find_analysis_runs("outputs")]
+
+
+def _identity_claim_path(analysis_dir):
+    return Path(analysis_dir).expanduser().resolve() / "match_identity_claims.json"
+
+
+def _match_identity_table(analysis_dir):
+    """Load post-match editable bindings without rewriting detection evidence."""
+    if not analysis_dir:
+        return [], "请先选择一场已完成的视频分析。"
+    analysis_path = Path(analysis_dir).expanduser().resolve()
+    summary_path = analysis_path / "spatial_match_summary.json"
+    metadata_path = analysis_path / "metadata.json"
+    if not summary_path.is_file():
+        return [], "未找到 spatial_match_summary.json；请先完成视频分析。"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+    except (OSError, ValueError) as error:
+        return [], f"读取 Track ID 汇总失败：{error}"
+    persisted = {}
+    claim_path = _identity_claim_path(analysis_path)
+    if claim_path.is_file():
+        try:
+            persisted = {
+                item.get("track_id"): item
+                for item in json.loads(claim_path.read_text(encoding="utf-8")).get("bindings", [])
+                if item.get("track_id")
+            }
+        except (OSError, ValueError):
+            persisted = {}
+    rows = []
+    for item in summary.get("player_style_inputs", []):
+        track_id = item.get("track_id")
+        binding = persisted.get(track_id, {})
+        rows.append([
+            track_id,
+            binding.get("person_id", item.get("person_id") or ""),
+            binding.get("team_id", item.get("team_id") or ""),
+            item.get("detected_frames", 0),
+            item.get("predicted_frames", 0),
+            item.get("missing_frames", 0),
+            item.get("distance_m", 0.0),
+        ])
+    mode = ((metadata.get("temporal_tracking") or {}).get("players") or {}).get("match_mode", "singles")
+    return rows, (
+        f"模式：**{mode}**。Track ID 是持续身份键；队伍不是由当前球场半区推断。"
+        "可填 person_id 与 team_a/team_b；保存后写入单独的人工绑定文件，不改 detections.jsonl。"
+    )
+
+
+def _save_match_identity_table(analysis_dir, table_value):
+    if not analysis_dir:
+        raise gr.Error("请先选择一场已完成的视频分析。")
+    analysis_path = Path(analysis_dir).expanduser().resolve()
+    summary_path = analysis_path / "spatial_match_summary.json"
+    metadata_path = analysis_path / "metadata.json"
+    if not summary_path.is_file():
+        raise gr.Error("未找到空间追踪汇总，无法保存身份绑定。")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+    known = {item.get("track_id") for item in summary.get("player_style_inputs", [])}
+    values = table_value.values.tolist() if hasattr(table_value, "values") else (table_value or [])
+    bindings = []
+    participants_by_team = {"team_a": set(), "team_b": set()}
+    mode = ((metadata.get("temporal_tracking") or {}).get("players") or {}).get("match_mode", "singles")
+    max_per_team = 1 if mode == "singles" else 2
+    for row in values:
+        if not row or not str(row[0] or "").strip():
+            continue
+        track_id = str(row[0]).strip()
+        if track_id not in known:
+            raise gr.Error(f"未知 Track ID：{track_id}")
+        person_id = str(row[1] or "").strip() or None
+        team_id = str(row[2] or "").strip() or None
+        if team_id not in {None, "team_a", "team_b"}:
+            raise gr.Error("team_id 只能留空、team_a 或 team_b。")
+        if team_id:
+            participants_by_team[team_id].add(person_id or track_id)
+        bindings.append({
+            "track_id": track_id,
+            "person_id": person_id,
+            "team_id": team_id,
+            "binding_source": "post_match_human_review",
+            "identity_alias": bool(person_id and sum(str(item[1] or "").strip() == person_id for item in values) > 1),
+        })
+    for team_id, participants in participants_by_team.items():
+        if len(participants) > max_per_team:
+            raise gr.Error(f"{mode} 模式下 {team_id} 最多确认 {max_per_team} 名不同球员。")
+    payload = {
+        "schema_version": "1.0",
+        "match_mode": mode,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "policy": "human post-match binding; immutable raw detections are not rewritten",
+        "bindings": bindings,
+    }
+    path = _identity_claim_path(analysis_path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return f"已保存 {len(bindings)} 条赛后身份/队伍绑定：`{path.name}`。原始检测和机器 Track ID 未被覆盖。"
+
+
+def _review_summary_markdown(session, selected_id=None):
+    summary = review_summary(session)
+    active = candidate_choices(session)
+    position = next((index + 1 for index, (_, value) in enumerate(active) if value == selected_id), 0)
+    selected = f"当前：**{position} / {summary['candidate_count']}**" if position else f"共 **{summary['candidate_count']}** 个候选"
+    completed = summary["confirmed"] + summary["corrected"] + summary["uncertain"] + summary["excluded"]
+    reviewed_count = len(session.get("reviewed_rallies") or [])
+    reviewed = f"　人工确认回合 **{reviewed_count}**" if reviewed_count else ""
+    return (
+        f"**复核进度**　{selected}　已处理 **{completed}**　待复核 **{summary['pending']}**　"
+        f"确认/修正 **{summary['confirmed'] + summary['corrected']}**　排除 **{summary['excluded']}**{reviewed}"
+    )
+
+
+def _review_details_markdown(view, session):
+    details = view["details"]
+    proposal = details["proposal"]
+    evidence = details.get("evidence") or {}
+    source = details.get("candidate_source", "unknown")
+    source_display = {
+        "spatial_hit_candidate": "人体/空间接近候选",
+        "trajectory_turn": "羽毛球轨迹方向变化",
+        "trajectory_gap_transition": "羽毛球短暂断检衔接",
+        "manual_timeline": "人工补录时间点",
+        "manual_merge": "人工合并候选",
+    }.get(source, source)
+    speed = evidence.get("outbound_speed_px_s")
+    duration = evidence.get("flight_duration_sec")
+    observations = evidence.get("observation_count", 0)
+    limit_translations = {
+        "Trajectory uses accepted 2D shuttle detections only.": "仅使用已接受的二维羽毛球轨迹。",
+        "The current hit candidate is weak spatial evidence and requires human review.": "当前是弱证据候选，必须人工复核。",
+        "Insufficient accepted shuttle detections after the candidate hit.": "候选击球后有效羽毛球观测不足。",
+    }
+    limits = "；".join(
+        limit_translations.get(item, item)
+        for item in (evidence.get("limitations") or ["二维轨迹证据有限，需要人工确认。"])
+    )
+    video = Path(view["clip"]).name if view.get("clip") else "无可播放片段"
+    return (
+        f"### {details['shot_id']} · {details['hit_time_sec']:.2f}s\n"
+        f"自动建议：**{proposal['label_display']}**（建议置信度 {proposal['confidence']:.2f}，仅用于排序）  \n"
+        f"候选来源：{source_display}；球观测数：{observations}；"
+        f"最大二维速度：{speed if speed is not None else '未知'} px/s；"
+        f"观测时长：{duration if duration is not None else '未知'} s。  \n"
+        f"复核片段：`{video}`  \n"
+        f"限制：{limits}"
+    )
+
+
+def _review_video_message(session, view):
+    reference = Path((session.get("source") or {}).get("reference_video") or "").name
+    if "skeleton" in reference.lower():
+        return (
+            "当前结果只有**骨架模式**视频。它不含真人画面；`850259` 当初以 Skeleton only 运行，"
+            "不能仅凭 detections.jsonl 还原完整人体骨架。后续请在视频分析页选择“原视频标注”，"
+            "即可在这里优先显示“人物 + 骨架 + 羽毛球”的复核片段。"
+        )
+    if "detect" in reference.lower() or "annotated" in reference.lower():
+        return "当前正在播放**人物 + 骨架 + 羽毛球**标注视频的复核片段。"
+    if view.get("clip"):
+        return "当前正在播放外部复核视频片段；请以视频画面为准完成判断。"
+    return "尚未生成可播放的复核片段。"
+
+
+def _review_match_video_message(session):
+    reference = Path((session.get("source") or {}).get("reference_video") or "")
+    if not reference.is_file():
+        return "未找到可播放的标注视频；可在视频分析页重新生成，或选择另一场分析结果。"
+    if "skeleton" in reference.name.lower():
+        return "当前是旧的**纯骨架**结果：整场可播放，但不含真人画面。新分析会使用“人物 + 骨架 + 羽毛球”标注视频。"
+    return "正在播放整场**人物 + 骨架 + 羽毛球**标注视频；右侧判断会随播放时间切换。"
+
+
+def _review_video_fps(video_path):
+    """Read the displayed video's real frame rate for client-side frame stepping."""
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    finally:
+        capture.release()
+    # Broken/variable-rate container metadata must not create unusable seek steps.
+    return round(fps, 3) if 1.0 <= fps <= 240.0 else 30.0
+
+
+def _review_candidate_form(candidate):
+    review = candidate.get("review") or {}
+    proposal = candidate.get("proposal") or {}
+    label = review.get("label") or proposal.get("label") or "unknown"
+    return (
+        label if label in SHOT_TYPES else "unknown",
+        review.get("decision") or "pending",
+        review.get("reviewer") or "",
+        review.get("note") or "",
+    )
+
+
+def _review_editor_markdown(candidate):
+    proposal = candidate.get("proposal") or {}
+    review = candidate.get("review") or {}
+    label = review.get("label") or proposal.get("label") or "unknown"
+    display = SHOT_TYPES.get(label, label)
+    source = {
+        "spatial_hit_candidate": "人体/空间接近",
+        "trajectory_turn": "羽毛球轨迹方向变化",
+        "trajectory_gap_transition": "羽毛球短暂断检衔接",
+        "manual_timeline": "人工添加时间点",
+        "manual_merge": "人工合并候选",
+    }.get(candidate.get("candidate_source"), candidate.get("candidate_source", "未知"))
+    review_display = REVIEW_DECISIONS.get(review.get("decision", "pending"), "待复核")
+    return (
+        f"### 编辑触球 · {candidate['hit_time_sec']:.2f}s\n"
+        f"候选：`{candidate['shot_id']}`；当前：**{display}**；状态：{review_display}。  \n"
+        f"来源：{source}。修改球种或结果后点击“保存本次修改”。"
+    )
+
+
+def _review_empty_editor_markdown(playback_sec=0.0):
+    return (
+        "### 编辑触球\n"
+        f"当前视频时间：**{float(playback_sec or 0.0):.2f}s**。"
+        "当前时间前没有可编辑的触球；播放到触球处后会自动切换，"
+        "也可以在这里添加人工触球。"
+    )
+
+
+def _review_rally_overlay(session, playback_sec):
+    """Render the non-authoritative rally counter placed over the match video."""
+    state = rally_playback_state(session, playback_sec)
+    if state["status"] == "human_reviewed":
+        rally = f"人工确认回合 {state['rally_number']} / {state['rally_count']}"
+        if state["shot_count"]:
+            shots = f"本回合已到第 {state['shot_index']} / {state['shot_count']} 拍"
+        else:
+            shots = "本回合尚未检测到触球"
+        outcome = RALLY_TERMINAL_OUTCOMES.get(state.get("terminal_outcome"), "人工确认终止")
+        detail = f"终止：{outcome} · {state['terminal_time_sec']:.2f}s"
+    elif state["status"] == "after_last_human_terminal":
+        rally = f"人工确认回合 {state['rally_number']} / {state['rally_count']} 已结束"
+        shots = f"本回合 {state['shot_count']} 拍"
+        outcome = RALLY_TERMINAL_OUTCOMES.get(state.get("terminal_outcome"), "人工确认终止")
+        detail = f"终止：{outcome} · {state['terminal_time_sec']:.2f}s"
+    elif state["status"] == "before_first_human_terminal":
+        rally = f"人工确认回合 1 / {state['rally_count']}"
+        shots = "等待第一拍"
+        detail = f"首个终止点：{state['terminal_time_sec']:.2f}s"
+    elif state["status"] == "assigned":
+        rally = f"候选回合 {state['rally_number']} / {state['rally_count']}"
+        shots = f"本回合第 {state['shot_index']} / {state['shot_count']} 拍"
+        detail = "仅统计当前离线候选；待人工复核"
+    elif state["status"] == "unassigned_touch":
+        rally = "候选回合：待重新分段"
+        shots = "当前为人工补拍，尚未归属回合"
+        detail = "不会自动并入相邻回合"
+    else:
+        rally = "候选回合：等待首拍"
+        shots = "当前回合 0 拍"
+        detail = "播放至第一条触球记录后显示"
+    return (
+        "<div class='review-rally-overlay-card'>"
+        f"<strong>{escape(rally)}</strong>"
+        f"<span>{escape(shots)}</span>"
+        f"<small>{escape(detail)}</small>"
+        "</div>"
+    )
+
+
+def _review_live_markdown(session, playback_sec):
+    state = timeline_state(session, playback_sec)
+    current = state["current"]
+    next_candidate = state["next"]
+    time_text = f"{state['playback_sec']:.2f}s"
+    if current is None:
+        upcoming = f"下一条自动候选：{next_candidate['hit_time_sec']:.2f}s。" if next_candidate else "尚无自动候选，可在当前时间添加。"
+        return f"## 当前球路：等待触球\n视频时间：**{time_text}**。{upcoming}"
+
+    review = current.get("review") or {}
+    proposal = current.get("proposal") or {}
+    decision = review.get("decision", "pending")
+    if decision in {"confirmed", "corrected"}:
+        label = review.get("label") or proposal.get("label") or "unknown"
+        provenance = "人工确认" if decision == "confirmed" else "人工修正"
+    elif decision == "excluded":
+        label = "unknown"
+        provenance = "已排除，等待下一次触球"
+    elif decision == "uncertain":
+        label = review.get("label") or "unknown"
+        provenance = "人工标记为不确定"
+    else:
+        label = proposal.get("label") or "unknown"
+        provenance = f"自动建议，置信度 {float(proposal.get('confidence') or 0.0):.2f}，待人工复核"
+    display = SHOT_TYPES.get(label, label)
+    upcoming = f"下一条候选：{next_candidate['hit_time_sec']:.2f}s。" if next_candidate else "已到当前候选列表末尾。"
+    return (
+        f"## 当前球路：**{display}**\n"
+        f"触球时间：**{current['hit_time_sec']:.2f}s**　视频时间：{time_text}  \n"
+        f"{provenance}。{upcoming}"
+    )
+
+
+def _review_open_timeline(analysis_dir, reference_video=None):
+    if not analysis_dir:
+        raise gr.Error("请先选择一个含 detections.jsonl 的分析结果。")
+    try:
+        session = create_or_load_review_session(analysis_dir, reference_video)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    video_path = (session.get("source") or {}).get("reference_video")
+    if not video_path or not Path(video_path).is_file():
+        raise gr.Error("当前结果没有可播放的标注视频。请重新分析或选择可用的视频结果。")
+    choices = candidate_choices(session)
+    initial_timeline = timeline_state(session, 0.0)
+    initial_candidate = initial_timeline["current"]
+    selected_id = initial_candidate["shot_id"] if initial_candidate else None
+    if selected_id:
+        candidate = next(item for item in session["candidates"] if item["shot_id"] == selected_id)
+        label, decision, reviewer, note = _review_candidate_form(candidate)
+        editor_details = _review_editor_markdown(candidate)
+    else:
+        label, decision, reviewer, note = "unknown", "pending", "", ""
+        editor_details = _review_empty_editor_markdown(0.0)
+    return (
+        gr.update(choices=choices, value=selected_id),
+        _review_summary_markdown(session, selected_id),
+        candidate_table(session),
+        reviewed_rally_table(session),
+        video_path,
+        _review_video_fps(video_path),
+        _review_match_video_message(session),
+        "0.00s",
+        _review_live_markdown(session, 0.0),
+        _review_rally_overlay(session, 0.0),
+        editor_details,
+        label,
+        decision,
+        reviewer,
+        note,
+        "已打开整场时间轴。播放过程中右侧会显示最近一次触球的判断；自动候选不正确时可修改或在当前时间补加。",
+    )
+
+
+def _review_follow_playback(analysis_dir, playback_sec, selected_shot_id=None, reference_video=None):
+    """Keep the editor on the touch at the displayed video time.
+
+    The form is deliberately left alone while the player remains within the
+    same touch candidate, so a reviewer does not lose an unsaved selection.
+    Only a transition to another touch replaces the editor values.
+    """
+    if not analysis_dir:
+        return (
+            "—", "请先打开一场分析结果。", _review_rally_overlay({"candidates": []}, 0.0),
+            gr.update(value=None), _review_empty_editor_markdown(), "unknown", "pending", "", "",
+        )
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    state = timeline_state(session, playback_sec)
+    current = state["current"]
+    next_shot_id = current["shot_id"] if current else None
+    updates = [gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()]
+    if next_shot_id != selected_shot_id:
+        if current is None:
+            updates = [
+                gr.update(value=None), _review_empty_editor_markdown(state["playback_sec"]),
+                "unknown", "pending", "", "",
+            ]
+        else:
+            label, decision, reviewer, note = _review_candidate_form(current)
+            updates = [
+                gr.update(value=next_shot_id), _review_editor_markdown(current),
+                label, decision, reviewer, note,
+            ]
+    return (
+        f"{state['playback_sec']:.2f}s",
+        _review_live_markdown(session, state["playback_sec"]),
+        _review_rally_overlay(session, state["playback_sec"]),
+        *updates,
+    )
+
+
+def _review_select_editor(analysis_dir, shot_id, reference_video=None):
+    if not analysis_dir or not shot_id:
+        raise gr.Error("请先从触球记录中选择一条，或在当前时间添加触球。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    candidate = next((item for item in session["candidates"] if item["shot_id"] == shot_id), None)
+    if candidate is None or not candidate.get("active", True):
+        raise gr.Error("未找到该有效触球记录，请刷新复核队列。")
+    label, decision, reviewer, note = _review_candidate_form(candidate)
+    return _review_editor_markdown(candidate), label, decision, reviewer, note
+
+
+def _review_jump_to_table_row(analysis_dir, reference_video, evt: gr.SelectData):
+    """Seek the match player by the selected shot's time in seconds, never frame index."""
+    if not analysis_dir:
+        raise gr.Error("请先打开一场整场复核。")
+    index = getattr(evt, "index", None)
+    row_index = index[0] if isinstance(index, (tuple, list)) else index
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    try:
+        candidate = candidate_at_table_row(session, row_index)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    hit_time = float(candidate["hit_time_sec"])
+    label, decision, reviewer, note = _review_candidate_form(candidate)
+    return (
+        gr.update(playback_position=hit_time),
+        hit_time,
+        f"{hit_time:.2f}s",
+        _review_live_markdown(session, hit_time),
+        _review_rally_overlay(session, hit_time),
+        gr.update(value=candidate["shot_id"]),
+        _review_editor_markdown(candidate),
+        label,
+        decision,
+        reviewer,
+        note,
+        f"已跳转到 **{hit_time:.2f}s** 的触球记录。",
+    )
+
+
+def _review_edit_playback_candidate(analysis_dir, playback_sec, reference_video=None):
+    if not analysis_dir:
+        raise gr.Error("请先打开一场分析结果。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    candidate = timeline_state(session, playback_sec)["current"]
+    if candidate is None:
+        raise gr.Error("当前时间前没有自动候选。请使用“在当前时间添加触球”记录这一次击球。")
+    label, decision, reviewer, note = _review_candidate_form(candidate)
+    return gr.update(value=candidate["shot_id"]), _review_editor_markdown(candidate), label, decision, reviewer, note
+
+
+def _review_add_at_playback(analysis_dir, playback_sec, reviewer, reference_video=None):
+    if not analysis_dir:
+        raise gr.Error("请先打开一场分析结果。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    state = timeline_state(session, playback_sec)
+    try:
+        session, candidate = add_manual_candidate(session, state["playback_sec"], reviewer)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    choices = candidate_choices(session)
+    label, decision, reviewer, note = _review_candidate_form(candidate)
+    return (
+        gr.update(choices=choices, value=candidate["shot_id"]),
+        _review_summary_markdown(session, candidate["shot_id"]),
+        candidate_table(session),
+        _review_editor_markdown(candidate),
+        label,
+        decision,
+        reviewer,
+        note,
+        _review_live_markdown(session, state["playback_sec"]),
+        _review_rally_overlay(session, state["playback_sec"]),
+        f"已在 **{state['playback_sec']:.2f}s** 添加人工触球。现在选择球种和复核结果，再保存本次修改。",
+    )
+
+
+def _review_add_terminal_at_playback(analysis_dir, playback_sec, outcome, reviewer, note, reference_video=None):
+    if not analysis_dir:
+        raise gr.Error("请先打开一场分析结果。")
+    try:
+        record, _ = add_manual_rally_terminal(analysis_dir, playback_sec, outcome, reviewer, note)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    outcome_display = RALLY_TERMINAL_OUTCOMES.get(record["outcome"], record["outcome"])
+    return (
+        reviewed_rally_table(session),
+        _review_summary_markdown(session),
+        _review_rally_overlay(session, playback_sec),
+        f"已在 **{record['time_sec']:.2f}s** 标记人工回合结束：**{outcome_display}**。"
+        "该记录写入 `shot_review/rally_terminals.jsonl`，原始检测未修改。",
+    )
+
+
+def _review_save_timeline_candidate(analysis_dir, shot_id, label, decision, reviewer, note, reference_video=None):
+    if not analysis_dir or not shot_id:
+        raise gr.Error("请先选择要修改的触球记录。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    try:
+        session = save_human_review(session, shot_id, label, decision, reviewer, note)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    candidate = next(item for item in session["candidates"] if item["shot_id"] == shot_id)
+    return (
+        _review_summary_markdown(session, shot_id),
+        candidate_table(session),
+        _review_editor_markdown(candidate),
+        "已保存：原始 detections.jsonl 未修改；人工结论已追加到 shot_review/annotations.jsonl。",
+    )
+
+
+def _review_open_session(analysis_dir, reference_video=None):
+    if not analysis_dir:
+        raise gr.Error("请先选择一个含 detections.jsonl 的分析结果。")
+    try:
+        session = create_or_load_review_session(analysis_dir, reference_video)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    choices = candidate_choices(session)
+    if not choices:
+        raise gr.Error("当前结果没有可复核的击球候选。请先确认羽毛球检测和击球候选是否产生。")
+    first_id = choices[0][1]
+    view = candidate_view(session, first_id)
+    return (
+        gr.update(choices=choices, value=first_id),
+        gr.update(choices=choices, value=[]),
+        _review_summary_markdown(session, first_id),
+        candidate_table(session),
+        view["clip"],
+        _review_details_markdown(view, session),
+        _review_video_message(session, view),
+        view["label"],
+        view["decision"],
+        view["reviewer"],
+        view["note"],
+    )
+
+
+def _review_refresh_runs(current_value):
+    choices = _review_run_choices()
+    allowed = {value for _, value in choices}
+    return gr.update(choices=choices, value=current_value if current_value in allowed else (choices[0][1] if choices else None))
+
+
+def _review_candidate_updates(session, selected_id=None):
+    choices = candidate_choices(session)
+    available = {value for _, value in choices}
+    selected_id = selected_id if selected_id in available else (choices[0][1] if choices else None)
+    return (
+        gr.update(choices=choices, value=selected_id),
+        gr.update(choices=choices, value=[]),
+        selected_id,
+    )
+
+
+def _review_rebuild_session(analysis_dir, reference_video=None):
+    if not analysis_dir:
+        raise gr.Error("请先选择一个含 detections.jsonl 的分析结果。")
+    session = create_or_load_review_session(analysis_dir, reference_video, regenerate=True)
+    shot_update, merge_update, selected_id = _review_candidate_updates(session)
+    if not selected_id:
+        raise gr.Error("当前结果没有可复核的候选。")
+    view = candidate_view(session, selected_id)
+    return (
+        shot_update, merge_update, _review_summary_markdown(session, selected_id), candidate_table(session),
+        view["clip"], _review_details_markdown(view, session), _review_video_message(session, view), view["label"], view["decision"],
+        view["reviewer"], view["note"],
+        "已重新生成自动候选；已有非待定人工复核和手动候选已保留。",
+    )
+
+
+def _review_select_candidate(analysis_dir, shot_id, reference_video=None):
+    if not analysis_dir or not shot_id:
+        raise gr.Error("请先生成复核队列并选择一拍。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    try:
+        view = candidate_view(session, shot_id)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    return (
+        view["clip"], _review_details_markdown(view, session), _review_video_message(session, view), view["label"], view["decision"],
+        view["reviewer"], view["note"],
+    )
+
+
+def _review_move_candidate(analysis_dir, shot_id, offset, reference_video=None):
+    if not analysis_dir or not shot_id:
+        raise gr.Error("请先打开复核队列。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    choices = candidate_choices(session)
+    ids = [value for _, value in choices]
+    try:
+        current_index = ids.index(shot_id)
+    except ValueError as error:
+        raise gr.Error("当前候选不存在，请重新打开复核队列。") from error
+    selected_id = ids[max(0, min(len(ids) - 1, current_index + int(offset)))]
+    view = candidate_view(session, selected_id)
+    return (
+        gr.update(value=selected_id), _review_summary_markdown(session, selected_id),
+        view["clip"], _review_details_markdown(view, session), _review_video_message(session, view),
+        view["label"], view["decision"], view["reviewer"], view["note"],
+    )
+
+
+def _review_save_candidate(analysis_dir, shot_id, label, decision, reviewer, note, reference_video=None):
+    if not analysis_dir or not shot_id:
+        raise gr.Error("请先选择需要保存的球路候选。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    try:
+        session = save_human_review(session, shot_id, label, decision, reviewer, note)
+        view = candidate_view(session, shot_id)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    return (
+        _review_summary_markdown(session, shot_id), candidate_table(session),
+        gr.update(choices=candidate_choices(session), value=shot_id),
+        gr.update(choices=candidate_choices(session), value=[]),
+        _review_details_markdown(view, session),
+        "已保存：原始 detections.jsonl 未被修改；本次人工判断已追加到 shot_review/annotations.jsonl。",
+    )
+
+
+def _review_add_manual_candidate(analysis_dir, hit_time_sec, reviewer, reference_video=None):
+    if not analysis_dir or hit_time_sec is None:
+        raise gr.Error("请输入要补录的击球时间（秒）。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    try:
+        session, candidate = add_manual_candidate(session, hit_time_sec, reviewer)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    shot_update, merge_update, _ = _review_candidate_updates(session, candidate["shot_id"])
+    view = candidate_view(session, candidate["shot_id"])
+    return (
+        shot_update, merge_update, _review_summary_markdown(session, candidate["shot_id"]), candidate_table(session),
+        view["clip"], _review_details_markdown(view, session), _review_video_message(session, view), view["label"], view["decision"],
+        view["reviewer"], view["note"],
+        "已新增人工补拍。请在片段中确认球种后再保存复核结论。",
+    )
+
+
+def _review_merge_selected(analysis_dir, shot_ids, reviewer, reference_video=None):
+    if not analysis_dir:
+        raise gr.Error("请先选择分析结果。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    try:
+        session, candidate = merge_review_candidates(session, shot_ids, reviewer)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    shot_update, merge_update, _ = _review_candidate_updates(session, candidate["shot_id"])
+    view = candidate_view(session, candidate["shot_id"])
+    return (
+        shot_update, merge_update, _review_summary_markdown(session, candidate["shot_id"]), candidate_table(session),
+        view["clip"], _review_details_markdown(view, session), _review_video_message(session, view), view["label"], view["decision"],
+        view["reviewer"], view["note"],
+        "已合并候选；被合并的原候选保留在审计记录中，但不再出现在有效队列。",
+    )
+
+
+def _review_split_selected(analysis_dir, shot_id, split_offset_sec, reviewer, reference_video=None):
+    if not analysis_dir or not shot_id:
+        raise gr.Error("请先选择要拆分的候选。")
+    session = create_or_load_review_session(analysis_dir, reference_video)
+    try:
+        session, first, second = split_review_candidate(session, shot_id, split_offset_sec, reviewer)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    shot_update, merge_update, _ = _review_candidate_updates(session, first["shot_id"])
+    view = candidate_view(session, first["shot_id"])
+    return (
+        shot_update, merge_update, _review_summary_markdown(session, first["shot_id"]), candidate_table(session),
+        view["clip"], _review_details_markdown(view, session), _review_video_message(session, view), view["label"], view["decision"],
+        view["reviewer"], view["note"],
+        f"已拆分为两拍：{first['hit_time_sec']:.2f}s 与 {second['hit_time_sec']:.2f}s。可继续补录或分别复核。",
+    )
 
 
 def build_ui():
@@ -487,73 +1502,332 @@ def build_ui():
         template_path_state = gr.State(value=None)
         analysis_ready_state = gr.State(value=False)
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                md_inputs = gr.Markdown(t["inputs"])
-                video_input = gr.File(label=t["video"], file_types=["video"])
-                template_input = gr.File(label=t["template"], file_types=["image"])
+        with gr.Tabs():
+            analysis_tab = gr.Tab("视频分析")
+            review_tab = gr.Tab("球路复核")
 
-                md_settings = gr.Markdown(t["settings"])
-                pose_family = gr.Dropdown(
-                    choices=["yolo-pose", "rtmpose", "rtmo"],
-                    value="yolo-pose", label=t["pose_family"],
-                )
-                pose_mode = gr.Dropdown(
-                    choices=["lightweight", "balanced", "performance"],
-                    value="balanced", label=t["pose_mode"],
-                )
-                language = gr.Radio(
-                    choices=[("中文", "zh"), ("English", "en")],
-                    value="zh", label=t["language"],
-                )
-                audio = gr.Checkbox(value=True, label=t["audio"])
-                output_video_style = gr.Radio(
-                    choices=[
-                        ("原视频标注 / Annotated source", "annotated"),
-                        ("仅球场、骨架和羽毛球 / Skeleton only", "skeleton"),
-                    ],
-                    value="skeleton", label=t["output_style"],
-                )
-                pose_imgsz = gr.Dropdown(
-                    choices=[640, 960, 1280], value=1280, label=t["pose_imgsz"],
-                )
-                pose_conf = gr.Slider(
-                    minimum=0.10, maximum=0.50, step=0.01, value=0.15,
-                    label=t["pose_conf"],
-                )
-                far_player_enhancement = gr.Checkbox(
-                    value=False, label=t["far_player_enhancement"],
-                )
-                far_pose_roi = gr.Textbox(
-                    value="0.12,0.30,0.86,0.82", label=t["far_pose_roi"],
-                )
+        with analysis_tab:
+            with gr.Row():
+                with gr.Column(scale=1):
+                    md_inputs = gr.Markdown(t["inputs"])
+                    video_input = gr.File(label=t["video"], file_types=["video"])
+                    template_input = gr.File(label=t["template"], file_types=["image"])
 
-                with gr.Accordion(t["advanced"], open=False) as adv_accordion:
-                    show_skeletons = gr.Checkbox(value=True, label=t["skeletons"])
-                    show_player_trajectories = gr.Checkbox(value=True, label=t["player_traj"])
-                    show_court_trajectory = gr.Checkbox(value=True, label=t["court_traj"])
-                    show_shuttlecock_trajectory = gr.Checkbox(value=True, label=t["shuttle_traj"])
-                    show_player_stats = gr.Checkbox(value=True, label=t["player_stats"])
-                    show_pose_roi = gr.Checkbox(value=True, label=t["pose_roi"])
-                    visualize_positions = gr.Checkbox(value=True, label=t["viz_positions"])
-                    yolo_pose_model = gr.Textbox(value="weights/yolo11n-pose.pt", label=t["yolo_pose_path"])
-                    ball_model = gr.Textbox(value="weights/yolo11s-ball.pt", label=t["ball_path"])
+                    md_settings = gr.Markdown(t["settings"])
+                    pose_family = gr.Dropdown(
+                        choices=["yolo-pose", "rtmpose", "rtmo"],
+                        value="yolo-pose", label=t["pose_family"],
+                    )
+                    pose_mode = gr.Dropdown(
+                        choices=["lightweight", "balanced", "performance"],
+                        value="balanced", label=t["pose_mode"],
+                    )
+                    language = gr.Radio(
+                        choices=[("中文", "zh"), ("English", "en")],
+                        value="zh", label=t["language"],
+                    )
+                    audio = gr.Checkbox(value=True, label=t["audio"])
+                    match_mode = gr.Radio(
+                        choices=[
+                            ("Singles (one player per team)", "singles"),
+                            ("Doubles (up to two players per team)", "doubles"),
+                        ],
+                        value="singles",
+                        label="比赛模式 / Match mode",
+                        info="New tracking uses spatial.tracks. Doubles keeps same-side players instead of upper/lower filtering.",
+                    )
+                    gr.Markdown("**输出视频：** 原视频人物 + 人体骨架 + 羽毛球标注")
+                    # Preserve the analysis callback contract while preventing
+                    # accidental Skeleton-only output in the normal workflow.
+                    output_video_style = gr.State(value="annotated")
+                    shuttle_detector = gr.Dropdown(
+                        choices=[
+                            ("TrackNetV3 原始轨迹（GPU 主流程）", "tracknet_v3"),
+                            ("YOLO 羽毛球检测（旧路径）", "yolo"),
+                        ],
+                        value="tracknet_v3",
+                        label="羽毛球检测来源",
+                        info="TrackNet 失败时会明确报错，不会静默改用 YOLO。",
+                    )
+                    pose_imgsz = gr.Dropdown(
+                        choices=[640, 960, 1280], value=960, label=t["pose_imgsz"],
+                    )
+                    pose_conf = gr.Slider(
+                        minimum=0.10, maximum=0.50, step=0.01, value=0.15,
+                        label=t["pose_conf"],
+                    )
+                    far_player_enhancement = gr.Checkbox(
+                        value=False, label=t["far_player_enhancement"],
+                    )
+                    far_pose_roi = gr.Textbox(
+                        value="0.12,0.30,0.86,0.82", label=t["far_pose_roi"],
+                    )
 
-            with gr.Column(scale=2):
-                md_step1 = gr.Markdown(t["step1"])
-                detect_btn = gr.Button(t["detect_btn"], variant="primary")
-                court_image = gr.Image(label=t["court_preview"], interactive=False, type="numpy")
-                corner_status = gr.Textbox(label=t["corner_status"], interactive=False, value=t["corner_none"])
-                apply_btn = gr.Button(t["apply_btn"], variant="secondary")
+                    with gr.Accordion(t["advanced"], open=False) as adv_accordion:
+                        show_skeletons = gr.Checkbox(value=True, label=t["skeletons"])
+                        show_player_trajectories = gr.Checkbox(value=True, label=t["player_traj"])
+                        show_court_trajectory = gr.Checkbox(value=True, label=t["court_traj"])
+                        show_shuttlecock_trajectory = gr.Checkbox(value=True, label=t["shuttle_traj"])
+                        show_player_stats = gr.Checkbox(value=True, label=t["player_stats"])
+                        show_pose_roi = gr.Checkbox(value=True, label=t["pose_roi"])
+                        visualize_positions = gr.Checkbox(value=True, label=t["viz_positions"])
+                        yolo_pose_model = gr.Textbox(value="weights/yolo11n-pose.pt", label=t["yolo_pose_path"])
+                        ball_model = gr.Textbox(value="weights/yolo11s-ball.pt", label=t["ball_path"])
 
-                md_step2 = gr.Markdown(t["step2"])
-                run_btn = gr.Button(t["run_btn"], variant="primary")
+                with gr.Column(scale=2):
+                    md_step1 = gr.Markdown(t["step1"])
+                    detect_btn = gr.Button(t["detect_btn"], variant="primary")
+                    court_image = gr.Image(label=t["court_preview"], interactive=False, type="numpy")
+                    corner_status = gr.Textbox(label=t["corner_status"], interactive=False, value=t["corner_none"])
+                    apply_btn = gr.Button(t["apply_btn"], variant="secondary")
 
-                md_results = gr.Markdown(t["results"])
-                output_video = gr.Video(label=t["out_video"])
-                output_gallery = gr.Gallery(label=t["out_gallery"], columns=2, height="auto")
-                output_metadata = gr.JSON(label=t["out_metadata"])
-                output_detections = gr.File(label=t["out_detections"])
+                    md_step2 = gr.Markdown(t["step2"])
+                    with gr.Row():
+                        run_btn = gr.Button(t["run_btn"], variant="primary")
+                        interrupt_btn = gr.Button(t["interrupt_btn"], variant="stop")
+
+                    md_results = gr.Markdown(t["results"])
+                    output_status = gr.JSON(
+                        label=t["out_status"],
+                        value={"phase": "idle", "hint": "点击运行分析后显示上传、排队、帧进度与执行来源。"},
+                    )
+                    output_video = gr.Video(label=t["out_video"])
+                    output_gallery = gr.Gallery(label=t["out_gallery"], columns=2, height="auto")
+                    output_metadata = gr.JSON(label=t["out_metadata"])
+                    output_detections = gr.File(label=t["out_detections"])
+                    output_tracknet_raw = gr.File(label="TrackNetV3 原始球点 CSV（可下载复核）")
+                    output_performance_report = gr.File(label="运动表现报告（含大模型状态）")
+                    output_rally_summary = gr.Markdown("### 回合与拍数\n完成分析后显示候选回合与每回合拍数。")
+                    output_rallies = gr.Dataframe(
+                        headers=["回合", "开始(s)", "结束(s)", "候选拍数", "可见球候选", "缺球补拍", "结束依据", "置信度"],
+                        datatype=["str", "number", "number", "number", "number", "number", "str", "number"],
+                        interactive=False,
+                        label="候选回合明细（所有结果均待人工复核）",
+                        max_height=300,
+                    )
+
+        with review_tab:
+            gr.Markdown(
+                "## 球路复核\n"
+                "播放**整场标注视频**。右侧会随播放时间显示最近一次触球的球路判断；"
+                "自动建议不正确时，直接修改；漏拍时，在当前播放时间添加。"
+            )
+            with gr.Row():
+                review_analysis_dir = gr.Dropdown(
+                    choices=_review_run_choices(),
+                    value=default_analysis_run("outputs") or None,
+                    label="分析结果目录（含 detections.jsonl）",
+                    scale=4,
+                )
+                refresh_review_runs = gr.Button("刷新分析结果", scale=1)
+            with gr.Row():
+                open_review_btn = gr.Button("打开整场复核", variant="primary")
+                rebuild_review_btn = gr.Button("重新加载时间轴", size="sm")
+            review_source_video = gr.File(
+                label="可选：更换为已有的“人物 + 骨架”标注视频",
+                file_types=["video"],
+                visible=False,
+            )
+            review_summary_output = gr.Markdown("请先打开复核队列。")
+            review_notice = gr.Markdown()
+            with gr.Row():
+                with gr.Column(scale=3):
+                    review_video_message = gr.Markdown()
+                    with gr.Group(elem_id="review-video-stage"):
+                        review_match_video = gr.Video(
+                            label="整场标注视频（可拖动进度条）",
+                            height=440,
+                            include_audio=True,
+                            elem_id="review-match-video",
+                        )
+                        review_rally_overlay = gr.HTML(
+                            value=(
+                                "<div class='review-rally-overlay-card'>"
+                                "<strong>候选回合：等待打开视频</strong>"
+                                "<span>当前回合 0 拍</span>"
+                                "</div>"
+                            ),
+                            elem_id="review-rally-overlay",
+                            html_template="${value}",
+                            css_template="""
+                                #review-video-stage {
+                                    position: relative !important;
+                                    overflow: hidden;
+                                }
+                                #review-rally-overlay {
+                                    position: absolute !important;
+                                    right: 16px;
+                                    bottom: 18px;
+                                    z-index: 10;
+                                    width: auto !important;
+                                    margin: 0 !important;
+                                    pointer-events: none;
+                                }
+                                #review-rally-overlay .review-rally-overlay-card {
+                                    display: flex;
+                                    flex-direction: column;
+                                    gap: 3px;
+                                    min-width: 180px;
+                                    padding: 9px 11px;
+                                    border: 1px solid rgba(144, 163, 255, 0.8);
+                                    border-radius: 8px;
+                                    background: rgba(8, 13, 30, 0.82);
+                                    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+                                    color: #fff;
+                                    text-align: right;
+                                }
+                                #review-rally-overlay strong { font-size: 14px; }
+                                #review-rally-overlay span { color: #dce5ff; font-size: 13px; }
+                                #review-rally-overlay small { color: #aebce7; font-size: 11px; }
+                            """,
+                        )
+                    review_playback_clock = gr.HTML(
+                        value=0.0,
+                        elem_id="review-playback-clock",
+                        html_template="<span class='review-playback-clock' aria-hidden='true'></span>",
+                        css_template=".review-playback-clock { display: none; }",
+                        js_on_load="""
+                            let attachedVideo = null;
+                            let lastSent = -1;
+                            const emitTime = (force = false) => {
+                                if (!attachedVideo) return;
+                                const seconds = Number(attachedVideo.currentTime || 0);
+                                if (!Number.isFinite(seconds) || (!force && Math.abs(seconds - lastSent) < 0.45)) return;
+                                lastSent = seconds;
+                                props.value = seconds;
+                                trigger('input');
+                            };
+                            const bindVideo = () => {
+                                const video = document.querySelector('#review-match-video video');
+                                if (!video || video === attachedVideo) return;
+                                attachedVideo = video;
+                                lastSent = -1;
+                                video.addEventListener('loadedmetadata', emitTime);
+                                video.addEventListener('timeupdate', emitTime);
+                                video.addEventListener('seeking', () => emitTime(true));
+                                video.addEventListener('seeked', () => emitTime(true));
+                            };
+                            bindVideo();
+                            window.setInterval(bindVideo, 500);
+                        """,
+                    )
+                    review_frame_controls = gr.HTML(
+                        value=30.0,
+                        elem_id="review-frame-controls",
+                        html_template="""
+                            <button type="button" data-frame-direction="-1" aria-label="上一帧">◀ 上一帧</button>
+                            <button type="button" data-frame-direction="1" aria-label="下一帧">下一帧 ▶</button>
+                            <span class="frame-rate-hint">按视频帧率逐帧（${value} FPS）</span>
+                        """,
+                        js_on_load="""
+                            const getVideo = () => document.querySelector('#review-match-video video');
+                            const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(value, maximum));
+                            const stepFrame = (direction) => {
+                                const video = getVideo();
+                                if (!video) return;
+                                const fps = Number(props.value);
+                                const safeFps = Number.isFinite(fps) && fps >= 1 && fps <= 240 ? fps : 30;
+                                const duration = Number(video.duration);
+                                if (!Number.isFinite(duration)) return;
+                                video.pause();
+                                video.currentTime = clamp(video.currentTime + direction / safeFps, 0, duration);
+                            };
+                            element.querySelectorAll('[data-frame-direction]').forEach((button) => {
+                                button.addEventListener('click', () => stepFrame(Number(button.dataset.frameDirection)));
+                            });
+                        """,
+                    )
+                    review_seek_request = gr.HTML(
+                        value=-1,
+                        elem_id="review-seek-request",
+                        html_template="<span class='review-seek-request' aria-hidden='true'></span>",
+                        css_template=".review-seek-request { display: none; }",
+                        js_on_load="""
+                            const targetSeconds = Number(props.value);
+                            if (!Number.isFinite(targetSeconds) || targetSeconds < 0) return;
+                            let attempts = 0;
+                            const seekBySeconds = () => {
+                                const video = document.querySelector('#review-match-video video');
+                                if (!video) return false;
+                                const duration = Number(video.duration);
+                                if (!Number.isFinite(duration)) return false;
+                                video.currentTime = Math.max(0, Math.min(targetSeconds, duration));
+                                return true;
+                            };
+                            if (seekBySeconds()) return;
+                            const timer = window.setInterval(() => {
+                                attempts += 1;
+                                if (seekBySeconds() || attempts >= 30) window.clearInterval(timer);
+                            }, 100);
+                        """,
+                    )
+                    review_candidates_table = gr.Dataframe(
+                        headers=["候选", "击球时间(s)", "自动建议", "建议置信度", "候选来源", "复核结果"],
+                        datatype=["str", "number", "str", "number", "str", "str"],
+                        interactive=False,
+                        label="触球记录（点击任一行跳转到该击球时间）",
+                        max_height=245,
+                        elem_id="review-touch-record",
+                    )
+                    review_rallies_table = gr.Dataframe(
+                        headers=["回合", "开始(s)", "结束(s)", "候选拍数", "人工终止证据", "来源"],
+                        datatype=["str", "number", "number", "number", "str", "str"],
+                        interactive=False,
+                        label="人工确认回合（优先于自动静止候选）",
+                        max_height=220,
+                    )
+                with gr.Column(scale=2, elem_id="review-editor-panel"):
+                    review_current_time = gr.Textbox(label="当前视频时间", value="—", interactive=False)
+                    review_live_judgement = gr.Markdown("### 当前球路：等待打开视频")
+                    with gr.Row():
+                        edit_playback_candidate_btn = gr.Button("编辑当前触球", size="sm")
+                        add_playback_candidate_btn = gr.Button("在当前时间添加触球", size="sm")
+                    with gr.Accordion("人工确认回合结束", open=False):
+                        review_terminal_outcome = gr.Dropdown(
+                            choices=[(display, key) for key, display in RALLY_TERMINAL_OUTCOMES.items()],
+                            value="landed_unknown",
+                            label="当前时间的回合终止类型",
+                        )
+                        add_terminal_btn = gr.Button("在当前时间标记回合结束", size="sm")
+                    gr.Markdown("### 人工修改")
+                    review_shot_id = gr.Dropdown(label="编辑对象（可手动切换）")
+                    review_details = gr.Markdown("播放到需处理的触球处，选择“编辑当前触球”或“在当前时间添加触球”。")
+                    review_label = gr.Radio(
+                        choices=[(display, key) for key, display in SHOT_TYPES.items()],
+                        value="unknown",
+                        label="球种",
+                    )
+                    review_decision = gr.Radio(
+                        choices=[
+                            ("确认自动建议", "confirmed"),
+                            ("人工修正", "corrected"),
+                            ("仍不确定", "uncertain"),
+                            ("排除：不是有效击球", "excluded"),
+                        ],
+                        value="pending",
+                        label="复核结果",
+                    )
+                    with gr.Row():
+                        review_reviewer = gr.Textbox(label="复核人（可选）", scale=1)
+                        review_note = gr.Textbox(label="备注（可选）", lines=1, scale=2)
+                    save_review_btn = gr.Button("保存本次修改", variant="primary", size="sm")
+
+            with gr.Accordion("赛后身份与队伍确认 / Post-match identity", open=False):
+                gr.Markdown(
+                    "仅用于赛后人工确认或纠错：可把同一人的分段 Track ID 标为同一个 person_id。"
+                    "team_id 仅可为 team_a/team_b，不能从当前球场半区自动推断。"
+                )
+                with gr.Row():
+                    identity_reload_btn = gr.Button("读取 Track ID", size="sm")
+                    identity_save_btn = gr.Button("保存身份/队伍绑定", variant="primary", size="sm")
+                identity_table = gr.Dataframe(
+                    headers=["track_id", "person_id（可选）", "team_id（team_a/team_b）", "detected", "predicted", "missing", "distance_m"],
+                    datatype=["str", "str", "str", "number", "number", "number", "number"],
+                    interactive=True,
+                    label="空间追踪身份绑定（不改原始 detections.jsonl）",
+                    max_height=260,
+                )
+                identity_notice = gr.Markdown("先选择分析结果后，点击“读取 Track ID”。")
 
         console_open_state = gr.State(value=False)
         console_trigger = gr.Button(
@@ -586,16 +1860,124 @@ def build_ui():
             show_progress="hidden",
         )
 
+        identity_reload_btn.click(
+            fn=_match_identity_table,
+            inputs=[review_analysis_dir],
+            outputs=[identity_table, identity_notice],
+            show_progress="hidden",
+        )
+        identity_save_btn.click(
+            fn=_save_match_identity_table,
+            inputs=[review_analysis_dir, identity_table],
+            outputs=[identity_notice],
+        )
+
+        refresh_review_runs.click(
+            fn=_review_refresh_runs,
+            inputs=[review_analysis_dir],
+            outputs=[review_analysis_dir],
+            show_progress="hidden",
+        )
+        # A job can finish while the analysis tab remains open. Refresh choices
+        # when the reviewer enters this tab so last night's result is visible
+        # without restarting the WebUI; keep an existing selection intact.
+        review_tab.select(
+            fn=_review_refresh_runs,
+            inputs=[review_analysis_dir],
+            outputs=[review_analysis_dir],
+            show_progress="hidden",
+        )
+        open_review_btn.click(
+            fn=_review_open_timeline,
+            inputs=[review_analysis_dir, review_source_video],
+            outputs=[
+                review_shot_id, review_summary_output, review_candidates_table, review_rallies_table, review_match_video,
+                review_frame_controls, review_video_message, review_current_time, review_live_judgement, review_rally_overlay,
+                review_details, review_label, review_decision, review_reviewer, review_note, review_notice,
+            ],
+        )
+        rebuild_review_btn.click(
+            fn=_review_open_timeline,
+            inputs=[review_analysis_dir, review_source_video],
+            outputs=[
+                review_shot_id, review_summary_output, review_candidates_table, review_rallies_table, review_match_video,
+                review_frame_controls, review_video_message, review_current_time, review_live_judgement, review_rally_overlay,
+                review_details, review_label, review_decision, review_reviewer, review_note, review_notice,
+            ],
+        )
+        review_playback_clock.input(
+            fn=_review_follow_playback,
+            inputs=[review_analysis_dir, review_playback_clock, review_shot_id, review_source_video],
+            outputs=[
+                review_current_time, review_live_judgement, review_rally_overlay,
+                review_shot_id, review_details, review_label, review_decision, review_reviewer, review_note,
+            ],
+            show_progress="hidden",
+            queue=False,
+        )
+        review_shot_id.change(
+            fn=_review_select_editor,
+            inputs=[review_analysis_dir, review_shot_id, review_source_video],
+            outputs=[review_details, review_label, review_decision, review_reviewer, review_note],
+            show_progress="hidden",
+        )
+        review_candidates_table.select(
+            fn=_review_jump_to_table_row,
+            inputs=[review_analysis_dir, review_source_video],
+            outputs=[
+                review_match_video, review_seek_request, review_current_time, review_live_judgement,
+                review_rally_overlay, review_shot_id, review_details, review_label, review_decision,
+                review_reviewer, review_note, review_notice,
+            ],
+            show_progress="hidden",
+        )
+        edit_playback_candidate_btn.click(
+            fn=_review_edit_playback_candidate,
+            inputs=[review_analysis_dir, review_playback_clock, review_source_video],
+            outputs=[review_shot_id, review_details, review_label, review_decision, review_reviewer, review_note],
+            show_progress="hidden",
+        )
+        add_playback_candidate_btn.click(
+            fn=_review_add_at_playback,
+            inputs=[review_analysis_dir, review_playback_clock, review_reviewer, review_source_video],
+            outputs=[
+                review_shot_id, review_summary_output, review_candidates_table, review_details,
+                review_label, review_decision, review_reviewer, review_note, review_live_judgement,
+                review_rally_overlay, review_notice,
+            ],
+            show_progress="hidden",
+        )
+        add_terminal_btn.click(
+            fn=_review_add_terminal_at_playback,
+            inputs=[
+                review_analysis_dir, review_playback_clock, review_terminal_outcome,
+                review_reviewer, review_note, review_source_video,
+            ],
+            outputs=[review_rallies_table, review_summary_output, review_rally_overlay, review_notice],
+            show_progress="hidden",
+        )
+        save_review_btn.click(
+            fn=_review_save_timeline_candidate,
+            inputs=[
+                review_analysis_dir, review_shot_id, review_label, review_decision,
+                review_reviewer, review_note, review_source_video,
+            ],
+            outputs=[
+                review_summary_output, review_candidates_table,
+                review_details, review_notice,
+            ],
+        )
+
         lang_outputs = [
             md_title, md_inputs, video_input, template_input,
-            md_settings, pose_family, pose_mode, audio, output_video_style,
+            md_settings, pose_family, pose_mode, audio,
             pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi, adv_accordion,
             show_skeletons, show_player_trajectories, show_court_trajectory,
             show_shuttlecock_trajectory, show_player_stats, show_pose_roi,
             visualize_positions, yolo_pose_model, ball_model,
             md_step1, detect_btn, court_image, corner_status, apply_btn,
-            md_step2, run_btn, md_results,
-            output_video, output_gallery, output_metadata, output_detections,
+            md_step2, run_btn, interrupt_btn, md_results,
+            output_status, output_video, output_gallery, output_metadata, output_detections,
         ]
         language.change(fn=_switch_language, inputs=[language], outputs=lang_outputs)
 
@@ -645,14 +2027,25 @@ def build_ui():
             fn=run_full_analysis,
             inputs=[
                 analysis_ready_state, video_input, template_path_state, corners_state,
-                pose_family, pose_mode, language, audio, output_video_style,
+                pose_family, pose_mode, language, audio, match_mode, output_video_style, shuttle_detector,
                 pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
                 show_skeletons, show_player_trajectories,
                 show_court_trajectory, show_shuttlecock_trajectory,
                 show_player_stats, show_pose_roi, visualize_positions,
                 yolo_pose_model, ball_model,
             ],
-            outputs=[output_video, output_gallery, output_metadata, output_detections],
+            outputs=[
+                output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
+                output_performance_report,
+                output_rally_summary, output_rallies, output_status,
+            ],
+        )
+        interrupt_btn.click(
+            fn=interrupt_active_analysis,
+            inputs=[language],
+            outputs=[output_status],
+            queue=False,
+            show_progress="hidden",
         )
 
     return demo

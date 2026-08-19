@@ -100,6 +100,32 @@ class PlayerGroundPointTests(unittest.TestCase):
         self.assertTrue(visualizer._is_on_court((50, -30), mapper))
         self.assertFalse(visualizer._is_on_court((125, 20), mapper))
 
+    def test_spatial_tracks_draw_detected_box_and_keep_missing_box_absent(self):
+        frame = np.zeros((100, 120, 3), dtype=np.uint8)
+        tracks = [
+            {
+                "track_id": "track_001",
+                "image_xy": [30, 60],
+                "status": "detected",
+                "trajectory_image": [[20, 70], [30, 60]],
+                "location_evidence": {"bbox_xyxy": [10, 20, 50, 80]},
+            },
+            {
+                "track_id": "track_002",
+                "image_xy": [90, 60],
+                "status": "missing",
+                "trajectory_image": [[80, 70], [90, 60]],
+                "location_evidence": {"bbox_xyxy": [70, 20, 110, 80]},
+            },
+        ]
+
+        PlayerPoseVisualizer._draw_spatial_tracks(frame, tracks)
+
+        # Green BGR box for a measured player. The missing track only has a
+        # red last-known point/label, never a human-shaped rectangle.
+        np.testing.assert_array_equal(frame[20, 10], np.asarray([0, 255, 0], dtype=np.uint8))
+        np.testing.assert_array_equal(frame[20, 70], np.asarray([0, 0, 0], dtype=np.uint8))
+
 
 if __name__ == "__main__":
     unittest.main()

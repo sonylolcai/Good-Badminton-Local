@@ -108,6 +108,62 @@ class ShuttlecockTracker:
         self.last_detection["rejection_reason"] = None
         return list(point)
 
+    def update_external_measurement(self, measurement, roi_corners=None):
+        """Use one externally computed raw measurement as the ball evidence.
+
+        TrackNetV3 has already applied temporal heatmap reasoning.  Reapplying
+        the YOLO distance gate here would incorrectly discard fast shots, so
+        this method preserves each raw visible point.  Missing frames still use
+        the existing, explicitly-labelled short prediction policy for display;
+        those predicted points remain ``accepted=False``.
+        """
+        self.frame_index += 1
+        measurement = measurement or {}
+        source = measurement.get("source") or "external_measurement"
+        point = measurement.get("image")
+        visible = bool(measurement.get("visible")) and self._valid_external_point(point)
+        if not visible:
+            self.last_detection = {
+                **self._empty_detection_state(),
+                "source": source,
+                "measurement_kind": measurement.get("measurement_kind"),
+                "confidence_status": measurement.get("confidence_status", "not_visible"),
+                "rejection_reason": "external_measurement_not_visible",
+            }
+            return self._handle_missing("external_measurement_not_visible", roi_corners)
+
+        normalized = (float(point[0]), float(point[1]))
+        self.last_candidate = {"point": normalized, "confidence": measurement.get("confidence")}
+        self.last_detection = {
+            "status": "detected",
+            "visible": True,
+            "accepted": True,
+            "image": [normalized[0], normalized[1]],
+            # The value records TrackNet's binary visibility threshold.  It is
+            # deliberately accompanied by confidence_status, not presented as
+            # a calibrated detector score.
+            "confidence": measurement.get("confidence"),
+            "confidence_status": measurement.get("confidence_status"),
+            "measurement_kind": measurement.get("measurement_kind"),
+            "candidate_count": 1,
+            "raw_candidate_count": 1,
+            "filtered_rejections": {},
+            "source": source,
+            "gap_frames": 0,
+            "rejection_reason": None,
+        }
+        self._append_valid_point(normalized)
+        return [normalized[0], normalized[1]]
+
+    @staticmethod
+    def _valid_external_point(point):
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            return False
+        try:
+            return np.isfinite(float(point[0])) and np.isfinite(float(point[1]))
+        except (TypeError, ValueError):
+            return False
+
     def _handle_missing(self, reason, roi_corners):
         self._record_missing_detection()
         predicted = self._predict_missing_position()
@@ -299,10 +355,13 @@ class ShuttlecockTracker:
 
         for i, point in enumerate(points):
             radius = int(3 + (i / len(points)) * 4)
-            cv2.circle(frame, point, radius, color, thickness=-1, lineType=cv2.LINE_AA)
+            pixel_point = self._as_drawable_pixel(point)
+            if pixel_point is not None:
+                cv2.circle(frame, pixel_point, radius, color, thickness=-1, lineType=cv2.LINE_AA)
 
-        latest_point = points[-1]
-        cv2.circle(frame, latest_point, 6, (0, 165, 255), thickness=-1, lineType=cv2.LINE_AA)
+        latest_point = self._as_drawable_pixel(points[-1])
+        if latest_point is not None:
+            cv2.circle(frame, latest_point, 6, (0, 165, 255), thickness=-1, lineType=cv2.LINE_AA)
 
         if self.show_performance_stats:
             print(f"Drawing shuttlecock trajectory took {time.time() - t0:.2f} sec")
@@ -331,3 +390,23 @@ class ShuttlecockTracker:
 
     def get_last_detection(self):
         return dict(self.last_detection)
+
+    @staticmethod
+    def _as_drawable_pixel(point):
+        """Return an OpenCV-compatible integer point without changing evidence.
+
+        TrackNet's raw measurements intentionally remain floating-point in the
+        tracker and the persisted data.  OpenCV drawing functions, however,
+        accept only integer pixel coordinates.  This conversion belongs at the
+        rendering boundary so a drawing failure cannot discard or rewrite a
+        valid measurement.
+        """
+        if not isinstance(point, (list, tuple, np.ndarray)) or len(point) != 2:
+            return None
+        try:
+            x, y = float(point[0]), float(point[1])
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(x) or not np.isfinite(y):
+            return None
+        return int(round(x)), int(round(y))

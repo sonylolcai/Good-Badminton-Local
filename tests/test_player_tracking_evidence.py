@@ -137,6 +137,28 @@ class PlayerTrackingEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(shuttle["confidence"], 0.48)
         self.assertEqual(shuttle["gap_frames"], 1)
 
+    def test_writes_spatial_contract_alongside_legacy_slots(self):
+        writer = _Writer()
+        tracker = PlayerTracker(
+            corners=[(0, 0), (100, 0), (100, 200), (0, 200)],
+            threshold=100,
+            detection_writer=writer,
+            fps=30,
+        )
+        spatial = {
+            "schema_version": "2.0",
+            "tracks": [{"track_id": "track_001", "zone_id": "rear_left"}],
+            "rally": {"score_status": "unknown"},
+        }
+
+        tracker.update(4, [], None, {}, {}, 4, spatial_state=spatial)
+
+        record = writer.records[0]
+        self.assertEqual(record["schema_version"], "2.0")
+        self.assertEqual(record["spatial"]["tracks"][0]["track_id"], "track_001")
+        self.assertEqual(record["spatial"]["rally"]["score_status"], "unknown")
+        self.assertIn("upper", record["players"])
+
 
 if __name__ == "__main__":
     unittest.main()

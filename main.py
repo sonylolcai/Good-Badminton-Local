@@ -14,6 +14,16 @@ def normalized_roi(value):
     return roi
 
 
+def image_line(value):
+    try:
+        values = tuple(float(item.strip()) for item in value.split(','))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError('球网必须是 x1,y1,x2,y2 四个图像像素值') from exc
+    if len(values) != 4:
+        raise argparse.ArgumentTypeError('球网必须是 x1,y1,x2,y2 四个图像像素值')
+    return [(values[0], values[1]), (values[2], values[3])]
+
+
 
 def main():
     parser = argparse.ArgumentParser(description='羽毛球比赛视频分析系统')
@@ -25,9 +35,11 @@ def main():
     parser.add_argument('--pose-mode', default='balanced', choices=['lightweight', 'balanced', 'performance'], help='RTMPose / RTMO 模型档位')
     parser.add_argument('--yolo-pose-model', default='weights/yolo11n-pose.pt', type=str, help='YOLO pose 模型路径或模型名')
     parser.add_argument('--pose-imgsz', default=1280, type=int, choices=[640, 960, 1280], help='YOLO Pose 全画面推理尺寸，当前固定机位基线推荐1280')
+    parser.add_argument('--pose-sample-hz', default=0.0, type=float, help='姿态采样频率；0 表示每个源视频帧均推理并保存 17 个关节，正数为降采样')
     parser.add_argument('--pose-conf', default=0.15, type=float, help='YOLO Pose 人体置信阈值，固定低清机位默认0.15')
     parser.add_argument('--far-player-enhancement', choices=['true', 'false'], default='false', help='启用全场640加远端ROI二次640检测，默认关闭')
     parser.add_argument('--far-pose-roi', type=normalized_roi, default=(0.12, 0.30, 0.86, 0.82), help='相对于姿态ROI的远端检测区域 x1,y1,x2,y2')
+    parser.add_argument('--net-image-line', type=image_line, default=None, help='人工球网两端像素坐标 x1,y1,x2,y2；不传时由球场四角推导')
     parser.add_argument('--pose-roi', choices=['true', 'false'], default='true', help='是否显示姿态检测 ROI 框，默认 true')
     parser.add_argument('--output-video-style', choices=['annotated', 'skeleton'], default='annotated', help='输出视频样式：原视频标注或仅显示球场、骨架和羽毛球')
     parser.add_argument('--display', choices=['true', 'false'], default='true', help='是否显示视频窗口，默认 true')
@@ -70,9 +82,11 @@ def main():
         show_pose_roi=args.pose_roi == 'true',
         output_video_style=args.output_video_style,
         pose_imgsz=args.pose_imgsz,
+        pose_sample_hz=args.pose_sample_hz,
         pose_conf=args.pose_conf,
         far_player_enhancement=args.far_player_enhancement == 'true',
         far_pose_roi=args.far_pose_roi,
+        net_image_line=args.net_image_line,
     )
 
     system.keep_audio = args.audio == 'true'
