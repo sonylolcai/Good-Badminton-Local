@@ -42,7 +42,9 @@ def main():
     parser.add_argument('--net-image-line', type=image_line, default=None, help='人工球网两端像素坐标 x1,y1,x2,y2；不传时由球场四角推导')
     parser.add_argument('--pose-roi', choices=['true', 'false'], default='true', help='是否显示姿态检测 ROI 框，默认 true')
     parser.add_argument('--output-video-style', choices=['annotated', 'skeleton'], default='annotated', help='输出视频样式：原视频标注或仅显示球场、骨架和羽毛球')
-    parser.add_argument('--display', choices=['true', 'false'], default='true', help='是否显示视频窗口，默认 true')
+    parser.add_argument('--generate-annotated-video', choices=['true', 'false'], default='false', help='是否生成标注视频（绘制与首次 H.264 编码），默认 false')
+    parser.add_argument('--browser-video-reencode', choices=['true', 'false'], default='false', help='是否额外进行浏览器兼容重编码；仅生成标注视频时生效，默认 false')
+    parser.add_argument('--display', choices=['true', 'false'], default='false', help='是否显示 OpenCV 预览窗口；开启会保留绘制但不导出视频，默认 false')
     parser.add_argument('--skeletons', choices=['true', 'false'], default='true', help='是否显示人体骨架，默认 true')
     parser.add_argument('--player-trajectories', choices=['true', 'false'], default='true', help='是否显示球员轨迹，默认 true')
     parser.add_argument('--court-trajectory', choices=['true', 'false'], default='true', help='是否显示球场轨迹，默认 true')
@@ -81,6 +83,8 @@ def main():
         yolo_pose_model=args.yolo_pose_model,
         show_pose_roi=args.pose_roi == 'true',
         output_video_style=args.output_video_style,
+        generate_annotated_video=args.generate_annotated_video == 'true',
+        browser_video_reencode=args.browser_video_reencode == 'true',
         pose_imgsz=args.pose_imgsz,
         pose_sample_hz=args.pose_sample_hz,
         pose_conf=args.pose_conf,

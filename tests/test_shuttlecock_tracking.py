@@ -8,6 +8,17 @@ class _NoopBallModel:
 
 
 class ShuttlecockPredictionTests(unittest.TestCase):
+    def test_detector_opt_out_is_not_reported_as_a_missing_or_predicted_ball(self):
+        tracker = ShuttlecockTracker(_NoopBallModel())
+
+        self.assertIsNone(tracker.mark_not_requested())
+        state = tracker.get_last_detection()
+        self.assertEqual(state["status"], "not_requested")
+        self.assertEqual(state["source"], "disabled_by_option")
+        self.assertFalse(state["visible"])
+        self.assertFalse(state["accepted"])
+        self.assertEqual(state["rejection_reason"], "detector_disabled")
+
     def test_short_missing_gap_is_predicted_and_long_gap_remains_missing(self):
         tracker = ShuttlecockTracker(
             _NoopBallModel(),

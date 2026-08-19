@@ -2,7 +2,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from webui.app import _local_fallback_policy, _task_history_detail, _task_history_rows
+from webui.reconcile_remote_tasks import reconcile_once
+from webui.remote_gpu import RemoteAnalysisError
 from webui.task_ledger import BusinessTaskLedger
 from webui.task_control import AnalysisTaskController
 
@@ -42,6 +46,72 @@ class BusinessTaskLedgerTests(unittest.TestCase):
         second = controller.start()
         self.assertFalse(second.is_cancelled())
         controller.finish(second)
+
+    def test_history_lists_all_tasks_and_keeps_remote_progress_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = BusinessTaskLedger(Path(temp_dir))
+            task_id = ledger.start_task(output_dir="outputs/remote_jobs/test", remote_base_url="http://gpu")
+            ledger.record_remote_event(task_id, {
+                "phase": "accepted", "job_id": "job-1", "accepted_at": "2026-01-01T00:00:00+00:00",
+            })
+            ledger.record_remote_event(task_id, {
+                "phase": "running", "job_id": "job-1", "processed_frames": 40,
+                "total_frames": 100, "ratio": 0.4,
+                "stage": "tracknet.inference", "tracking": {"phase": "tracknet_inference"},
+            })
+
+            rows = _task_history_rows(ledger)
+            detail = _task_history_detail(task_id, ledger)
+
+            self.assertEqual(1, len(rows))
+            self.assertEqual("远端运行中", rows[0][2])
+            self.assertEqual("40.0% (40/100)", rows[0][4])
+            self.assertEqual("tracknet.inference", rows[0][5])
+            self.assertEqual("job-1", detail["remote"]["job_id"])
+            self.assertEqual(0.4, detail["last_remote_status"]["ratio"])
+
+    def test_missing_remote_receipt_stops_automatic_404_retries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = BusinessTaskLedger(Path(temp_dir))
+            task_id = ledger.start_task(output_dir="outputs/remote_jobs/no-receipt", remote_base_url="http://gpu")
+
+            with patch(
+                "webui.reconcile_remote_tasks.recover_remote_task",
+                side_effect=RemoteAnalysisError("remote GPU request failed: HTTP Error 404: Not Found"),
+            ):
+                summary = reconcile_once(ledger)
+
+            self.assertEqual("submission_unconfirmed", summary[0]["status"])
+            self.assertEqual("submission_unconfirmed", ledger.get(task_id)["status"])
+            self.assertEqual([], list(ledger.pending_tasks()))
+
+    def test_remote_failure_after_confirmed_receipt_never_restarts_full_local_run(self):
+        """A completed/failed GPU job must not silently duplicate work locally."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = BusinessTaskLedger(Path(temp_dir))
+            task_id = ledger.start_task(output_dir="outputs/remote_jobs/accepted", remote_base_url="http://gpu")
+            ledger.record_remote_event(task_id, {
+                "phase": "accepted", "job_id": "job-already-ran",
+            })
+
+            allowed, reason = _local_fallback_policy(
+                ledger, task_id, {"shuttle_detector": "yolo"},
+            )
+
+            self.assertFalse(allowed)
+            self.assertIn("已确认接收", reason)
+
+    def test_pre_receipt_transport_failure_can_still_use_explicit_local_continuity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = BusinessTaskLedger(Path(temp_dir))
+            task_id = ledger.start_task(output_dir="outputs/remote_jobs/no-receipt", remote_base_url="http://gpu")
+
+            allowed, reason = _local_fallback_policy(
+                ledger, task_id, {"shuttle_detector": "yolo"},
+            )
+
+            self.assertTrue(allowed)
+            self.assertIsNone(reason)
 
     def test_performance_trace_is_copied_outside_the_prunable_result_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -14,6 +14,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# These are business-side terminal facts.  A UI restart must not turn any of
+# them back into a candidate for remote polling.  ``submission_unconfirmed``
+# means no remote receipt was ever recovered, so a user must explicitly decide
+# whether to submit the source video again.
+TERMINAL_TASK_STATUSES = frozenset({
+    "succeeded", "failed", "cancelled", "interrupted_unconfirmed",
+    "local_fallback", "submission_unconfirmed",
+})
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -218,14 +228,31 @@ class BusinessTaskLedger:
         self._write(task)
 
     def pending_tasks(self):
-        terminal = {"succeeded", "failed", "cancelled", "interrupted_unconfirmed"}
-        for path in sorted(self.root.glob("*.json")):
+        for task in self.list_tasks():
+            if task.get("status") not in TERMINAL_TASK_STATUSES:
+                yield task
+
+    def list_tasks(self, limit=None):
+        """Return every durable task, newest first, for restart-safe history.
+
+        The event stream remains the detailed audit trail.  This method only
+        provides a deterministic index for the WebUI and future business
+        service; it never contacts the GPU API or changes task state.
+        """
+        tasks = []
+        for path in self.root.glob("*.json"):
             try:
                 task = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if task.get("status") not in terminal:
-                yield task
+            if not isinstance(task, dict) or not task.get("task_id"):
+                continue
+            tasks.append(task)
+        tasks.sort(
+            key=lambda task: str(task.get("updated_at") or task.get("created_at") or ""),
+            reverse=True,
+        )
+        return tasks[:max(0, int(limit))] if limit is not None else tasks
 
     def get(self, task_id):
         path = self._path(task_id)

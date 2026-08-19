@@ -155,6 +155,25 @@ class ShuttlecockTracker:
         self._append_valid_point(normalized)
         return [normalized[0], normalized[1]]
 
+    def mark_not_requested(self):
+        """Persist an explicit detector opt-out for one source frame.
+
+        This intentionally does not call the missing-frame predictor: an
+        absent measurement selected by the operator is not evidence that the
+        shuttle was temporarily occluded.
+        """
+        self.frame_index += 1
+        self.last_candidate = None
+        self.last_detection = {
+            **self._empty_detection_state(),
+            "status": "not_requested",
+            "source": "disabled_by_option",
+            "measurement_kind": "not_requested",
+            "confidence_status": "not_applicable",
+            "rejection_reason": "detector_disabled",
+        }
+        return None
+
     @staticmethod
     def _valid_external_point(point):
         if not isinstance(point, (list, tuple)) or len(point) != 2:

@@ -137,6 +137,24 @@ class GpuApiTests(unittest.TestCase):
         stored = self.app.state.job_manager.get_job(job["job_id"])
         self.assertEqual(stored["options"]["shuttle_detector"], "tracknet_v3")
 
+    def test_job_allows_shuttle_detection_to_be_explicitly_disabled(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-no-shuttle"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"shuttle_detector":"none"}',
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["options"]["shuttle_detector"], "none")
+
     def test_operator_can_cancel_a_queued_job_without_deleting_its_record(self):
         response = self.client.post(
             "/api/v1/jobs",
@@ -184,7 +202,46 @@ class GpuApiTests(unittest.TestCase):
         stored = self.app.state.job_manager.get_job(response.json()["job_id"])
         self.assertEqual(stored["options"]["pose_imgsz"], 960)
         self.assertEqual(stored["options"]["pose_sample_hz"], 10.0)
+        self.assertEqual(stored["options"]["shuttle_detector"], "yolo")
+        self.assertFalse(stored["options"]["generate_annotated_video"])
+        self.assertFalse(stored["options"]["browser_video_reencode"])
         self.assertEqual(stored["tracking"]["phase"], "waiting_for_analysis")
+
+    def test_job_can_explicitly_request_video_generation_and_browser_reencode(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-video-output"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"generate_annotated_video":true,"browser_video_reencode":true}',
+            },
+        )
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertTrue(stored["options"]["generate_annotated_video"])
+        self.assertTrue(stored["options"]["browser_video_reencode"])
+
+    def test_browser_reencode_is_omitted_when_video_generation_is_disabled(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-no-video-output"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"browser_video_reencode":true}',
+            },
+        )
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertFalse(stored["options"]["generate_annotated_video"])
+        self.assertFalse(stored["options"]["browser_video_reencode"])
 
     def test_job_allows_an_explicit_full_frame_pose_evidence_run(self):
         response = self.client.post(

@@ -156,10 +156,12 @@ class StatsVisualizer:
         # 计算回合数显示位置，基于视频尺寸
         rally_pos_y = int(self.panel_height + self.frame_height * 0.1) # 第一个面板下方
               
-        # 使用语言配置显示回合数
+        # 回合数只在有羽毛球证据时显示。None means an explicit
+        # shuttle-detector opt-out, not a zero-round match.
         text_items = []
-        rally_text = f"{self.texts[self.language]['rally']}: {rally_count}"
-        text_items.append((rally_text, (self.margin, rally_pos_y), self.font_scale*1.5, (0, 165, 255), self.thickness+2))
+        if rally_count is not None:
+            rally_text = f"{self.texts[self.language]['rally']}: {rally_count}"
+            text_items.append((rally_text, (self.margin, rally_pos_y), self.font_scale*1.5, (0, 165, 255), self.thickness+2))
         
         # 绘制上半场球员统计
         self._draw_player_panel(frame, self.texts[self.language]['upper_player'], movement_stats.get('upper', {}), 

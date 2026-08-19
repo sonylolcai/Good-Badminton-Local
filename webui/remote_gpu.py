@@ -264,6 +264,19 @@ def recover_remote_task(business_task_id, remote_job_id, output_dir, status_cb=N
         "recovered": True,
     })
     if job.get("status") != "succeeded":
+        # A restarted WebUI used to discover a failed job but lose the only
+        # server-side timing/error evidence.  Fetch the small terminal trace
+        # before returning; the reconciliation caller archives it in its
+        # durable business ledger.  This never fetches a normal result bundle
+        # for failed or cancelled work.
+        if job.get("status") in {"failed", "cancelled"}:
+            job["local_performance_trace"] = _download_terminal_performance_trace(
+                config,
+                job_id,
+                job,
+                output_dir,
+                status_cb=status_cb,
+            )
         return job, None
     _emit(status_cb, {"mode": "remote_gpu", "phase": "downloading", "job_id": job_id, "recovered": True})
     result = _json_request(config, f"/api/v1/jobs/{job_id}/result")

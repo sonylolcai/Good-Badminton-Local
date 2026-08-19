@@ -8,7 +8,7 @@ PROFILE = {
     "production_options": {
         "pose_imgsz": 960,
         "pose_sample_hz": 10.0,
-        "shuttle_detector": "tracknet_v3",
+        "shuttle_detector": "yolo",
         "max_llm_requests_per_match": 1,
     },
     "regression": {"max_stage_regression_percent": 15.0},
@@ -32,7 +32,7 @@ def make_trace(pose_sample_hz=10.0, human_seconds=8.0):
         "options": {
             "pose_imgsz": 960,
             "pose_sample_hz": pose_sample_hz,
-            "shuttle_detector": "tracknet_v3",
+            "shuttle_detector": "yolo",
         },
         "progress": {"total_frames": 300},
         "timing": {

@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
         help="Good-Badminton TrackNet adapter with sampled background and visible progress.",
     )
     parser.add_argument("--background-sample-count", type=int, default=120)
+    parser.add_argument("--chunk-frames", type=int, default=96)
     parser.add_argument(
         "--run-rectified",
         action="store_true",
@@ -53,6 +54,8 @@ def main() -> int:
         return _error("--batch-size must be greater than zero")
     if args.background_sample_count <= 0:
         return _error("--background-sample-count must be greater than zero")
+    if args.chunk_frames <= 0:
+        return _error("--chunk-frames must be greater than zero")
     if args.fast_predictor and not args.fast_predictor.is_file():
         return _error(f"Fast TrackNet predictor does not exist: {args.fast_predictor}")
 
@@ -99,7 +102,10 @@ def _run_predict(args: argparse.Namespace, output_dir: Path, *, inpaint_checkpoi
         args.eval_mode,
     ]
     if use_fast_predictor:
-        command.extend(("--background-sample-count", str(args.background_sample_count)))
+        command.extend((
+            "--background-sample-count", str(args.background_sample_count),
+            "--chunk-frames", str(getattr(args, "chunk_frames", 96)),
+        ))
     if inpaint_checkpoint:
         command.extend(("--inpaintnet_file", str(inpaint_checkpoint.resolve())))
     runtime_env = None

@@ -9,6 +9,7 @@ import numpy as np
 
 from evaluation.shuttle_tracknet_ab.annotations import validate_annotations
 from evaluation.shuttle_tracknet_ab.fast_predict_tracknet_v3 import _iter_batches
+from evaluation.shuttle_tracknet_ab.fast_predict_tracknet_v3 import _iter_stream_batches
 from evaluation.shuttle_tracknet_ab.run_tracknet_v3 import _run_predict
 from evaluation.shuttle_tracknet_ab.metrics import evaluate_shuttle_predictions
 from evaluation.shuttle_tracknet_ab.prediction_io import (
@@ -67,6 +68,31 @@ class TrackNetABBenchmarkTests(unittest.TestCase):
         self.assertEqual((3, 8, 2), flattened_indexes.shape)
         self.assertEqual(list(range(8)), flattened_indexes[0, :, 1].tolist())
         self.assertEqual(list(range(2, 10)), flattened_indexes[-1, :, 1].tolist())
+
+    def test_bounded_streaming_batches_match_full_buffer_window_indexes(self):
+        processed = np.zeros((10, 3, 2, 2), dtype=np.uint8)
+        chunks = iter(((0, processed[:3]), (3, processed[3:7]), (7, processed[7:])))
+        batches = list(
+            _iter_stream_batches(
+                np,
+                chunks,
+                median_channels=None,
+                sequence_length=8,
+                batch_size=2,
+                frame_count=10,
+            )
+        )
+        flattened_indexes = np.concatenate([indexes for indexes, _ in batches], axis=0)
+        self.assertEqual((3, 8, 2), flattened_indexes.shape)
+        self.assertEqual(list(range(8)), flattened_indexes[0, :, 1].tolist())
+        self.assertEqual(list(range(2, 10)), flattened_indexes[-1, :, 1].tolist())
+        full_batches = list(_iter_batches(np, processed, None, sequence_length=8, batch_size=2))
+        self.assertTrue(
+            np.array_equal(
+                np.concatenate([inputs for _, inputs in batches], axis=0),
+                np.concatenate([inputs for _, inputs in full_batches], axis=0),
+            )
+        )
 
     def test_metrics_credit_only_raw_measurements_and_keep_inference_separate(self):
         annotations = [

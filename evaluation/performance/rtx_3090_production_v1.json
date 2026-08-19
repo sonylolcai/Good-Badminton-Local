@@ -5,7 +5,7 @@
   "production_options": {
     "pose_imgsz": 960,
     "pose_sample_hz": 10.0,
-    "shuttle_detector": "tracknet_v3",
+    "shuttle_detector": "yolo",
     "max_llm_requests_per_match": 1
   },
   "regression": {

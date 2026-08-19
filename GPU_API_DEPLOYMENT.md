@@ -106,10 +106,10 @@ curl -X POST http://GPU_HOST:PUBLIC_PORT/api/v1/jobs \
   -F "video=@match.mp4" \
   -F "template=@court.png" \
   -F 'court_corners=[[120,210],[1035,209],[1150,700],[35,700]]' \
-  -F 'options_json={"pose_imgsz":1280,"output_video_style":"skeleton","audio":false}'
+  -F 'options_json={"pose_imgsz":1280,"generate_annotated_video":false,"browser_video_reencode":false,"audio":false}'
 ```
 
-成功后轮询 `/api/v1/jobs/{job_id}`。`succeeded` 后调用 `/result`，返回 `annotated_video`、`metadata`、`detections` 和（生成时）`spatial_match_summary` 的受保护下载 URL。
+成功后轮询 `/api/v1/jobs/{job_id}`。`succeeded` 后调用 `/result`，始终返回 `metadata`、`detections` 和（生成时）`spatial_match_summary` 的受保护下载 URL；只有显式传入 `generate_annotated_video:true` 时才会附带 `annotated_video`。`browser_video_reencode` 默认为 `false`，且仅在已生成标注视频时生效。
 
 ## WebUI 远端优先模式
 
@@ -350,15 +350,16 @@ powershell -ExecutionPolicy Bypass -File .\deploy\package_gpu_api.ps1 -IncludeTr
 bash /root/good-badminton-gpu-api/deploy/setup_tracknet_v3_ab.sh
 ```
 
-`run_tracknet_v3_ab.sh` 对普通的 2–5 分钟视频默认使用官方 TrackNetV3 权重与连续
-`weight` 集成，但将背景改为均匀抽样中值（默认 120 帧）并将每帧缩放限制为一次。它会在
-CSV 同目录写入 `tracknet_execution.json`，明确记录该预处理差异。首轮只产生原始 TrackNet
+`run_tracknet_v3_ab.sh` 对普通的 2–5 分钟视频使用官方 TrackNetV3 权重与连续
+`weight` 集成。适配器先顺序抽样 120 帧生成模型尺寸的背景中值，再顺序解码、预处理和推理
+固定大小的分块（默认每块 96 帧）；它不会把整段原始视频或全部预处理帧保存在内存中。CSV
+同目录的 `tracknet_execution.json` 会记录背景、分块和内存策略。首轮只产生原始 TrackNet
 候选 B；默认不跑 InpaintNet B*，避免将轨迹补全误读为额外真实检测。
 
-可按显存和视频稳定性调整批量或背景样本数：
+可按显存和视频稳定性调整批量、背景样本数或内存上限：
 
 ```bash
-TRACKNET_BATCH_SIZE=8 TRACKNET_BACKGROUND_SAMPLE_COUNT=180 \
+TRACKNET_BATCH_SIZE=8 TRACKNET_BACKGROUND_SAMPLE_COUNT=180 TRACKNET_CHUNK_FRAMES=64 \
   bash /root/good-badminton-gpu-api/deploy/run_tracknet_v3_ab.sh <video> <detections.jsonl>
 ```
 

@@ -223,6 +223,10 @@ def _parse_options(value):
         "show_pose_roi": False,
         "visualize_positions": True,
         "output_video_style": "skeleton",
+        # Data is the production contract. Rendering and media export are
+        # explicit diagnostics/review options rather than default compute.
+        "generate_annotated_video": False,
+        "browser_video_reencode": False,
         # Fixed-camera production keeps a timestamped 10 Hz pose budget.  A
         # caller can still explicitly request 0 for an offline full-frame
         # evidence run, but it is not suitable as the streaming default.
@@ -234,7 +238,10 @@ def _parse_options(value):
         "match_mode": "singles",
         "lock_match_roster": True,
         "roster_stable_frames": 2,
-        "shuttle_detector": "tracknet_v3",
+        # YOLO remains the low-latency default.  TrackNetV3 is an explicit,
+        # slower accuracy experiment and must never start from an omitted API
+        # option.
+        "shuttle_detector": "yolo",
         # Opaque business-session reference only. Participant check IDs remain
         # on the business service and never become visual identity evidence.
         "match_session_ref": None,
@@ -255,10 +262,17 @@ def _parse_options(value):
         raise HTTPException(status_code=422, detail="pose_conf must be in (0, 1]")
     if options["output_video_style"] not in {"annotated", "skeleton"}:
         raise HTTPException(status_code=422, detail="output_video_style must be annotated or skeleton")
+    for key in ("generate_annotated_video", "browser_video_reencode"):
+        if not isinstance(options[key], bool):
+            raise HTTPException(status_code=422, detail=f"{key} must be a JSON boolean")
+    if not options["generate_annotated_video"]:
+        # There is no media source to transcode. Keep the persisted option
+        # truthful so the terminal performance trace explains the omission.
+        options["browser_video_reencode"] = False
     if options["match_mode"] not in {"singles", "doubles"}:
         raise HTTPException(status_code=422, detail="match_mode must be singles or doubles")
-    if options["shuttle_detector"] not in {"yolo", "tracknet_v3"}:
-        raise HTTPException(status_code=422, detail="shuttle_detector must be yolo or tracknet_v3")
+    if options["shuttle_detector"] not in {"none", "yolo", "tracknet_v3"}:
+        raise HTTPException(status_code=422, detail="shuttle_detector must be none, yolo, or tracknet_v3")
     if int(options["roster_stable_frames"]) < 1 or int(options["roster_stable_frames"]) > 10:
         raise HTTPException(status_code=422, detail="roster_stable_frames must be between 1 and 10")
     if options["match_session_ref"] is not None and not re.fullmatch(

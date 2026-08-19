@@ -8,6 +8,20 @@ from webui.app import _rally_summary_from_result
 
 
 class RallySummaryTests(unittest.TestCase):
+    def test_explicit_no_shuttle_run_does_not_rebuild_shot_or_rally_artifacts(self):
+        summary, rows = _rally_summary_from_result(
+            {"derived": {"status": "not_requested"}},
+            {
+                "models": {
+                    "shuttlecock_detection": {"primary_source": "none"},
+                },
+                "derived": {"status": "not_requested"},
+            },
+        )
+
+        self.assertIn("不检测羽毛球", summary)
+        self.assertEqual(rows, [])
+
     def test_result_summary_rebuilds_missing_local_artifacts_and_keeps_metadata_valid(self):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)

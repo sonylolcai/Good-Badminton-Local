@@ -7,15 +7,19 @@ WebUI 中执行 A/B 报告。
 
 ## 行为边界
 
-- 选择 `TrackNetV3 原始轨迹（GPU 主流程）` 时，服务器先完整运行 TrackNet，
+- WebUI 的“羽毛球检测来源”提供三个互斥模式：`不检测羽毛球`、`YOLO`
+  （默认）和 `TrackNetV3`。选择“不检测羽毛球”时，服务不会加载或调用
+  羽毛球模型，也不会生成球轨迹、击球候选或回合派生数据；
+  `detections.jsonl.shuttlecock.status=not_requested` 明确表示这是人工选择，
+  不是漏检。只有主动选择 `TrackNetV3` 时，服务器才会先运行 TrackNet，
   再开始人物、球场、轨迹、球路和回合主流程。
 - 标注视频右上角显示 `Shuttle: TrackNetV3 raw`；结果页提供原始 CSV 下载。
 - `detections.jsonl.shuttlecock` 会标记
   `source=tracknet_v3_raw`、`measurement_kind=temporal_heatmap` 和
   `confidence_status=uncalibrated_binary_visibility_threshold_0.5`。
 - 轨迹预测仍显示为 `predicted`，且 `accepted=false`；不会冒充 TrackNet 的真实点。
-- TrackNet 失败时，本分支会明确失败，**不会静默回退到 YOLO**。需要旧路径时，在
-  WebUI 下拉框明确选择 `YOLO 羽毛球检测（旧路径）`。
+- TrackNet 失败时，已主动开启 TrackNet 的任务会明确失败，**不会静默回退到 YOLO**；
+  未勾选时本来就只运行 YOLO。
 - 此分支用于直观验收，不代表 TrackNet 已通过正式模型替换或比赛判分验收。
 
 ## GPU 服务一次性配置
@@ -29,6 +33,7 @@ GOOD_BADMINTON_TRACKNET_CHECKPOINT=/root/good-badminton-gpu-api-state/models/tra
 GOOD_BADMINTON_TRACKNET_PYTHON=/root/miniconda3/bin/python3
 GOOD_BADMINTON_TRACKNET_BATCH_SIZE=16
 GOOD_BADMINTON_TRACKNET_BACKGROUND_SAMPLES=120
+GOOD_BADMINTON_TRACKNET_CHUNK_FRAMES=96
 ```
 
 代码包仍不包含 TrackNetV3 上游源码和权重；它们由上述持久目录保存。更新应用代码后，
@@ -48,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\package_gpu_api.ps1
 bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh
 ```
 
-然后重启本地 WebUI，选择 `TrackNetV3 原始轨迹（GPU 主流程）` 并运行一段视频。
+然后重启本地 WebUI，在“羽毛球检测来源”选择 `TrackNetV3` 并运行一段视频。
 远端任务完成后，WebUI 自动下载标注视频、`detections.jsonl`、`metadata.json` 和
 `tracknet_raw_csv` 到本地 `outputs/remote_jobs/`；无需再手工从服务器取 CSV。
 

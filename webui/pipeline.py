@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -99,8 +100,9 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
     target_dir = Path(output_dir) / "tracknet_v3"
     batch_size = int(os.environ.get("GOOD_BADMINTON_TRACKNET_BATCH_SIZE", "16"))
     background_samples = int(os.environ.get("GOOD_BADMINTON_TRACKNET_BACKGROUND_SAMPLES", "120"))
-    if batch_size <= 0 or background_samples <= 0:
-        raise RuntimeError("TrackNetV3 批量大小和背景采样数必须为正整数。")
+    chunk_frames = int(os.environ.get("GOOD_BADMINTON_TRACKNET_CHUNK_FRAMES", "96"))
+    if batch_size <= 0 or background_samples <= 0 or chunk_frames <= 0:
+        raise RuntimeError("TrackNetV3 批量大小、背景采样数和分块帧数必须为正整数。")
     command = [
         runtime_python,
         str(runner),
@@ -112,6 +114,7 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
         "--output-dir", str(target_dir),
         "--batch-size", str(batch_size),
         "--background-sample-count", str(background_samples),
+        "--chunk-frames", str(chunk_frames),
         "--overwrite",
     ]
     print("TrackNetV3 primary shuttle detector:", subprocess.list2cmdline(command))
@@ -122,6 +125,7 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
         {
             "batch_size": batch_size,
             "background_sample_count": background_samples,
+            "chunk_frames": chunk_frames,
         },
     )
     runtime_env = os.environ.copy()
@@ -136,6 +140,11 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
         env=runtime_env,
     )
     output_lines = queue.Queue()
+    # The child process is intentionally a boundary, but a bare exit code is
+    # not actionable after an API/WebUI restart.  Keep only a bounded tail so
+    # a failed remote job can persist the immediate TrackNet diagnostic in its
+    # durable job record without retaining an unbounded duplicate log.
+    output_tail = deque(maxlen=80)
 
     def read_output():
         assert process.stdout is not None
@@ -148,7 +157,9 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
     try:
         while process.poll() is None or not output_lines.empty():
             try:
-                _forward_tracknet_output(output_lines.get(timeout=0.2), state_cb)
+                raw_line = output_lines.get(timeout=0.2)
+                output_tail.append(raw_line.rstrip())
+                _forward_tracknet_output(raw_line, state_cb)
             except queue.Empty:
                 pass
             if cancel_cb is not None and cancel_cb():
@@ -165,9 +176,20 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
             process.wait(timeout=10)
         output_reader.join(timeout=2)
         while not output_lines.empty():
-            _forward_tracknet_output(output_lines.get_nowait(), state_cb)
+            raw_line = output_lines.get_nowait()
+            output_tail.append(raw_line.rstrip())
+            _forward_tracknet_output(raw_line, state_cb)
     if process.returncode:
-        raise RuntimeError(f"TrackNetV3 推理失败（退出码 {process.returncode}）。")
+        diagnostic = "\n".join(line for line in output_tail if line).strip()
+        if diagnostic:
+            # Keep the exception reasonably small: it is copied into both the
+            # remote job JSON and the business-side task ledger.
+            diagnostic = diagnostic[-6000:]
+            raise RuntimeError(
+                f"TrackNetV3 推理失败（退出码 {process.returncode}）。"
+                f"\n子进程日志末尾：\n{diagnostic}"
+            )
+        raise RuntimeError(f"TrackNetV3 推理失败（退出码 {process.returncode}），且未输出诊断日志。")
     csv_path = target_dir / "tracknet_raw" / f"{Path(video_path).stem}_ball.csv"
     if not csv_path.is_file() or csv_path.stat().st_size == 0:
         raise RuntimeError("TrackNetV3 未生成原始球点 CSV。")
@@ -620,6 +642,12 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     yolo_pose_model = options.get("yolo_pose_model", "weights/yolo11n-pose.pt")
     ball_model = options.get("ball_model", "weights/yolo11s-ball.pt")
     keep_audio = options.get("audio", True)
+    generate_annotated_video = bool(options.get("generate_annotated_video", False))
+    browser_video_reencode = bool(options.get("browser_video_reencode", False))
+    # The second conversion has no source when primary video output is off.
+    # Normalize it so a data-only task remains a valid low-latency request.
+    if not generate_annotated_video:
+        browser_video_reencode = False
     show_skeletons = options.get("show_skeletons", True)
     show_player_trajectories = options.get("show_player_trajectories", True)
     show_court_trajectory = options.get("show_court_trajectory", True)
@@ -639,8 +667,8 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     lock_match_roster = bool(options.get("lock_match_roster", True))
     roster_stable_frames = int(options.get("roster_stable_frames", 2))
     shuttle_detector = options.get("shuttle_detector", "yolo")
-    if shuttle_detector not in {"yolo", "tracknet_v3"}:
-        raise ValueError("shuttle_detector must be 'yolo' or 'tracknet_v3'.")
+    if shuttle_detector not in {"none", "yolo", "tracknet_v3"}:
+        raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
     tracknet_measurements_path = None
     if shuttle_detector == "tracknet_v3":
         tracknet_measurements_path = _prepare_tracknet_v3_raw(
@@ -682,6 +710,8 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         roster_stable_frames=roster_stable_frames,
         shuttle_detector=shuttle_detector,
         tracknet_measurements_path=tracknet_measurements_path,
+        generate_annotated_video=generate_annotated_video,
+        browser_video_reencode=browser_video_reencode,
     )
     system.keep_audio = keep_audio
     system.process_video(
@@ -756,10 +786,31 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
                 "已经生成位置检测数据，但图表渲染失败。请打开右下角后台输出查看详情。"
             )
 
-    _emit_analysis_stage(state_cb, "post_processing", "browser_video_reencode")
-    web_video_path = _reencode_for_browser(system.output_video_path, output_dir, cancel_cb=cancel_cb)
-    if not os.path.isfile(web_video_path) or os.path.getsize(web_video_path) == 0:
-        raise RuntimeError("标注视频导出失败，未生成可播放文件。请打开右下角后台输出查看详情。")
+    web_video_path = None
+    if generate_annotated_video:
+        if browser_video_reencode:
+            _emit_analysis_stage(state_cb, "post_processing", "browser_video_reencode")
+            web_video_path = _reencode_for_browser(system.output_video_path, output_dir, cancel_cb=cancel_cb)
+        else:
+            _emit_analysis_stage(
+                state_cb,
+                "post_processing",
+                "browser_video_reencode_skipped",
+                {"reason": "browser_video_reencode=false"},
+            )
+            web_video_path = system.output_video_path
+        if not os.path.isfile(web_video_path) or os.path.getsize(web_video_path) == 0:
+            raise RuntimeError("标注视频导出失败，未生成可播放文件。请打开右下角后台输出查看详情。")
+    else:
+        _emit_analysis_stage(
+            state_cb,
+            "post_processing",
+            "browser_video_reencode_skipped",
+            {"reason": "generate_annotated_video=false"},
+        )
+        warnings.append(
+            "本次按高级选项跳过标注视频绘制与编码；人物轨迹、速度、距离、JSONL 和统计结果已照常保存。"
+        )
 
     result = {
         "output_dir": output_dir,

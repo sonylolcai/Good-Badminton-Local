@@ -25,6 +25,7 @@ from webui.pipeline import (
     run_analysis,
 )
 from webui.remote_gpu import RemoteAnalysisError, remote_gpu_config, run_remote_analysis
+from webui.reconcile_remote_tasks import reconcile_once
 from webui.shot_review import (
     REVIEW_DECISIONS,
     RALLY_TERMINAL_OUTCOMES,
@@ -66,6 +67,31 @@ def _write_execution_metadata(result, execution):
     with open(metadata_path, "w", encoding="utf-8") as output:
         json.dump(metadata, output, ensure_ascii=False, indent=2)
         output.write("\n")
+
+
+def _local_fallback_policy(ledger, business_task_id, options):
+    """Return whether a remote error may safely start a new local analysis.
+
+    A local run is a useful continuity fallback only when a GPU submission
+    never received a durable receipt.  Once the GPU has accepted a job, it may
+    have already spent substantial time processing (or have partial output).
+    Starting a second full analysis on the workstation after that job fails
+    hides the real error and can waste an entire second match-length run.
+    """
+    if options.get("shuttle_detector") == "tracknet_v3":
+        return False, (
+            "远程 TrackNetV3 主流程失败；为避免悄悄改用本地 YOLO，"
+            "本次不会自动本地回退。"
+        )
+
+    task = ledger.get(business_task_id) if ledger is not None and business_task_id else None
+    remote = (task or {}).get("remote") or {}
+    if remote.get("accepted") and remote.get("job_id"):
+        return False, (
+            "远端 GPU 已确认接收并执行过该任务；为避免重复计算，"
+            "本次不会自动切换为本地分析。"
+        )
+    return True, None
 
 
 def _validate_file_size(path, max_bytes, label="File"):
@@ -222,10 +248,11 @@ def ensure_court_for_analysis(video_file, template_path, corners, click_corners,
 
 
 def run_full_analysis(analysis_ready, video_file, template_path, corners,
-                      pose_family, pose_mode, language, audio, match_mode,
-                      output_video_style, shuttle_detector,
-                      pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
-                      show_skeletons, show_player_trajectories,
+                       pose_family, pose_mode, language, audio, match_mode,
+                       output_video_style, shuttle_detector,
+                       pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
+                       generate_annotated_video, browser_video_reencode,
+                       show_skeletons, show_player_trajectories,
                       show_court_trajectory, show_shuttlecock_trajectory,
                       show_player_stats, show_pose_roi, visualize_positions,
                       yolo_pose_model, ball_model,
@@ -261,6 +288,10 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "lock_match_roster": True,
         "roster_stable_frames": 2,
         "output_video_style": output_video_style,
+        "generate_annotated_video": generate_annotated_video,
+        "browser_video_reencode": browser_video_reencode,
+        # This is an execution mode rather than a display toggle. ``none``
+        # does not invoke a shuttle detector or create ball evidence.
         "shuttle_detector": shuttle_detector,
         "pose_imgsz": int(pose_imgsz),
         # A 10 Hz measurement is enough for fixed-camera movement analysis
@@ -347,11 +378,11 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                     })
                     return
                 fallback_reason = str(remote_exc)
-                if shuttle_detector == "tracknet_v3":
-                    raise RuntimeError(
-                        "远程 TrackNetV3 主流程失败；为避免悄悄改用 YOLO，本次不会本地回退。"
-                        f" 原因：{fallback_reason}"
-                    ) from remote_exc
+                allow_fallback, block_reason = _local_fallback_policy(
+                    ledger, business_task_id, options,
+                )
+                if not allow_fallback:
+                    raise RuntimeError(f"{block_reason} 原因：{fallback_reason}") from remote_exc
                 print(f"Remote GPU analysis failed; falling back locally: {fallback_reason}")
                 ledger.record_terminal(
                     business_task_id,
@@ -482,7 +513,8 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
     for warning in result.get("warnings", []):
         gr.Warning(warning)
 
-    output_video = result["video"] if os.path.isfile(result["video"]) else None
+    video_candidate = result.get("video")
+    output_video = video_candidate if video_candidate and os.path.isfile(video_candidate) else None
     viz_images = [img for img in result["visualizations"] if os.path.isfile(img)]
 
     metadata_content = None
@@ -535,10 +567,22 @@ def _rally_summary_from_result(result, metadata):
     legacy GPU service did not return them.
     """
     metadata = metadata or {}
+    derived = metadata.get("derived") or result.get("derived") or {}
+    shuttle_source = (
+        (metadata.get("models") or {})
+        .get("shuttlecock_detection", {})
+        .get("primary_source")
+    )
+    if shuttle_source == "none" or derived.get("status") == "not_requested":
+        return (
+            "### 回合与拍数\n"
+            "本次选择了**不检测羽毛球**：只输出人物跑位、姿态和持续追踪数据，"
+            "不会生成球轨迹、候选击球或候选回合。",
+            [],
+        )
     detections_path = Path(result.get("detections") or "")
     if not detections_path.is_file():
         return "### 回合与拍数\n未找到本地检测数据，暂时无法生成候选回合。", []
-    derived = metadata.get("derived") or result.get("derived") or {}
     rally_path = Path(derived.get("rallies_path") or "")
     local_rally_path = detections_path.parent / "derived" / "rallies_v2.jsonl"
     if not rally_path.is_file() and local_rally_path.is_file():
@@ -1496,6 +1540,150 @@ def _review_split_selected(analysis_dir, shot_id, split_offset_sec, reviewer, re
     )
 
 
+_TASK_STATUS_TEXT = {
+    "submitting": "正在提交",
+    "accepted": "已接收",
+    "queued": "远端排队",
+    "running": "远端运行中",
+    "downloading": "正在拉取结果",
+    "downloaded": "已下载，等待整理",
+    "succeeded": "已完成",
+    "failed": "失败",
+    "cancelled": "已中断",
+    "interrupted_unconfirmed": "本地中断，远端状态未确认",
+    "local_fallback": "本地回退处理中",
+    "submission_unconfirmed": "未获得远端接收回执",
+}
+
+
+def _task_history_last_remote_details(task):
+    """Return the latest remote status payload from an append-only ledger."""
+    for entry in reversed(task.get("history") or []):
+        if entry.get("event") == "remote_status_polled":
+            return dict(entry.get("details") or {})
+    return {}
+
+
+def _task_history_error(task):
+    error = task.get("error") or {}
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("type") or "")
+    return str(error or "")
+
+
+def _task_history_rows(ledger=None):
+    """Build a compact, restart-safe task index without making remote calls."""
+    ledger = ledger or BusinessTaskLedger()
+    rows = []
+    for task in ledger.list_tasks():
+        remote = task.get("remote") or {}
+        details = _task_history_last_remote_details(task)
+        progress = details.get("ratio")
+        progress_text = "—" if progress is None else f"{float(progress) * 100:.1f}%"
+        processed = details.get("processed_frames")
+        total = details.get("total_frames")
+        if processed is not None:
+            progress_text += f" ({processed}/{total if total is not None else '?'})"
+        tracking = details.get("tracking") or {}
+        stage = details.get("stage") or tracking.get("stage") or tracking.get("phase") or "—"
+        output_dir_text = task.get("output_dir")
+        output_dir = Path(output_dir_text) if output_dir_text else None
+        has_result = bool(output_dir and (output_dir / "metadata.json").is_file())
+        rows.append([
+            task.get("task_id"),
+            task.get("created_at"),
+            _TASK_STATUS_TEXT.get(task.get("status"), task.get("status")),
+            remote.get("job_id") or "—",
+            progress_text,
+            stage,
+            "已落地" if has_result else "未落地",
+            _task_history_error(task)[:180] or "—",
+        ])
+    return rows
+
+
+def _task_history_choices(ledger=None):
+    ledger = ledger or BusinessTaskLedger()
+    choices = []
+    for task in ledger.list_tasks():
+        remote = task.get("remote") or {}
+        label = (
+            f"{str(task.get('created_at') or '')[:19]} · "
+            f"{_TASK_STATUS_TEXT.get(task.get('status'), task.get('status'))} · "
+            f"{str(remote.get('job_id') or task.get('task_id'))[:12]}"
+        )
+        choices.append((label, task["task_id"]))
+    return choices
+
+
+def _task_history_detail(task_id, ledger=None):
+    if not task_id:
+        return {"hint": "选择一条任务查看完整业务事件、远端 Job ID、错误和本地结果目录。"}
+    ledger = ledger or BusinessTaskLedger()
+    task = ledger.get(task_id)
+    if task is None:
+        return {"error": "任务记录不存在或已被手动删除。", "task_id": task_id}
+    # Keep the on-screen payload legible. The complete audit trail remains in
+    # outputs/business_tasks/<task_id>.json for export and forensic debugging.
+    return {
+        "task_id": task.get("task_id"),
+        "status": task.get("status"),
+        "status_text": _TASK_STATUS_TEXT.get(task.get("status"), task.get("status")),
+        "created_at": task.get("created_at"),
+        "updated_at": task.get("updated_at"),
+        "output_dir": task.get("output_dir"),
+        "output_metadata_exists": bool(
+            task.get("output_dir")
+            and (Path(task["output_dir"]) / "metadata.json").is_file()
+        ),
+        "remote": task.get("remote"),
+        "last_remote_status": _task_history_last_remote_details(task),
+        "error": task.get("error"),
+        "performance_trace": task.get("performance_trace"),
+        "end_to_end_trace": task.get("end_to_end_trace"),
+        "event_count": len(task.get("history") or []),
+        "recent_events": (task.get("history") or [])[-30:],
+        "full_ledger_path": str(ledger._path(task_id)),
+    }
+
+
+def _task_history_refresh(selected_task_id=None):
+    """Run one bounded reconciliation pass, then refresh the durable index."""
+    try:
+        reconciliation = reconcile_once()
+        note = f"已完成一次远端对账：检查 {len(reconciliation)} 条未结束任务。"
+    except Exception as exc:
+        reconciliation = []
+        note = f"远端对账未完成：{exc}。已保留原有本地任务记录，可稍后重试。"
+    ledger = BusinessTaskLedger()
+    choices = _task_history_choices(ledger)
+    allowed = {value for _, value in choices}
+    selected = selected_task_id if selected_task_id in allowed else (choices[0][1] if choices else None)
+    detail = _task_history_detail(selected, ledger)
+    detail["last_reconciliation"] = reconciliation
+    return _task_history_rows(ledger), gr.update(choices=choices, value=selected), detail, note
+
+
+def _task_history_select(task_id):
+    return _task_history_detail(task_id)
+
+
+def _start_task_reconciliation_worker():
+    """Reconcile after a WebUI restart without delaying the first page render."""
+    def worker():
+        try:
+            summary = reconcile_once()
+            if summary:
+                print(f"Restart-safe remote task reconciliation: {len(summary)} task(s) checked")
+        except Exception:
+            # The history tab exposes the persistent task state and allows a
+            # manual retry. A temporarily unreachable remote API must never
+            # prevent Gradio from starting.
+            traceback.print_exc()
+
+    threading.Thread(target=worker, name="remote-task-reconciliation", daemon=True).start()
+
+
 def build_ui():
     t = _UI_TEXT["zh"]
 
@@ -1512,6 +1700,7 @@ def build_ui():
         with gr.Tabs():
             analysis_tab = gr.Tab("视频分析")
             review_tab = gr.Tab("球路复核")
+            history_tab = gr.Tab("分析任务历史")
 
         with analysis_tab:
             with gr.Row():
@@ -1543,18 +1732,22 @@ def build_ui():
                         label="比赛模式 / Match mode",
                         info="New tracking uses spatial.tracks. Doubles keeps same-side players instead of upper/lower filtering.",
                     )
-                    gr.Markdown("**输出视频：** 原视频人物 + 人体骨架 + 羽毛球标注")
+                    gr.Markdown("**标注视频：** 默认不生成，优先保存可分析数据；需要肉眼复核时可在高级选项开启。")
                     # Preserve the analysis callback contract while preventing
                     # accidental Skeleton-only output in the normal workflow.
                     output_video_style = gr.State(value="annotated")
                     shuttle_detector = gr.Dropdown(
                         choices=[
-                            ("TrackNetV3 原始轨迹（GPU 主流程）", "tracknet_v3"),
-                            ("YOLO 羽毛球检测（旧路径）", "yolo"),
+                            ("不检测羽毛球（最快，仅人物跑位/姿态）", "none"),
+                            ("YOLO 羽毛球检测（默认）", "yolo"),
+                            ("TrackNetV3 羽毛球轨迹增强（较慢）", "tracknet_v3"),
                         ],
-                        value="tracknet_v3",
+                        value="yolo",
                         label="羽毛球检测来源",
-                        info="TrackNet 失败时会明确报错，不会静默改用 YOLO。",
+                        info=(
+                            "不检测会跳过羽毛球模型、球轨迹、击球候选和回合派生；"
+                            "YOLO 为默认平衡方案；TrackNetV3 会额外执行逐帧时序推理。"
+                        ),
                     )
                     pose_imgsz = gr.Dropdown(
                         choices=[640, 960, 1280], value=960, label=t["pose_imgsz"],
@@ -1571,6 +1764,16 @@ def build_ui():
                     )
 
                     with gr.Accordion(t["advanced"], open=False) as adv_accordion:
+                        generate_annotated_video = gr.Checkbox(
+                            value=False,
+                            label="生成标注视频（绘制 + 首次 H.264 编码）",
+                            info="关闭时跳过每帧绘制、临时 MP4 写入和首次视频编码；不会影响人物轨迹、速度、距离、Track ID、JSONL 或统计。",
+                        )
+                        browser_video_reencode = gr.Checkbox(
+                            value=False,
+                            label="浏览器兼容重编码（仅生成标注视频时生效）",
+                            info="在已生成标注视频后再执行一次浏览器兼容转码；仅用于网页播放兼容性，默认关闭以节省时间。",
+                        )
                         show_skeletons = gr.Checkbox(value=True, label=t["skeletons"])
                         show_player_trajectories = gr.Checkbox(value=True, label=t["player_traj"])
                         show_court_trajectory = gr.Checkbox(value=True, label=t["court_traj"])
@@ -1836,6 +2039,36 @@ def build_ui():
                 )
                 identity_notice = gr.Markdown("先选择分析结果后，点击“读取 Track ID”。")
 
+        with history_tab:
+            gr.Markdown(
+                "## 分析任务历史\n"
+                "每次提交、远端接收回执、轮询状态、结果下载和失败信息都会持久化到本机。"
+                "WebUI 重启后不会重复上传；打开本页或点击对账会从远端恢复已确认任务的最新状态。"
+            )
+            initial_task_choices = _task_history_choices()
+            initial_task_id = initial_task_choices[0][1] if initial_task_choices else None
+            with gr.Row():
+                refresh_task_history_btn = gr.Button("刷新并对账远端", variant="primary")
+                task_history_selector = gr.Dropdown(
+                    choices=initial_task_choices,
+                    value=initial_task_id,
+                    label="查看任务详情",
+                    scale=3,
+                )
+            task_history_notice = gr.Markdown("本页未自动重复提交视频；只读取既有业务任务记录并轮询已确认的远端 Job。")
+            task_history_table = gr.Dataframe(
+                value=_task_history_rows(),
+                headers=["业务任务", "发起时间", "当前状态", "远端 Job", "最后进度", "最后阶段", "本地结果", "错误摘要"],
+                datatype=["str", "str", "str", "str", "str", "str", "str", "str"],
+                interactive=False,
+                label="全部已发起分析任务（最新在上）",
+                max_height=360,
+            )
+            task_history_detail = gr.JSON(
+                value=_task_history_detail(initial_task_id),
+                label="任务详情与最近事件（完整账本路径在字段中）",
+            )
+
         console_open_state = gr.State(value=False)
         console_trigger = gr.Button(
             "打开后台输出", size="sm", elem_id="backend-console-trigger",
@@ -1892,6 +2125,24 @@ def build_ui():
             fn=_review_refresh_runs,
             inputs=[review_analysis_dir],
             outputs=[review_analysis_dir],
+            show_progress="hidden",
+        )
+        refresh_task_history_btn.click(
+            fn=_task_history_refresh,
+            inputs=[task_history_selector],
+            outputs=[task_history_table, task_history_selector, task_history_detail, task_history_notice],
+            show_progress="hidden",
+        )
+        history_tab.select(
+            fn=_task_history_refresh,
+            inputs=[task_history_selector],
+            outputs=[task_history_table, task_history_selector, task_history_detail, task_history_notice],
+            show_progress="hidden",
+        )
+        task_history_selector.change(
+            fn=_task_history_select,
+            inputs=[task_history_selector],
+            outputs=[task_history_detail],
             show_progress="hidden",
         )
         open_review_btn.click(
@@ -2036,10 +2287,11 @@ def build_ui():
         run_preflight.then(
             fn=run_full_analysis,
             inputs=[
-                analysis_ready_state, video_input, template_path_state, corners_state,
-                pose_family, pose_mode, language, audio, match_mode, output_video_style, shuttle_detector,
-                pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
-                show_skeletons, show_player_trajectories,
+                 analysis_ready_state, video_input, template_path_state, corners_state,
+                 pose_family, pose_mode, language, audio, match_mode, output_video_style, shuttle_detector,
+                 pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
+                 generate_annotated_video, browser_video_reencode,
+                 show_skeletons, show_player_trajectories,
                 show_court_trajectory, show_shuttlecock_trajectory,
                 show_player_stats, show_pose_roi, visualize_positions,
                 yolo_pose_model, ball_model,
@@ -2062,6 +2314,7 @@ def build_ui():
 
 
 if __name__ == "__main__":
+    _start_task_reconciliation_worker()
     demo = build_ui()
     demo.queue(default_concurrency_limit=1).launch(
         server_name="127.0.0.1",

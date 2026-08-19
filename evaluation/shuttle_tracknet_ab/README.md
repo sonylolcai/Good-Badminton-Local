@@ -75,6 +75,10 @@ SHA-256 会阻止把标注误用到另一份视频；未完成、代理复核或
 - `tracknet_raw\<video>_ball.csv`：B，原始热图检测；
 - `tracknet_rectified\<video>_ball.csv`：B*，修复后的轨迹。
 
+原始 B 的 Good-Badminton 适配器默认以 96 帧为有界解码/预处理块；可传
+`--chunk-frames 64` 降低峰值内存，代价是更多分块切换。该参数不改变模型的逐帧检测
+频率或时间坐标。
+
 ## 3. 运行 A/B 评估
 
 ```powershell

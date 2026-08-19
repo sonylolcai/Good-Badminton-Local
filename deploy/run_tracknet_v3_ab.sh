@@ -24,12 +24,12 @@ TRACKNET_ROOT="$STATE_DIR/models/tracknetv3/source"
 TRACKNET_CHECKPOINT="$STATE_DIR/models/tracknetv3/ckpts/TrackNet_best.pt"
 INPAINT_CHECKPOINT="$STATE_DIR/models/tracknetv3/ckpts/InpaintNet_best.pt"
 RUN_ROOT="$STATE_DIR/tracknet_ab"
-# The official --large_video path streams tiny batches from CPU to avoid RAM
-# exhaustion.  It is substantially slower on our 60 GiB instance and is not
-# needed for normal 2-5 minute match clips.  Enable it only for genuinely long
-# videos or after a measured memory failure.
+# The adapter itself decodes/preprocesses bounded chunks.  This ceiling is
+# independent of video duration and avoids the container OOM that the old
+# full-video frame list could trigger.
 TRACKNET_BATCH_SIZE="${TRACKNET_BATCH_SIZE:-16}"
 TRACKNET_BACKGROUND_SAMPLE_COUNT="${TRACKNET_BACKGROUND_SAMPLE_COUNT:-120}"
+TRACKNET_CHUNK_FRAMES="${TRACKNET_CHUNK_FRAMES:-96}"
 TRACKNET_RECTIFICATION="${TRACKNET_RECTIFICATION:-0}"
 
 fail() {
@@ -48,6 +48,8 @@ fail() {
 [[ "$TRACKNET_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || fail "TRACKNET_BATCH_SIZE must be a positive integer."
 [[ "$TRACKNET_BACKGROUND_SAMPLE_COUNT" =~ ^[1-9][0-9]*$ ]] || \
   fail "TRACKNET_BACKGROUND_SAMPLE_COUNT must be a positive integer."
+[[ "$TRACKNET_CHUNK_FRAMES" =~ ^[1-9][0-9]*$ ]] || \
+  fail "TRACKNET_CHUNK_FRAMES must be a positive integer."
 [[ "$TRACKNET_RECTIFICATION" == "0" || "$TRACKNET_RECTIFICATION" == "1" ]] || \
   fail "TRACKNET_RECTIFICATION must be 0 (default) or 1."
 
@@ -66,6 +68,7 @@ command=(
   --output-dir "$output_dir"
   --batch-size "$TRACKNET_BATCH_SIZE"
   --background-sample-count "$TRACKNET_BACKGROUND_SAMPLE_COUNT"
+  --chunk-frames "$TRACKNET_CHUNK_FRAMES"
 )
 if [[ "$TRACKNET_RECTIFICATION" == "1" && -f "$INPAINT_CHECKPOINT" ]]; then
   command+=(--run-rectified)

@@ -66,7 +66,7 @@ def load_runtime_dependencies():
     SCHEMA_VERSION = _SCHEMA_VERSION
 
 class BadmintonAnalysisSystem:
-    def __init__(self, video_path, show_display=True, 
+    def __init__(self, video_path, show_display=False,
                  show_skeletons=True, show_player_trajectories=True, 
                  show_court_trajectory=True, show_shuttlecock_trajectory=True,
                  show_player_stats=True, show_performance_stats=False, 
@@ -82,14 +82,15 @@ class BadmintonAnalysisSystem:
                  enable_bytetrack=False, lock_match_roster=True,
                  roster_stable_frames=2, shuttle_detector='yolo',
                  tracknet_measurements_path=None, huji_action_model=None,
-                 huji_sample_hz=6.0):
+                 huji_sample_hz=6.0, generate_annotated_video=False,
+                 browser_video_reencode=False):
         self.video_path = video_path
         self.show_display = show_display
         self.language = language
         self.template_path = template_path
         self.ball_model_path = ball_model_path
-        if shuttle_detector not in {'yolo', 'tracknet_v3'}:
-            raise ValueError("shuttle_detector must be 'yolo' or 'tracknet_v3'.")
+        if shuttle_detector not in {'none', 'yolo', 'tracknet_v3'}:
+            raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
         self.shuttle_detector = shuttle_detector
         self.tracknet_measurements_path = tracknet_measurements_path
         # Huji-compatible scene classification is an optional, coarse
@@ -128,6 +129,12 @@ class BadmintonAnalysisSystem:
                 "output_video_style must be 'annotated' or 'skeleton'."
             )
         self.output_video_style = output_video_style
+        # Video rendering is optional. The detector, court mapping, persistent
+        # tracks, JSONL evidence, and reports do not require a rendered MP4.
+        self.generate_annotated_video = bool(generate_annotated_video)
+        self.browser_video_reencode = bool(
+            browser_video_reencode and self.generate_annotated_video
+        )
 
 
         self.show_skeletons = show_skeletons
@@ -184,7 +191,12 @@ class BadmintonAnalysisSystem:
         self.detections_path = os.path.join(self.save_dir, "detections.jsonl")
         self.spatial_match_summary_path = os.path.join(self.save_dir, "spatial_match_summary.json")
         output_prefix = "skeleton" if self.output_video_style == "skeleton" else "detect"
-        self.output_video_path = os.path.join(self.save_dir, f"{output_prefix}_{self.video_name}.mp4")
+        self.output_video_path = (
+            os.path.join(self.save_dir, f"{output_prefix}_{self.video_name}.mp4")
+            if self.generate_annotated_video else None
+        )
+        self.temp_output_video_path = None
+        self.video_writer = None
         self.detection_writer = None
         
 
@@ -347,9 +359,15 @@ class BadmintonAnalysisSystem:
                 "shuttlecock": self.ball_model_path if self.shuttle_detector == 'yolo' else None,
                 "shuttlecock_detection": {
                     "primary_source": self.shuttle_detector,
+                    "enabled": self.shuttle_detector != 'none',
                     "raw_measurements_path": self.tracknet_measurements_path if self.shuttle_detector == 'tracknet_v3' else None,
-                    "measurement_kind": "temporal_heatmap" if self.shuttle_detector == 'tracknet_v3' else "yolo_box_center",
+                    "measurement_kind": (
+                        "not_requested" if self.shuttle_detector == 'none' else
+                        "temporal_heatmap" if self.shuttle_detector == 'tracknet_v3' else
+                        "yolo_box_center"
+                    ),
                     "confidence_policy": (
+                        "not_applicable" if self.shuttle_detector == 'none' else
                         "uncalibrated_binary_visibility_threshold_0.5"
                         if self.shuttle_detector == 'tracknet_v3'
                         else "yolo_model_confidence"
@@ -413,7 +431,18 @@ class BadmintonAnalysisSystem:
                 "video": self.output_video_path,
                 "detections": self.detections_path,
                 "tracknet_raw_csv": self.tracknet_measurements_path if self.shuttle_detector == 'tracknet_v3' else None,
-                "video_style": self.output_video_style,
+                "video_style": self.output_video_style if self.generate_annotated_video else None,
+                "video_generation": {
+                    "enabled": self.generate_annotated_video,
+                    "annotation_drawing": self.generate_annotated_video,
+                    "initial_h264_export": self.generate_annotated_video,
+                    "browser_reencode_requested": self.browser_video_reencode,
+                    "policy": (
+                        "disabled; data artifacts remain complete"
+                        if not self.generate_annotated_video else
+                        "enabled; browser reencode is handled by the pipeline"
+                    ),
+                },
                 "spatial_match_summary": self.spatial_match_summary_path,
             },
             "temporal_tracking": {
@@ -437,9 +466,14 @@ class BadmintonAnalysisSystem:
                     "state_policy": "detected is a measurement; predicted/missing are explicit temporal states and not detector facts",
                 },
                 "shuttlecock": {
+                    "enabled": self.shuttle_detector != 'none',
                     "max_prediction_frames": self.shuttlecock_tracker.max_prediction_frames,
                     "prediction_confidence_decay": self.shuttlecock_tracker.prediction_confidence_decay,
-                    "prediction_usage": "visualization_and_export_only; exclude from hit/error ground truth",
+                    "prediction_usage": (
+                        "not_requested; no shuttle, hit, or rally evidence is generated"
+                        if self.shuttle_detector == 'none' else
+                        "visualization_and_export_only; exclude from hit/error ground truth"
+                    ),
                 },
             },
         }
@@ -477,7 +511,7 @@ class BadmintonAnalysisSystem:
 
 
         if not is_court:
-            output_frame = self._create_output_frame(frame)
+            output_frame = self._create_output_frame(frame) if self._needs_visual_output() else frame
             self._write_output_frame(output_frame, frame_count, out)
             return output_frame, detect_frame_count
 
@@ -506,9 +540,13 @@ class BadmintonAnalysisSystem:
                 self.tracknet_measurements.measurement_for_frame(frame_count - 1),
                 roi_corners=roi_corners,
             )
-        else:
+        elif self.shuttle_detector == 'yolo':
             detected_ball_position = self.shuttlecock_tracker.detect_ball(frame, roi_corners=roi_corners)
             ball_position = self.shuttlecock_tracker.update_trajectory(detected_ball_position, roi_corners)
+        else:
+            # An operator opt-out is not a missing/predicted ball track.
+            detected_ball_position = None
+            ball_position = self.shuttlecock_tracker.mark_not_requested()
         ball_elapsed = time.time() - ball_t0
         
 
@@ -550,51 +588,52 @@ class BadmintonAnalysisSystem:
             and frame_count % self.performance_log_interval_frames == 0
         )
 
-        output_frame = self._create_output_frame(frame)
-        if self.shuttle_detector == 'tracknet_v3':
-            cv2.putText(
-                output_frame,
-                "Shuttle: TrackNetV3 raw",
-                (max(12, self.frame_width - 290), 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (0, 215, 255),
-                2,
-                cv2.LINE_AA,
-            )
-        if self.output_video_style == "annotated" and self.show_pose_roi:
-            cv2.rectangle(output_frame, roi_corners[0], roi_corners[1], (255, 0, 0), 2)
-            cv2.putText(output_frame, "Pose ROI", (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2, cv2.LINE_AA)
-
-        shuttle_draw_t0 = time.time()
-        self.shuttlecock_tracker.handle_visualization(output_frame)
-        shuttle_draw_elapsed = time.time() - shuttle_draw_t0
-
-        t0 = time.time()
-
-        self.player_pose_visualizer.draw_players(
-            frame=output_frame,
-            player_tracker=self.player_tracker, 
-            cached_movement_stats=self.cached_movement_stats,
-            stats_visualizer=(
-                self.stats_visualizer
-                if self.show_player_stats and self.output_video_style == "annotated"
-                else None
-            ),
-            rally_count=self.rally_count,
-            spatial_tracks=spatial_state.get("tracks", []),
-            unassigned_detections=(spatial_state.get("match_roster") or {}).get("unassigned_observations", []),
-        )
-        t1 = time.time()
-        players_draw_elapsed = t1 - t0
-        
-
+        output_frame = frame
+        shuttle_draw_elapsed = 0.0
+        players_draw_elapsed = 0.0
         court_draw_elapsed = 0.0
-        if self.show_court_trajectory and self.output_video_style == "annotated":
+        if self._needs_visual_output():
+            output_frame = self._create_output_frame(frame)
+            if self.shuttle_detector == 'tracknet_v3':
+                cv2.putText(
+                    output_frame,
+                    "Shuttle: TrackNetV3 raw",
+                    (max(12, self.frame_width - 290), 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58,
+                    (0, 215, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            if self.output_video_style == "annotated" and self.show_pose_roi:
+                cv2.rectangle(output_frame, roi_corners[0], roi_corners[1], (255, 0, 0), 2)
+                cv2.putText(output_frame, "Pose ROI", (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2, cv2.LINE_AA)
+
+            shuttle_draw_t0 = time.time()
+            if self.shuttle_detector != 'none':
+                self.shuttlecock_tracker.handle_visualization(output_frame)
+            shuttle_draw_elapsed = time.time() - shuttle_draw_t0
+
             t0 = time.time()
-            output_frame = self.court_trajectory_visualizer.draw_overlay(output_frame, self.player_tracker.court_history)
-            t1 = time.time()
-            court_draw_elapsed = t1 - t0
+            self.player_pose_visualizer.draw_players(
+                frame=output_frame,
+                player_tracker=self.player_tracker,
+                cached_movement_stats=self.cached_movement_stats,
+                stats_visualizer=(
+                    self.stats_visualizer
+                    if self.show_player_stats and self.output_video_style == "annotated"
+                    else None
+                ),
+                rally_count=None if self.shuttle_detector == 'none' else self.rally_count,
+                spatial_tracks=spatial_state.get("tracks", []),
+                unassigned_detections=(spatial_state.get("match_roster") or {}).get("unassigned_observations", []),
+            )
+            players_draw_elapsed = time.time() - t0
+
+            if self.show_court_trajectory and self.output_video_style == "annotated":
+                t0 = time.time()
+                output_frame = self.court_trajectory_visualizer.draw_overlay(output_frame, self.player_tracker.court_history)
+                court_draw_elapsed = time.time() - t0
 
         if should_log_performance:
             print(
@@ -761,6 +800,10 @@ class BadmintonAnalysisSystem:
             canvas, _ = self.court_mapper.draw_court_overlay(canvas)
         return canvas
 
+    def _needs_visual_output(self):
+        """Whether this run needs an annotated frame for any media sink."""
+        return bool(self.generate_annotated_video or self.show_display or self.save_images)
+
     def _write_output_frame(self, frame, frame_count, out):
         """Write every source frame so the exported video keeps its full timeline."""
         if frame is None:
@@ -768,7 +811,8 @@ class BadmintonAnalysisSystem:
         if self.show_display:
             cv2.imshow('frame', frame)
             cv2.waitKey(1)
-        out.write(frame)
+        if out is not None:
+            out.write(frame)
         if self.save_images:
             cv2.imwrite(os.path.join(self.images_save_dir, f"{frame_count}.png"), frame)
 
@@ -818,7 +862,8 @@ class BadmintonAnalysisSystem:
         return template_gray, template_color
 
     def _setup_video_writer(self, frame_width, frame_height, fps):
-
+        if not self.generate_annotated_video:
+            return None
         self.temp_output_video_path = os.path.join(self.save_dir, f"temp_detect_{self.video_name}.mp4")
         
 
@@ -873,61 +918,74 @@ class BadmintonAnalysisSystem:
         if self.detection_writer is not None:
             self.detection_writer.close()
             self.detection_writer = None
-        try:
-            if state_callback is not None:
-                state_callback({"phase": "post_processing", "stage": "offline_shot_reconstruction"})
-            from .analysis.offline_shot_reconstruction import generate_offline_artifacts
-            from .analysis.huji_play_state import HUJI_PLAY_STATE_FILENAME, generate_huji_play_state
-
-            play_state_path = None
-            if self.huji_action_model:
-                play_state_path = os.path.join(self.save_dir, "derived", HUJI_PLAY_STATE_FILENAME)
-                try:
-                    if state_callback is not None:
-                        state_callback({"phase": "post_processing", "stage": "huji_play_state"})
-                    play_state_result = generate_huji_play_state(
-                        self.video_path,
-                        self.huji_action_model,
-                        play_state_path,
-                        sample_hz=self.huji_sample_hz,
-                    )
-                    print(
-                        "Huji-compatible play-state: "
-                        f"{play_state_result['sample_count']} samples at "
-                        f"{play_state_result['sample_hz']:.2f}Hz"
-                    )
-                except Exception as play_state_error:
-                    # The core detector output remains valid when an optional
-                    # scene model is absent, invalid, or not yet deployed.
-                    print(f"Huji-compatible play-state unavailable: {play_state_error}")
-                    play_state_path = None
-
-            self.offline_artifacts = generate_offline_artifacts(
-                self.detections_path,
-                fps=getattr(self, "fps", None),
-                play_state_path=play_state_path,
-            )
-            # ``metadata.json`` is the WebUI's compact result manifest.  Keep
-            # derived paths/counts here so a finished run exposes its candidate
-            # rally and shot summary without modifying immutable detections.
+        if self.shuttle_detector == 'none':
+            # Keep raw person evidence usable without fabricating an empty
+            # shot/rally artifact from a run that opted out of ball evidence.
+            self.offline_artifacts = {
+                "status": "not_requested",
+                "reason": "shuttle_detector=none",
+                "policy": "ball trajectories, hit candidates, and rally derivation were not requested",
+            }
             if os.path.isfile(self.metadata_path):
                 with open(self.metadata_path, "r", encoding="utf-8") as source:
                     metadata = json.load(source)
                 metadata["derived"] = self.offline_artifacts
                 write_json(self.metadata_path, metadata)
-            print(
-                "Offline shuttle reconstruction: "
-                f"{self.offline_artifacts['frame_count']} frames, "
-                f"{self.offline_artifacts['event_count']} candidate shots, "
-                f"{self.offline_artifacts.get('rally_count', 0)} candidate rallies, "
-                f"{self.offline_artifacts.get('inferred_shot_count', 0)} motion-inferred shots"
-            )
-        except Exception as exc:
-            # The annotated video and immutable detections are still usable if
-            # a post-processing artifact fails. Do not silently claim derived
-            # shot data exists; leave a visible console diagnostic instead.
-            self.offline_artifacts = {"status": "failed", "error": str(exc)}
-            print(f"Offline shuttle reconstruction failed: {exc}")
+        else:
+            try:
+                if state_callback is not None:
+                    state_callback({"phase": "post_processing", "stage": "offline_shot_reconstruction"})
+                from .analysis.offline_shot_reconstruction import generate_offline_artifacts
+                from .analysis.huji_play_state import HUJI_PLAY_STATE_FILENAME, generate_huji_play_state
+
+                play_state_path = None
+                if self.huji_action_model:
+                    play_state_path = os.path.join(self.save_dir, "derived", HUJI_PLAY_STATE_FILENAME)
+                    try:
+                        if state_callback is not None:
+                            state_callback({"phase": "post_processing", "stage": "huji_play_state"})
+                        play_state_result = generate_huji_play_state(
+                            self.video_path,
+                            self.huji_action_model,
+                            play_state_path,
+                            sample_hz=self.huji_sample_hz,
+                        )
+                        print(
+                            "Huji-compatible play-state: "
+                            f"{play_state_result['sample_count']} samples at "
+                            f"{play_state_result['sample_hz']:.2f}Hz"
+                        )
+                    except Exception as play_state_error:
+                        # The core detector output remains valid when an optional
+                        # scene model is absent, invalid, or not yet deployed.
+                        print(f"Huji-compatible play-state unavailable: {play_state_error}")
+                        play_state_path = None
+
+                self.offline_artifacts = generate_offline_artifacts(
+                    self.detections_path,
+                    fps=getattr(self, "fps", None),
+                    play_state_path=play_state_path,
+                )
+                # ``metadata.json`` is the WebUI's compact result manifest. Keep
+                # derived paths/counts here without changing raw detections.
+                if os.path.isfile(self.metadata_path):
+                    with open(self.metadata_path, "r", encoding="utf-8") as source:
+                        metadata = json.load(source)
+                    metadata["derived"] = self.offline_artifacts
+                    write_json(self.metadata_path, metadata)
+                print(
+                    "Offline shuttle reconstruction: "
+                    f"{self.offline_artifacts['frame_count']} frames, "
+                    f"{self.offline_artifacts['event_count']} candidate shots, "
+                    f"{self.offline_artifacts.get('rally_count', 0)} candidate rallies, "
+                    f"{self.offline_artifacts.get('inferred_shot_count', 0)} motion-inferred shots"
+                )
+            except Exception as exc:
+                # The annotated video and immutable detections are still usable if
+                # a post-processing artifact fails. Do not silently claim derived
+                # shot data exists; leave a visible console diagnostic instead.
+                self.offline_artifacts = {"status": "failed", "error": str(exc)}
+                print(f"Offline shuttle reconstruction failed: {exc}")
 
         # Start the single bounded report request before the optional audio
         # remux/export stage. Report generation depends on the finalized
@@ -959,35 +1017,48 @@ class BadmintonAnalysisSystem:
             }
             print(f"Performance report generation failed: {exc}")
 
-        if state_callback is not None:
-            state_callback({"phase": "post_processing", "stage": "video_writer_finalize"})
-        if hasattr(self, 'video_writer') and self.video_writer is not None:
-            self.video_writer.release()
-            time.sleep(1)
+        if self.generate_annotated_video:
+            if state_callback is not None:
+                state_callback({"phase": "post_processing", "stage": "video_writer_finalize"})
+            if self.video_writer is not None:
+                self.video_writer.release()
+                time.sleep(1)
 
+            cap.release()
+            if self.show_display:
+                cv2.destroyAllWindows()
+
+            if state_callback is not None:
+                state_callback({"phase": "post_processing", "stage": "annotated_video_export"})
+            if hasattr(self, 'keep_audio') and self.keep_audio:
+                export_ok = vap.process_video_with_audio(
+                    video_path=self.video_path,
+                    temp_video_path=self.temp_output_video_path,
+                    output_path=self.output_video_path,
+                    save_dir=self.save_dir
+                )
+            else:
+                export_ok = vap.process_video_without_audio(
+                    temp_video_path=self.temp_output_video_path,
+                    output_path=self.output_video_path
+                )
+            if not export_ok:
+                raise RuntimeError(
+                    "Annotated video export failed. Open the backend console for the FFmpeg error."
+                )
+            return
+
+        # Data-only mode avoids the temporary writer and both FFmpeg export
+        # passes. Detector and analytics artifacts above are already final.
         cap.release()
-
         if self.show_display:
             cv2.destroyAllWindows()
-
         if state_callback is not None:
-            state_callback({"phase": "post_processing", "stage": "annotated_video_export"})
-        if hasattr(self, 'keep_audio') and self.keep_audio:
-            export_ok = vap.process_video_with_audio(
-                video_path=self.video_path,
-                temp_video_path=self.temp_output_video_path,
-                output_path=self.output_video_path,
-                save_dir=self.save_dir
-            )
-        else:
-            export_ok = vap.process_video_without_audio(
-                temp_video_path=self.temp_output_video_path,
-                output_path=self.output_video_path
-            )
-        if not export_ok:
-            raise RuntimeError(
-                "Annotated video export failed. Open the backend console for the FFmpeg error."
-            )
+            state_callback({
+                "phase": "post_processing",
+                "stage": "annotated_video_export_skipped",
+                "stage_detail": {"reason": "generate_annotated_video=false"},
+            })
 
     def analyze_shuttlecock(self, roi_corners, corners):
         """Hit-point analysis is currently disabled."""

@@ -253,7 +253,9 @@ RTMPose 模型档位：
 --template-path              球场模板图路径；不传时会弹出文件选择框
 --pose-roi true|false                是否显示姿态检测 ROI 框，默认 true
 --output-video-style annotated|skeleton  输出原视频标注或匿名骨架视频，默认 annotated
---display true|false                 是否显示 OpenCV 预览窗口，默认 true
+--generate-annotated-video true|false    是否绘制并导出标注视频，默认 false；关闭不影响 JSONL、轨迹、速度、距离和统计
+--browser-video-reencode true|false      是否额外做浏览器兼容重编码，仅在生成标注视频时生效，默认 false
+--display true|false                 是否显示 OpenCV 预览窗口；开启会保留绘制但不导出视频，默认 false
 --skeletons true|false               是否显示人体骨架，默认 true
 --player-trajectories true|false     是否显示球员轨迹，默认 true
 --court-trajectory true|false        是否显示球场轨迹叠加层，默认 true
@@ -262,7 +264,7 @@ RTMPose 模型档位：
 --performance-stats                  打印性能耗时
 --save-images                        保存处理后的每帧图像
 --visualize-positions true|false     是否生成热力图和散点图，默认 true
---audio true|false                   是否保留原视频音频，默认 true
+--audio true|false                   是否保留原视频音频，仅在生成标注视频时生效，默认 true
 --language {zh,en}           选择界面语言
 ```
 
@@ -272,7 +274,7 @@ RTMPose 模型档位：
 
 - `metadata.json`：视频、模型、球场标注和输出文件元数据。
 - `detections.jsonl`：逐帧检测记录，包含回合编号、球员、手部、球场坐标、速度、羽毛球坐标，以及人体落点的真实/降级/缺失状态、置信度和推理来源。羽毛球额外记录 `detected / predicted / missing`、候选数量、过滤原因和短缺口长度；`predicted` 只能用于连续显示和低权重轨迹，不应当作击球/失误真值。
-- `detect_<视频文件名>.mp4`：带骨架、轨迹、统计信息和回合编号叠加层的输出视频。
+- `detect_<视频文件名>.mp4`：可选的带骨架、轨迹、统计信息和回合编号叠加层的输出视频；只有 `--generate-annotated-video true` 才生成。
 - `court_annotations.txt`：球场标注坐标缓存。
 - `position_visualizations/heatmaps/`：球员位置热力图。
 - `position_visualizations/scatter_plots/`：球员位置散点图。
