@@ -158,7 +158,14 @@ def _normalize_court_corners(points):
 
 
 def apply_manual_corners(template_file, corners_state):
-    """Re-run court resolution with manually clicked corners."""
+    """Confirm the four detected or manually selected court corners.
+
+    ``corners_state`` is the canonical resolved state: automatic detection
+    writes its four points there, and the manual click handler only writes it
+    once the fourth point has been selected.  The separate click accumulator
+    is intentionally not accepted here because it remains empty after a
+    successful automatic detection.
+    """
     if not template_file:
         raise gr.Error("Please generate or upload a court template first.")
     if not corners_state or len(corners_state) != 4:
@@ -2006,7 +2013,10 @@ def build_ui():
 
         apply_btn.click(
             fn=apply_manual_corners,
-            inputs=[template_path_state, click_corners_state],
+            # Automatic detection produces ``corners_state`` directly. Manual
+            # clicks promote their completed four-point set into the same
+            # state, so both paths use one canonical input at confirmation.
+            inputs=[template_path_state, corners_state],
             outputs=[court_image, corners_state, analysis_ready_state],
         ).then(
             fn=lambda c, lang: _UI_TEXT.get(lang, _UI_TEXT["zh"])["manual_ok"].format(len(c)) if c
