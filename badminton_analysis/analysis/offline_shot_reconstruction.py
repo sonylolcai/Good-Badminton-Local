@@ -18,6 +18,8 @@ from pathlib import Path
 from statistics import median
 from typing import Iterable
 
+from .huji_play_state import HUJI_PLAY_STATE_FILENAME, load_huji_play_state, terminal_play_context
+
 
 DERIVED_DIRNAME = "derived"
 SHUTTLE_TRACK_FILENAME = "shuttle_tracks_v2.jsonl"
@@ -25,10 +27,10 @@ SHOT_EVENT_FILENAME = "shot_events_v2.jsonl"
 RALLY_FILENAME = "rallies_v2.jsonl"
 TERMINAL_CANDIDATE_FILENAME = "terminal_candidates_v1.jsonl"
 RALLY_BOUNDARY_REFERENCE_FILENAME = "rally_boundary_reference_user_review.jsonl"
-DERIVATION_VERSION = "2.3"
+DERIVATION_VERSION = "2.4"
 
 
-def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
+def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_state_path=None):
     """Create versioned derived artifacts next to immutable detector output."""
     detections_path = Path(detections_path)
     rows = load_jsonl(detections_path)
@@ -36,6 +38,8 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
         raise ValueError("detections.jsonl is empty; offline reconstruction has no evidence")
     output_dir = Path(output_dir) if output_dir else detections_path.parent / DERIVED_DIRNAME
     output_dir.mkdir(parents=True, exist_ok=True)
+    configured_play_state_path = Path(play_state_path) if play_state_path else output_dir / HUJI_PLAY_STATE_FILENAME
+    play_state_rows = load_huji_play_state(configured_play_state_path)
     fps = float(fps or infer_fps(rows) or 30.0)
     width, height = video_dimensions(detections_path.parent)
     track_rows = reconstruct_shuttle_track(rows, fps=fps, width=width, height=height)
@@ -48,6 +52,7 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
         raw_rows=rows,
         court_polygon=court_polygon,
     )
+    terminal_candidates = apply_huji_play_state_context(terminal_candidates, play_state_rows)
     # A static visual false-positive is especially harmful here: it turns one
     # rally into two.  Every accepted boundary retains its evidence source and
     # confidence; manual references are never an input to this calculation.
@@ -75,6 +80,15 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None):
         "event_count": len(events),
         "rally_count": len(rallies),
         "terminal_candidate_count": len(terminal_candidates),
+        "play_state": {
+            "path": str(configured_play_state_path) if configured_play_state_path.is_file() else None,
+            "status": "available" if play_state_rows else "not_available",
+            "sample_count": len(play_state_rows),
+            "policy": (
+                "Huji-compatible scene state can only reduce a direction-reversal-after-gap "
+                "candidate when active play continues; it is never terminal or score proof."
+            ),
+        },
         "observed_shot_count": sum(event.get("event_origin") == "machine_candidate" for event in events),
         "inferred_shot_count": sum(event.get("event_origin") == "motion_constraint_candidate" for event in events),
         "fps": fps,
@@ -203,12 +217,15 @@ def build_shot_events(raw_rows, track_rows, fps=30.0):
                 }
             )
     seeds.extend(_trajectory_turn_seeds(track_rows))
+    seeds.extend(_trajectory_heading_change_near_hand_seeds(raw_rows, track_rows))
+    seeds.extend(_reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows))
     seeds = _deduplicate_seeds(seeds)
     events = []
     for index, seed in enumerate(seeds, start=1):
         raw = _row_at_frame(raw_rows, seed["frame"])
         track = by_frame.get(seed["frame"])
         hitter = _hitter_evidence(raw, track, seed.get("hitter_track_id"))
+        event_origin = seed.get("event_origin", "machine_candidate")
         events.append(
             {
                 "schema_version": DERIVATION_VERSION,
@@ -218,9 +235,13 @@ def build_shot_events(raw_rows, track_rows, fps=30.0):
                 "status": "candidate",
                 "candidate_source": seed["source"],
                 "candidate_reason": seed.get("reason"),
-                "event_origin": "machine_candidate",
+                "event_origin": event_origin,
                 "time_confidence": round(min(0.55, float(seed["confidence"])), 4),
-                "trajectory": _event_trajectory_evidence(track_rows, seed["time_sec"]),
+                "trajectory": (
+                    _missing_shuttle_trajectory()
+                    if event_origin == "motion_constraint_candidate"
+                    else _event_trajectory_evidence(track_rows, seed["time_sec"])
+                ),
                 "hitter": hitter,
                 "receiver": {"track_id": None, "confidence": 0.0, "source": "not_yet_inferred"},
                 "proposal": {"label": "unknown", "confidence": 0.0, "status": "needs_human_review"},
@@ -612,6 +633,36 @@ def _terminal_candidate(time_sec, source, confidence, **evidence):
     }
 
 
+def apply_huji_play_state_context(candidates, play_state_rows):
+    """Preserve Huji-compatible scene evidence without treating it as a boundary.
+
+    The only automatic change is deliberately narrow: a
+    ``direction_reversal_after_gap`` candidate is a common source of false
+    splits when the shuttle is lost briefly.  If a separate scene classifier
+    sees active play *continue* beyond that candidate, its confidence is
+    lowered below the default splitting threshold.  Landing, boundary-exit,
+    stationary-shuttle, manual, and score data are never overridden.
+    """
+    adjusted = []
+    for original in candidates or []:
+        candidate = dict(original)
+        evidence = dict(candidate.get("evidence") or {})
+        context = terminal_play_context(play_state_rows, candidate.get("time_sec", 0.0))
+        if context is not None:
+            evidence["play_state_context"] = context
+            candidate["evidence"] = evidence
+            if candidate.get("source") == "direction_reversal_after_gap":
+                candidate["confidence_before_play_state"] = candidate.get("confidence")
+                candidate["confidence"] = round(min(float(candidate.get("confidence") or 0.0), 0.64), 4)
+                candidate["status"] = "candidate_conflicted_by_active_play"
+                candidate["review_reason"] = (
+                    "Active-play scene evidence continues after a shuttle-gap direction reversal; "
+                    "do not automatically split without additional terminal evidence."
+                )
+        adjusted.append(candidate)
+    return adjusted
+
+
 def _deduplicate_terminal_candidates(candidates, merge_window_sec=1.0):
     """Keep the strongest explanation in a local time cluster, preserving sources."""
     clusters = []
@@ -836,12 +887,136 @@ def _trajectory_turn_seeds(track_rows):
     return seeds
 
 
+def _trajectory_heading_change_near_hand_seeds(raw_rows, track_rows):
+    """Find a contact-shaped 2D turn only when a detected hand supports it.
+
+    A return seen by a fixed camera often changes from a fast vertical descent
+    into a horizontal or diagonal departure.  That is a sharp heading change,
+    but not necessarily a 180-degree reversal, so ``_trajectory_turn_seeds``
+    deliberately does not cover it.  A player hand close to the *raw detected*
+    shuttle position is required to keep an ordinary curved flight from
+    becoming a hit candidate.
+
+    This emits a review candidate, never a confirmed contact or a score fact.
+    """
+    raw_by_frame = {int(item.get("frame", 0)): item for item in raw_rows}
+    observed = [item for item in track_rows if item.get("status") == "detected"]
+    seeds = []
+    for before, current, after in zip(observed, observed[1:], observed[2:]):
+        if before.get("trajectory_id") != current.get("trajectory_id") or current.get("trajectory_id") != after.get("trajectory_id"):
+            continue
+        dt_before = float(current["time_sec"]) - float(before["time_sec"])
+        dt_after = float(after["time_sec"]) - float(current["time_sec"])
+        if not (0.02 <= dt_before <= 0.30 and 0.02 <= dt_after <= 0.30):
+            continue
+        incoming = _velocity(before["image_xy"], current["image_xy"], dt_before)
+        outgoing = _velocity(current["image_xy"], after["image_xy"], dt_after)
+        incoming_speed = math.hypot(*incoming)
+        outgoing_speed = math.hypot(*outgoing)
+        cosine = _cosine(incoming, outgoing)
+        # ``cosine <= 0.45`` is an approximately 63-degree turn.  The speed
+        # and hand gates below make this stricter than a generic trajectory
+        # curvature test while retaining down-to-side returns.
+        if min(incoming_speed, outgoing_speed) < 400.0 or cosine > 0.45:
+            continue
+        hitter = _hitter_evidence(raw_by_frame.get(int(current["frame"])), current, None)
+        if hitter.get("source") != "visible_hand_proximity" or float(hitter.get("distance_px") or math.inf) > 140.0:
+            continue
+        hand_support = max(0.0, 1.0 - float(hitter["distance_px"]) / 140.0)
+        turn_strength = max(0.0, min(1.0, (0.45 - cosine) / 1.45))
+        confidence = min(0.42, 0.16 + 0.14 * hand_support + 0.12 * turn_strength)
+        seeds.append(
+            {
+                "frame": int(current["frame"]),
+                "time_sec": float(current["time_sec"]),
+                "source": "trajectory_heading_change_near_hand",
+                "confidence": confidence,
+                "hitter_track_id": None,
+                "reason": (
+                    "fast 2d heading change near visible hand "
+                    f"cosine={cosine:.2f}; hand_distance_px={float(hitter['distance_px']):.1f}; "
+                    "offline review required"
+                ),
+            }
+        )
+    return seeds
+
+
+def _reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, max_hand_distance_px=100.0):
+    """Turn a short TrackNet gap near a hand into an explicitly inferred cue.
+
+    The shuttle coordinate within a reconstructed gap is not a detector
+    measurement.  It is nevertheless useful review evidence when the bounded
+    interpolation crosses a visible player's hand.  One strongest cue is kept
+    per interpolation gap; it is marked ``motion_constraint_candidate`` so it
+    cannot contribute a fabricated observed speed or a confirmed shot count.
+    """
+    raw_by_frame = {int(item.get("frame", 0)): item for item in raw_rows}
+    grouped = {}
+    for current in track_rows:
+        if current.get("status") != "reconstructed":
+            continue
+        provenance = current.get("provenance") or {}
+        if provenance.get("kind") != "bidirectional_linear_interpolation" or int(provenance.get("gap_frames") or 0) < 2:
+            continue
+        hitter = _hitter_evidence(raw_by_frame.get(int(current["frame"])), current, None)
+        distance = float(hitter.get("distance_px") or math.inf)
+        if hitter.get("source") != "visible_hand_proximity" or distance > float(max_hand_distance_px):
+            continue
+        key = (
+            provenance.get("before_frame"),
+            provenance.get("after_frame"),
+            hitter.get("track_id"),
+        )
+        existing = grouped.get(key)
+        if existing is None or distance < existing["distance"]:
+            grouped[key] = {"track": current, "hitter": hitter, "distance": distance, "provenance": provenance}
+
+    seeds = []
+    for item in grouped.values():
+        current = item["track"]
+        support = max(0.0, 1.0 - item["distance"] / float(max_hand_distance_px))
+        seeds.append(
+            {
+                "frame": int(current["frame"]),
+                "time_sec": float(current["time_sec"]),
+                "source": "reconstructed_gap_hand_proximity",
+                "confidence": min(0.22, 0.10 + 0.12 * support),
+                "hitter_track_id": None,
+                "event_origin": "motion_constraint_candidate",
+                "reason": (
+                    "short TrackNet gap interpolates near a visible hand "
+                    f"distance_px={item['distance']:.1f}; gap_frames={int(item['provenance']['gap_frames'])}; "
+                    "inferred candidate, not a detector measurement"
+                ),
+            }
+        )
+    return seeds
+
+
 def _deduplicate_seeds(seeds, min_gap_sec=0.35):
-    priority = {"spatial_hit_candidate": 2, "trajectory_turn": 1}
+    priority = {
+        "spatial_hit_candidate": 3,
+        "trajectory_heading_change_near_hand": 2,
+        "trajectory_turn": 1,
+        "reconstructed_gap_hand_proximity": 0,
+    }
     grouped = []
     for seed in sorted(seeds, key=lambda item: item["time_sec"]):
         if grouped and seed["time_sec"] - grouped[-1]["time_sec"] <= min_gap_sec:
             previous = grouped[-1]
+            sources = {previous.get("source"), seed.get("source")}
+            # A review-supported rapid exchange can be roughly 0.3 seconds
+            # apart.  A short reconstructed gap is a distinct *inferred* cue
+            # once it is more than 0.20 seconds after a hand-supported turn;
+            # only merge it when it is temporally indistinguishable from the
+            # observed contact it might be explaining.
+            if (
+                "reconstructed_gap_hand_proximity" in sources
+                and abs(float(seed["time_sec"]) - float(previous["time_sec"])) > 0.20
+            ):
+                grouped.append(seed)
+                continue
             if (priority.get(seed["source"], 0), seed["confidence"]) >= (priority.get(previous["source"], 0), previous["confidence"]):
                 grouped[-1] = seed
             continue

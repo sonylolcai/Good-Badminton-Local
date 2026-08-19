@@ -262,6 +262,7 @@ class PlayerPoseVisualizer:
         stats_visualizer=None,
         rally_count=0,
         spatial_tracks=None,
+        unassigned_detections=None,
     ):
         if self.show_skeletons and self.current_pose_data is not None:
             t0 = time.time()
@@ -281,6 +282,7 @@ class PlayerPoseVisualizer:
                 spatial_tracks,
                 draw_trajectory=self.show_player_trajectories,
             )
+            self._draw_unassigned_detections(frame, unassigned_detections)
         else:
             # Compatibility rendering for older callers. New analysis passes
             # spatial tracks and never uses upper/lower as an identity source.
@@ -356,12 +358,51 @@ class PlayerPoseVisualizer:
                 label = f"{label} {track['team_id']}"
             if status != "detected":
                 label = f"{label} ({status})"
+            association = track.get("association") or {}
+            try:
+                identity_confidence = float(association.get("identity_confidence", 1.0))
+            except (TypeError, ValueError):
+                identity_confidence = 1.0
+            if status == "detected" and identity_confidence < 0.7:
+                # The box is real, but the long-occlusion association is not
+                # strong enough for individual statistics until it stabilizes.
+                label = f"{label} (recovered {identity_confidence:.0%})"
             cv2.putText(
                 frame,
                 label,
                 (position[0] + 8, max(16, position[1] - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+    @staticmethod
+    def _draw_unassigned_detections(frame, detections):
+        """Show real candidates that the fixed roster could not safely name."""
+        color = (0, 110, 255)
+        for detection in detections or []:
+            bbox = detection.get("bbox_xyxy")
+            if bbox is None or len(bbox) < 4:
+                continue
+            try:
+                x1, y1, x2, y2 = (int(round(float(value))) for value in bbox[:4])
+            except (TypeError, ValueError):
+                continue
+            if x2 <= x1 or y2 <= y1:
+                continue
+            PlayerPoseVisualizer._draw_dashed_rectangle(frame, (x1, y1), (x2, y2), color)
+            try:
+                confidence = float(detection.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            cv2.putText(
+                frame,
+                f"candidate / unassigned {confidence:.0%}",
+                (x1, max(16, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
                 color,
                 1,
                 cv2.LINE_AA,

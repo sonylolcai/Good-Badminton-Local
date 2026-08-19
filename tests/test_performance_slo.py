@@ -24,6 +24,13 @@ class PerformanceSloTests(unittest.TestCase):
         sampled_60 = [index for index in range(1, 20) if system._should_sample_pose(index)]
         self.assertEqual(sampled_60, [1, 7, 13, 19])
 
+    def test_zero_pose_sample_hz_processes_every_source_frame(self):
+        system = object.__new__(BadmintonAnalysisSystem)
+        system.pose_sample_hz = 0.0
+        system.fps = 50.0
+
+        self.assertTrue(all(system._should_sample_pose(index) for index in range(1, 31)))
+
     def test_pose_keypoints_remain_tied_to_their_measurement_frame(self):
         tracker = CourtMultiObjectTracker(CourtSpace(self.CORNERS), fps=10)
         observation = {
@@ -39,12 +46,37 @@ class PerformanceSloTests(unittest.TestCase):
         }
         detected = tracker.update(1, [observation])[0]
         self.assertTrue(detected["location_evidence"]["is_current_measurement"])
-        self.assertEqual(len(detected["location_evidence"]["keypoints_image"]), 17)
+        self.assertTrue(detected["pose"]["is_current_measurement"])
+        self.assertEqual(detected["pose"]["measurement_frame"], 1)
+        self.assertEqual(len(detected["pose"]["keypoints_image"]), 17)
+        self.assertEqual(len(detected["pose"]["keypoint_scores"]), 17)
 
         predicted = tracker.update(2, [])[0]
         self.assertEqual(predicted["status"], "predicted")
         self.assertFalse(predicted["location_evidence"]["is_current_measurement"])
         self.assertEqual(predicted["location_evidence"]["measurement_frame"], 1)
+        self.assertFalse(predicted["pose"]["is_current_measurement"])
+        self.assertIsNone(predicted["pose"]["measurement_frame"])
+        self.assertEqual(predicted["pose"]["last_measurement_frame"], 1)
+        self.assertIsNone(predicted["pose"]["keypoints_image"])
+        self.assertIsNone(predicted["pose"]["keypoint_scores"])
+
+    def test_pose_contract_preserves_invisible_joint_slots(self):
+        tracker = CourtMultiObjectTracker(CourtSpace(self.CORNERS), fps=10)
+        observation = {
+            "court_xy": (2.0, 2.0),
+            "image_xy": (200.0, 200.0),
+            "confidence": 0.9,
+            "keypoints_image": [[float(index), float(index + 1)] if index != 5 else None for index in range(17)],
+            "keypoint_scores": [0.8] * 17,
+        }
+
+        record = tracker.update(1, [observation])[0]["pose"]
+
+        self.assertEqual(record["format"], "coco17_image_v1")
+        self.assertEqual(len(record["keypoints_image"]), 17)
+        self.assertIsNone(record["keypoints_image"][5])
+        self.assertEqual(record["keypoint_scores"][5], 0.8)
 
     def test_report_evidence_is_available_without_claiming_an_llm_response(self):
         with tempfile.TemporaryDirectory() as directory:

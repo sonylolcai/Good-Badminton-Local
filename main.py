@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--pose-mode', default='balanced', choices=['lightweight', 'balanced', 'performance'], help='RTMPose / RTMO 模型档位')
     parser.add_argument('--yolo-pose-model', default='weights/yolo11n-pose.pt', type=str, help='YOLO pose 模型路径或模型名')
     parser.add_argument('--pose-imgsz', default=1280, type=int, choices=[640, 960, 1280], help='YOLO Pose 全画面推理尺寸，当前固定机位基线推荐1280')
+    parser.add_argument('--pose-sample-hz', default=0.0, type=float, help='姿态采样频率；0 表示每个源视频帧均推理并保存 17 个关节，正数为降采样')
     parser.add_argument('--pose-conf', default=0.15, type=float, help='YOLO Pose 人体置信阈值，固定低清机位默认0.15')
     parser.add_argument('--far-player-enhancement', choices=['true', 'false'], default='false', help='启用全场640加远端ROI二次640检测，默认关闭')
     parser.add_argument('--far-pose-roi', type=normalized_roi, default=(0.12, 0.30, 0.86, 0.82), help='相对于姿态ROI的远端检测区域 x1,y1,x2,y2')
@@ -81,6 +82,7 @@ def main():
         show_pose_roi=args.pose_roi == 'true',
         output_video_style=args.output_video_style,
         pose_imgsz=args.pose_imgsz,
+        pose_sample_hz=args.pose_sample_hz,
         pose_conf=args.pose_conf,
         far_player_enhancement=args.far_player_enhancement == 'true',
         far_pose_roi=args.far_pose_roi,

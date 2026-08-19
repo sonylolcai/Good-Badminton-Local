@@ -6,6 +6,8 @@ import tkinter as tk
 import time
 import argparse
 
+from .cancellation import raise_if_cancelled
+
 
 def load_runtime_dependencies():
     """Load heavy runtime dependencies after argparse has handled --help."""
@@ -73,13 +75,14 @@ class BadmintonAnalysisSystem:
                  pose_mode='balanced', pose_family='rtmpose',
                  yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True,
                  output_video_style='annotated', pose_imgsz=960,
-                 pose_sample_hz=10.0,
+                 pose_sample_hz=0.0,
                  pose_conf=0.15, far_player_enhancement=False,
                  far_pose_roi=(0.12, 0.30, 0.86, 0.82), net_image_line=None,
                  match_mode='singles', tracker_backend='court_association',
                  enable_bytetrack=False, lock_match_roster=True,
                  roster_stable_frames=2, shuttle_detector='yolo',
-                 tracknet_measurements_path=None):
+                 tracknet_measurements_path=None, huji_action_model=None,
+                 huji_sample_hz=6.0):
         self.video_path = video_path
         self.show_display = show_display
         self.language = language
@@ -89,14 +92,22 @@ class BadmintonAnalysisSystem:
             raise ValueError("shuttle_detector must be 'yolo' or 'tracknet_v3'.")
         self.shuttle_detector = shuttle_detector
         self.tracknet_measurements_path = tracknet_measurements_path
+        # Huji-compatible scene classification is an optional, coarse
+        # post-processing prior.  It is intentionally opt-in because the
+        # published Huji repository does not bundle a reviewed badminton
+        # classifier checkpoint with this project.
+        self.huji_action_model = huji_action_model or os.environ.get("GOOD_BADMINTON_HUJI_ACTION_MODEL")
+        self.huji_sample_hz = float(os.environ.get("GOOD_BADMINTON_HUJI_SAMPLE_HZ", huji_sample_hz))
+        if self.huji_sample_hz <= 0:
+            raise ValueError("huji_sample_hz must be greater than 0")
         self.pose_mode = pose_mode
         self.pose_family = pose_family
         self.yolo_pose_model = yolo_pose_model
         self.show_pose_roi = show_pose_roi
         self.pose_imgsz = int(pose_imgsz)
         self.pose_sample_hz = float(pose_sample_hz)
-        if not 1.0 <= self.pose_sample_hz <= 30.0:
-            raise ValueError("pose_sample_hz must be between 1 and 30")
+        if self.pose_sample_hz < 0.0 or (0.0 < self.pose_sample_hz < 1.0):
+            raise ValueError("pose_sample_hz must be 0 (every source frame) or at least 1")
         self.pose_conf = float(pose_conf)
         if not 0.0 < self.pose_conf <= 1.0:
             raise ValueError("pose_conf must be greater than 0 and no more than 1")
@@ -217,15 +228,21 @@ class BadmintonAnalysisSystem:
         self.performance_log_interval_frames = 150
         self.pose_processed_frames = 0
         self.performance_report = None
-    def process_video(self, progress_callback=None, state_callback=None):
+    def process_video(self, progress_callback=None, state_callback=None, cancel_callback=None):
         """Process the input video.
 
         Args:
             progress_callback: Optional callable(frame_count, total_frames)
                 invoked after each frame so callers can report progress.
+            cancel_callback: Optional callable() returning True after an
+                operator interrupts the task. Cancellation is checked between
+                frames so model inference and media writers are not torn down
+                halfway through a frame.
         """
         self.start_time = time.time()
 
+        if state_callback is not None:
+            state_callback({"phase": "human_tracking", "stage": "video_open_and_calibration"})
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Unable to open video: {self.video_path}")
@@ -283,8 +300,15 @@ class BadmintonAnalysisSystem:
         frame_count = 0
         detect_frame_count = 0
 
+        if state_callback is not None:
+            state_callback({
+                "phase": "human_tracking",
+                "stage": "human_frame_processing",
+                "stage_detail": {"total_frames": total_frames, "fps": float(fps)},
+            })
 
         while cap.isOpened():
+            raise_if_cancelled(cancel_callback)
             ret, frame = cap.read()
             if not ret:
                 break
@@ -295,6 +319,7 @@ class BadmintonAnalysisSystem:
             )
             if progress_callback is not None:
                 progress_callback(frame_count, total_frames)
+            raise_if_cancelled(cancel_callback)
 
         self.end_time = time.time()
         processing_time = self.end_time - self.start_time
@@ -304,7 +329,7 @@ class BadmintonAnalysisSystem:
         print(f"处理耗时: {processing_time:.2f} 秒")
         print(f"处理速度比: {processing_time/video_duration:.2f}x")
         
-        self._cleanup(cap)
+        self._cleanup(cap, state_callback=state_callback)
 
     def _write_metadata(self, fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height):
         metadata = {
@@ -330,6 +355,15 @@ class BadmintonAnalysisSystem:
                         else "yolo_model_confidence"
                     ),
                 },
+                "play_state": {
+                    "enabled": bool(self.huji_action_model),
+                    "model": self.huji_action_model,
+                    "sample_hz": self.huji_sample_hz if self.huji_action_model else None,
+                    "policy": (
+                        "optional Huji-compatible scene classification; only a conservative "
+                        "conflict prior for direction-reversal-after-gap candidates, never score proof"
+                    ),
+                },
                 "pose": {
                     "family": self.pose_family,
                     "model": self.yolo_pose_model if self.pose_family == "yolo-pose" else self.pose_mode,
@@ -343,10 +377,17 @@ class BadmintonAnalysisSystem:
                         else "native"
                     ),
                     "far_roi_normalized": list(self.far_pose_roi) if self.far_player_enhancement else None,
-                    "sample_hz": self.pose_sample_hz,
+                    # 0 is the explicit full-evidence mode: run pose on every
+                    # source frame, then persist raw COCO17 joints for every
+                    # detected track observation.  A positive value is an
+                    # opt-in performance/storage trade-off.
+                    "requested_sample_hz": self.pose_sample_hz,
+                    "effective_sample_hz": float(fps) if self.pose_sample_hz == 0 else min(float(fps), self.pose_sample_hz),
                     "processed_frame_count": 0,
+                    "raw_keypoint_contract": self.fixed_camera_match.tracker.pose_keypoint_contract(),
                     "sampling_policy": (
-                        "source timestamps are retained; skipped frames carry explicit "
+                        "every_source_frame" if self.pose_sample_hz == 0 else
+                        "timestamp buckets retain source timestamps; skipped frames carry explicit "
                         "predicted/missing track state and are never pose measurements"
                     ),
                     "court_filter_margins_m": {
@@ -542,6 +583,7 @@ class BadmintonAnalysisSystem:
             ),
             rally_count=self.rally_count,
             spatial_tracks=spatial_state.get("tracks", []),
+            unassigned_detections=(spatial_state.get("match_roster") or {}).get("unassigned_observations", []),
         )
         t1 = time.time()
         players_draw_elapsed = t1 - t0
@@ -583,6 +625,7 @@ class BadmintonAnalysisSystem:
         callback(
             {
                 "phase": "human_tracking",
+                "stage": "human_frame_processing",
                 "frame": int(frame_count),
                 "time_sec": round((int(frame_count) - 1) / self.fps, 4),
                 "match_roster": roster,
@@ -600,11 +643,11 @@ class BadmintonAnalysisSystem:
     def _should_sample_pose(self, frame_count):
         """Return whether this source frame carries a new pose measurement.
 
-        Timestamp buckets keep a 10 Hz policy correct for 25/30/50/60 FPS
-        inputs. Sampling is evidence reduction, not interpolation: skipped
-        frames have no fresh pose keypoints.
+        ``pose_sample_hz=0`` is the data-complete default and means every
+        source frame.  A positive rate is an explicit timestamp-based sampling
+        policy; skipped frames have no fresh pose keypoints and must stay null.
         """
-        if self.pose_sample_hz >= self.fps:
+        if self.pose_sample_hz == 0 or self.pose_sample_hz >= self.fps:
             return True
         index = max(0, int(frame_count) - 1)
         if index == 0:
@@ -810,9 +853,11 @@ class BadmintonAnalysisSystem:
             f.write(f"mid_height={mid_height}\n")
         return corners, roi_corners, mid_height
 
-    def _cleanup(self, cap):
+    def _cleanup(self, cap, state_callback=None):
         """Clean up resources and merge audio when needed."""
         if hasattr(self, "fixed_camera_match"):
+            if state_callback is not None:
+                state_callback({"phase": "post_processing", "stage": "spatial_finalize"})
             spatial_summary = self.fixed_camera_match.finalize()
             write_json(self.spatial_match_summary_path, spatial_summary)
             if os.path.isfile(self.metadata_path):
@@ -829,11 +874,38 @@ class BadmintonAnalysisSystem:
             self.detection_writer.close()
             self.detection_writer = None
         try:
+            if state_callback is not None:
+                state_callback({"phase": "post_processing", "stage": "offline_shot_reconstruction"})
             from .analysis.offline_shot_reconstruction import generate_offline_artifacts
+            from .analysis.huji_play_state import HUJI_PLAY_STATE_FILENAME, generate_huji_play_state
+
+            play_state_path = None
+            if self.huji_action_model:
+                play_state_path = os.path.join(self.save_dir, "derived", HUJI_PLAY_STATE_FILENAME)
+                try:
+                    if state_callback is not None:
+                        state_callback({"phase": "post_processing", "stage": "huji_play_state"})
+                    play_state_result = generate_huji_play_state(
+                        self.video_path,
+                        self.huji_action_model,
+                        play_state_path,
+                        sample_hz=self.huji_sample_hz,
+                    )
+                    print(
+                        "Huji-compatible play-state: "
+                        f"{play_state_result['sample_count']} samples at "
+                        f"{play_state_result['sample_hz']:.2f}Hz"
+                    )
+                except Exception as play_state_error:
+                    # The core detector output remains valid when an optional
+                    # scene model is absent, invalid, or not yet deployed.
+                    print(f"Huji-compatible play-state unavailable: {play_state_error}")
+                    play_state_path = None
 
             self.offline_artifacts = generate_offline_artifacts(
                 self.detections_path,
                 fps=getattr(self, "fps", None),
+                play_state_path=play_state_path,
             )
             # ``metadata.json`` is the WebUI's compact result manifest.  Keep
             # derived paths/counts here so a finished run exposes its candidate
@@ -862,6 +934,8 @@ class BadmintonAnalysisSystem:
         # detections and spatial summary, but should not wait behind a costly
         # browser-video encode at the end of a match.
         try:
+            if state_callback is not None:
+                state_callback({"phase": "post_processing", "stage": "performance_report"})
             from .analysis.performance_report import generate_performance_report
 
             self.performance_report = generate_performance_report(
@@ -885,6 +959,8 @@ class BadmintonAnalysisSystem:
             }
             print(f"Performance report generation failed: {exc}")
 
+        if state_callback is not None:
+            state_callback({"phase": "post_processing", "stage": "video_writer_finalize"})
         if hasattr(self, 'video_writer') and self.video_writer is not None:
             self.video_writer.release()
             time.sleep(1)
@@ -894,6 +970,8 @@ class BadmintonAnalysisSystem:
         if self.show_display:
             cv2.destroyAllWindows()
 
+        if state_callback is not None:
+            state_callback({"phase": "post_processing", "stage": "annotated_video_export"})
         if hasattr(self, 'keep_audio') and self.keep_audio:
             export_ok = vap.process_video_with_audio(
                 video_path=self.video_path,

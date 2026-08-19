@@ -131,7 +131,12 @@ def build_report_evidence(metadata, spatial_summary):
         },
         "measurement_plan": {
             "pose_imgsz": pose.get("imgsz"),
-            "pose_sample_hz": pose.get("sample_hz"),
+            # ``sample_hz`` was the v2.1 field.  Read it as a fallback so a
+            # report can still open older jobs, while v2.2 exposes both the
+            # requested policy and the actual source-frame rate used.
+            "pose_sample_hz": pose.get("effective_sample_hz", pose.get("sample_hz")),
+            "pose_requested_sample_hz": pose.get("requested_sample_hz"),
+            "pose_sampling_policy": pose.get("sampling_policy"),
             "pose_processed_frame_count": pose.get("processed_frame_count"),
             "shuttle_primary_source": shuttle.get("primary_source"),
             "shuttle_measurement_kind": shuttle.get("measurement_kind"),

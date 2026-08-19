@@ -116,6 +116,10 @@ class MultiTrackModeTests(unittest.TestCase):
         )
         self.assertEqual([item["track_id"] for item in after_extra_detection["tracks"]], track_ids)
         self.assertEqual(after_extra_detection["match_roster"]["unassigned_observation_count"], 1)
+        self.assertEqual(
+            after_extra_detection["match_roster"]["unassigned_observations"][0]["reason"],
+            "unassigned_after_locked_roster_association",
+        )
 
     def test_locked_roster_reassociates_brief_gap_without_creating_a_new_id(self):
         pipeline = FixedCameraMatchPipeline(
@@ -144,6 +148,112 @@ class MultiTrackModeTests(unittest.TestCase):
             "roster_reassociation",
             {item["association"]["source"] for item in recovered["tracks"]},
         )
+
+    def test_locked_doubles_roster_recovers_one_unambiguous_long_occlusion(self):
+        """A real returning detection must reclaim its locked ID after overlap.
+
+        The recovery deliberately relies only on the current court end and a
+        one-to-one candidate set.  It never claims that the missing player was
+        observed during the occlusion, and it must not use image-side labels as
+        identity.
+        """
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="doubles",
+            lock_match_roster=True,
+            roster_stable_frames=1,
+        )
+        initial = pipeline.update(
+            1,
+            [
+                self._observation((1.0, 1.0), None),
+                self._observation((4.8, 1.2), None),
+                self._observation((1.1, 12.0), None),
+                self._observation((4.9, 11.8), None),
+            ],
+            None,
+        )
+        first_end_a_id = next(
+            item["track_id"]
+            for item in initial["tracks"]
+            if item["court_xy_m"] == [1.0, 1.0]
+        )
+
+        # The player at (1, 1) is invisible longer than the normal short-gap
+        # reassociation window while the other three people remain detected.
+        for frame_index in range(2, 32):
+            pipeline.update(
+                frame_index,
+                [
+                    self._observation((4.8, 1.2), None),
+                    self._observation((1.1, 12.0), None),
+                    self._observation((4.9, 11.8), None),
+                ],
+                None,
+            )
+
+        recovered = pipeline.update(
+            32,
+            [
+                self._observation((1.2, 1.1), None),
+                self._observation((4.8, 1.2), None),
+                self._observation((1.1, 12.0), None),
+                self._observation((4.9, 11.8), None),
+            ],
+            None,
+        )
+        restored = next(item for item in recovered["tracks"] if item["track_id"] == first_end_a_id)
+        self.assertEqual(restored["status"], "detected")
+        self.assertEqual(restored["association"]["source"], "roster_end_recovery")
+        self.assertLess(restored["association"]["identity_confidence"], 0.7)
+        self.assertEqual(recovered["match_roster"]["unassigned_observation_count"], 0)
+
+    def test_locked_doubles_long_recovery_does_not_guess_between_two_same_end_people(self):
+        """Ambiguous same-end returns remain unassigned rather than switching IDs."""
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="doubles",
+            lock_match_roster=True,
+            roster_stable_frames=1,
+        )
+        pipeline.update(
+            1,
+            [
+                self._observation((1.0, 1.0), None),
+                self._observation((4.8, 1.2), None),
+                self._observation((1.1, 12.0), None),
+                self._observation((4.9, 11.8), None),
+            ],
+            None,
+        )
+        for frame_index in range(2, 32):
+            pipeline.update(
+                frame_index,
+                [
+                    self._observation((1.1, 12.0), None),
+                    self._observation((4.9, 11.8), None),
+                ],
+                None,
+            )
+        recovered = pipeline.update(
+            32,
+            [
+                self._observation((1.0, 1.0), None),
+                self._observation((4.8, 1.2), None),
+                self._observation((1.1, 12.0), None),
+                self._observation((4.9, 11.8), None),
+            ],
+            None,
+        )
+        self.assertEqual(recovered["match_roster"]["unassigned_observation_count"], 2)
+        self.assertEqual(len(recovered["match_roster"]["unassigned_observations"]), 2)
+        missing_end_a = [
+            item for item in recovered["tracks"]
+            if item["court_end"] == "end_a" and item["status"] == "missing"
+        ]
+        self.assertEqual(len(missing_end_a), 2)
 
     def test_bytetrack_is_not_enabled_without_recorded_gate(self):
         with self.assertRaisesRegex(ValueError, "evaluation-gated"):

@@ -1,13 +1,17 @@
+import json
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+from badminton_analysis.cancellation import AnalysisCancelled, raise_if_cancelled
 from badminton_analysis.court.mapper import (
     CourtMapper,
     auto_detect_preview,
@@ -24,9 +28,48 @@ _COURT_DETECTION_SIZE = (1080, 720)
 _SAFE_OUTPUT_STEM_PATTERN = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 _dependencies_loaded = False
+_TRACKNET_EVENT_PREFIX = "GOOD_BADMINTON_TRACKNET_EVENT="
 
 
-def _prepare_tracknet_v3_raw(video_path, output_dir):
+def _emit_analysis_stage(callback, phase, stage, details=None):
+    """Emit a small, durable stage update when a callback is configured."""
+    if callback is not None:
+        callback({
+            "phase": phase,
+            "stage": stage,
+            "stage_detail": dict(details or {}),
+        })
+
+
+def _forward_tracknet_output(raw_line, state_cb):
+    """Keep TrackNet logs visible and turn structured events into job state.
+
+    The separate TrackNet process is deliberately left as an executable
+    boundary.  A JSON-prefixed stdout event gives the API a way to persist
+    real per-stage timestamps and inference progress without guessing from
+    elapsed wall time or scraping human-oriented log text.
+    """
+    line = raw_line.rstrip()
+    if not line:
+        return
+    print(line, flush=True)
+    if not line.startswith(_TRACKNET_EVENT_PREFIX) or state_cb is None:
+        return
+    try:
+        event = json.loads(line[len(_TRACKNET_EVENT_PREFIX):])
+    except json.JSONDecodeError:
+        print("TrackNet emitted an invalid structured progress event.", flush=True)
+        return
+    stage = str(event.pop("stage", "unknown"))
+    _emit_analysis_stage(
+        state_cb,
+        "tracknet_preprocessing",
+        f"tracknet.{stage}",
+        event,
+    )
+
+
+def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=None):
     """Run the configured GPU TrackNet runtime and return its immutable CSV.
 
     Good-Badminton intentionally does not package TrackNetV3 source code or
@@ -72,10 +115,59 @@ def _prepare_tracknet_v3_raw(video_path, output_dir):
         "--overwrite",
     ]
     print("TrackNetV3 primary shuttle detector:", subprocess.list2cmdline(command))
+    _emit_analysis_stage(
+        state_cb,
+        "tracknet_preprocessing",
+        "tracknet.launch",
+        {
+            "batch_size": batch_size,
+            "background_sample_count": background_samples,
+        },
+    )
+    runtime_env = os.environ.copy()
+    runtime_env["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        command,
+        cwd=str(project_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=runtime_env,
+    )
+    output_lines = queue.Queue()
+
+    def read_output():
+        assert process.stdout is not None
+        for raw_line in iter(process.stdout.readline, ""):
+            output_lines.put(raw_line)
+        process.stdout.close()
+
+    output_reader = threading.Thread(target=read_output, name="tracknet-output", daemon=True)
+    output_reader.start()
     try:
-        subprocess.run(command, cwd=str(project_root), check=True)
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"TrackNetV3 推理失败（退出码 {exc.returncode}）。") from exc
+        while process.poll() is None or not output_lines.empty():
+            try:
+                _forward_tracknet_output(output_lines.get(timeout=0.2), state_cb)
+            except queue.Empty:
+                pass
+            if cancel_cb is not None and cancel_cb():
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+                raise AnalysisCancelled("TrackNetV3 推理已中断。")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        output_reader.join(timeout=2)
+        while not output_lines.empty():
+            _forward_tracknet_output(output_lines.get_nowait(), state_cb)
+    if process.returncode:
+        raise RuntimeError(f"TrackNetV3 推理失败（退出码 {process.returncode}）。")
     csv_path = target_dir / "tracknet_raw" / f"{Path(video_path).stem}_ball.csv"
     if not csv_path.is_file() or csv_path.stat().st_size == 0:
         raise RuntimeError("TrackNetV3 未生成原始球点 CSV。")
@@ -360,7 +452,7 @@ def _find_ffmpeg():
     return None
 
 
-def _reencode_for_browser(video_path, output_dir):
+def _reencode_for_browser(video_path, output_dir, cancel_cb=None):
     """Re-encode video to H.264 so browsers can play it.
 
     OpenCV's mp4v codec isn't browser-compatible.  This converts to H.264
@@ -376,7 +468,7 @@ def _reencode_for_browser(video_path, output_dir):
 
     web_path = os.path.join(output_dir, "web_" + os.path.basename(video_path))
     try:
-        subprocess.run(
+        process = subprocess.Popen(
             [
                 ffmpeg, "-y",
                 "-i", video_path,
@@ -389,13 +481,33 @@ def _reencode_for_browser(video_path, output_dir):
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=300,
-            check=True,
         )
-        if os.path.isfile(web_path) and os.path.getsize(web_path) > 0:
-            return web_path
-    except (FileNotFoundError, subprocess.SubprocessError):
-        pass
+    except OSError:
+        return video_path
+
+    try:
+        deadline = time.monotonic() + 300
+        while process.poll() is None:
+            if cancel_cb is not None and cancel_cb():
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+                raise AnalysisCancelled("浏览器视频转码已中断。")
+            if time.monotonic() >= deadline:
+                process.terminate()
+                process.wait(timeout=10)
+                return video_path
+            time.sleep(0.2)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+
+    if process.returncode == 0 and os.path.isfile(web_path) and os.path.getsize(web_path) > 0:
+        return web_path
     return video_path
 
 
@@ -421,7 +533,7 @@ def _scale_corners_to_video(corners, template_path, video_path):
     return [(int(x * sx), int(y * sy)) for x, y in corners]
 
 
-def _max_template_match_score(video_path, template_path, max_samples=24):
+def _max_template_match_score(video_path, template_path, max_samples=24, cancel_cb=None):
     """Measure whether an uploaded template can pass the runtime court-view gate."""
     template = imread_safe(template_path, cv2.IMREAD_GRAYSCALE)
     cap = cv2.VideoCapture(video_path)
@@ -436,6 +548,7 @@ def _max_template_match_score(video_path, template_path, max_samples=24):
     template = cv2.resize(template, (frame_w, frame_h))
     best_score = -1.0
     for frame_index in _sample_frame_indices(total_frames, max_samples=max_samples):
+        raise_if_cancelled(cancel_cb)
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -448,7 +561,7 @@ def _max_template_match_score(video_path, template_path, max_samples=24):
 
 
 def run_analysis(video_path, template_path, corners, options, progress_cb=None,
-                 state_cb=None, output_dir=None, cleanup_outputs=True):
+                 state_cb=None, cancel_cb=None, output_dir=None, cleanup_outputs=True):
     """Run the full analysis pipeline headlessly.
 
     Args:
@@ -457,21 +570,28 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         corners: List of 4 (x, y) court corner tuples (template resolution).
         options: dict of analysis options (mirrors CLI flags).
         progress_cb: Optional callable(frame_count, total_frames).
+        cancel_cb: Optional callable() returning True after an interrupt.
 
     Returns:
         dict with output file paths.
     """
+    raise_if_cancelled(cancel_cb)
+    _emit_analysis_stage(state_cb, "preparing", "runtime_dependencies")
     _ensure_dependencies()
     if cleanup_outputs:
+        _emit_analysis_stage(state_cb, "preparing", "output_retention_cleanup")
         _cleanup_old_outputs()
 
-    match_score = _max_template_match_score(video_path, template_path)
+    _emit_analysis_stage(state_cb, "preparing", "template_compatibility")
+    match_score = _max_template_match_score(video_path, template_path, cancel_cb=cancel_cb)
+    raise_if_cancelled(cancel_cb)
     if match_score is not None and match_score < 0.75:
         raise RuntimeError(
             f"球场模板与当前视频不匹配（抽样最高匹配度 {match_score:.3f}，"
             "运行要求 0.750）。请清空已上传的模板图，再从当前视频自动选择球场帧。"
         )
 
+    _emit_analysis_stage(state_cb, "preparing", "court_configuration")
     corners = _scale_corners_to_video(corners, template_path, video_path)
 
     cap = cv2.VideoCapture(video_path)
@@ -523,11 +643,13 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         raise ValueError("shuttle_detector must be 'yolo' or 'tracknet_v3'.")
     tracknet_measurements_path = None
     if shuttle_detector == "tracknet_v3":
-        if state_cb is not None:
-            state_cb({"phase": "tracknet_preprocessing"})
-        tracknet_measurements_path = _prepare_tracknet_v3_raw(video_path, output_dir)
-    if state_cb is not None:
-        state_cb({"phase": "human_tracking"})
+        tracknet_measurements_path = _prepare_tracknet_v3_raw(
+            video_path,
+            output_dir,
+            cancel_cb=cancel_cb,
+            state_cb=state_cb,
+        )
+    _emit_analysis_stage(state_cb, "human_tracking", "human_tracking_setup")
 
     system = BadmintonAnalysisSystem(
         video_path,
@@ -562,7 +684,12 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         tracknet_measurements_path=tracknet_measurements_path,
     )
     system.keep_audio = keep_audio
-    system.process_video(progress_callback=progress_cb, state_callback=state_cb)
+    system.process_video(
+        progress_callback=progress_cb,
+        state_callback=state_cb,
+        cancel_callback=cancel_cb,
+    )
+    raise_if_cancelled(cancel_cb)
 
     # This is an opaque business correlation key, not an identity input for
     # visual tracking. Storing it in the result manifest lets the business
@@ -570,7 +697,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     # the GPU worker.
     match_session_ref = options.get("match_session_ref")
     if match_session_ref and os.path.isfile(system.metadata_path):
-        import json
+        _emit_analysis_stage(state_cb, "post_processing", "match_context_manifest")
         with open(system.metadata_path, "r", encoding="utf-8") as source:
             metadata = json.load(source)
         metadata.setdefault("match_context", {})["match_session_ref"] = str(match_session_ref)
@@ -585,19 +712,52 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
             "请使用当前视频中的模板帧，并检查四个球场角点。"
         )
 
+    position_evidence_summary = None
     if visualize_positions and has_detections:
-        if language == "en":
-            from badminton_analysis.visualization.player_positions_en import analyze_player_positions
-        else:
-            from badminton_analysis.visualization.player_positions_zh import analyze_player_positions
+        _emit_analysis_stage(state_cb, "post_processing", "position_visualizations")
         vis_dir = os.path.join(output_dir, "position_visualizations")
-        visualization_ok = analyze_player_positions(system.detections_path, vis_dir, fps=system.fps)
+        raise_if_cancelled(cancel_cb)
+        # v2 files keep a durable spatial track for every person.  Use that
+        # contract first so doubles never collapse into legacy upper/lower
+        # display slots.  Old result files still use their original renderer.
+        from badminton_analysis.visualization.spatial_player_positions import analyze_spatial_track_positions
+        position_result = analyze_spatial_track_positions(
+            system.detections_path,
+            vis_dir,
+            fps=system.fps,
+            language=language,
+        )
+        if position_result is None:
+            if language == "en":
+                from badminton_analysis.visualization.player_positions_en import analyze_player_positions
+            else:
+                from badminton_analysis.visualization.player_positions_zh import analyze_player_positions
+            visualization_ok = analyze_player_positions(system.detections_path, vis_dir, fps=system.fps)
+        else:
+            visualization_ok = bool(position_result.get("success"))
+            position_evidence_summary = position_result.get("summary_path")
+            track_summaries = (position_result.get("summary") or {}).get("tracks") or {}
+            if match_mode == "doubles" and len(track_summaries) < 4:
+                warnings.append(
+                    "双打名册未形成四条轨迹：本次只输出已实际追踪到的人员热力图，不能据此做四人能力对比。"
+                )
+            empty_tracks = [
+                track_id for track_id, summary in track_summaries.items()
+                if not summary.get("usable_measurements")
+            ]
+            if empty_tracks:
+                warnings.append(
+                    "以下轨迹没有满足置信度门槛的真实位置检测，已保留状态但未用于热力图或距离统计："
+                    + "、".join(sorted(empty_tracks))
+                )
+        raise_if_cancelled(cancel_cb)
         if not visualization_ok:
             warnings.append(
                 "已经生成位置检测数据，但图表渲染失败。请打开右下角后台输出查看详情。"
             )
 
-    web_video_path = _reencode_for_browser(system.output_video_path, output_dir)
+    _emit_analysis_stage(state_cb, "post_processing", "browser_video_reencode")
+    web_video_path = _reencode_for_browser(system.output_video_path, output_dir, cancel_cb=cancel_cb)
     if not os.path.isfile(web_video_path) or os.path.getsize(web_video_path) == 0:
         raise RuntimeError("标注视频导出失败，未生成可播放文件。请打开右下角后台输出查看详情。")
 
@@ -608,6 +768,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         "detections": system.detections_path,
         "tracknet_raw_csv": tracknet_measurements_path,
         "performance_report": (getattr(system, "performance_report", None) or {}).get("report_path"),
+        "position_evidence_summary": position_evidence_summary,
         "derived": getattr(system, "offline_artifacts", None),
         "visualizations": [],
         "warnings": warnings,

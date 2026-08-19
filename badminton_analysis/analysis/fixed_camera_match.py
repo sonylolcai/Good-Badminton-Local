@@ -16,7 +16,32 @@ from ..court.reference import BADMINTON_COURT_LENGTH, BADMINTON_COURT_WIDTH
 from ..tracking.bytetrack_adapter import ByteTrackAdapter
 
 
-SCHEMA_VERSION = "2.1"
+SCHEMA_VERSION = "2.3"
+
+# Ultralytics YOLO Pose emits the standard 17-point COCO skeleton.  The raw
+# order is declared once in metadata rather than repeated beside every frame,
+# while each ``spatial.tracks[].pose`` record keeps the aligned point/value
+# arrays needed for later biomechanical analysis.
+POSE_KEYPOINT_FORMAT = "coco17_image_v1"
+COCO17_KEYPOINT_NAMES = [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+]
 
 
 class CourtSpace:
@@ -65,6 +90,10 @@ class _Track:
     last_evidence: dict = field(default_factory=dict)
     association_key: Optional[str] = None
     association_source: str = "court_association"
+    # This describes certainty that the current detector measurement belongs
+    # to this durable ID.  It is intentionally separate from pose confidence:
+    # a crisp pose can still be an uncertain identity after a long occlusion.
+    association_identity_confidence: float = 0.85
     image_history: list = field(default_factory=list)
 
 
@@ -129,6 +158,7 @@ class CourtMultiObjectTracker:
         self._last_roster_candidate_count = 0
         self._last_roster_reason = "awaiting_stable_on_court_detections" if self.lock_match_roster else "disabled"
         self._last_unassigned_observation_count = 0
+        self._last_unassigned_observations = []
 
     def update(self, frame_index, observations):
         observations = [
@@ -150,6 +180,7 @@ class CourtMultiObjectTracker:
         """
         self._last_roster_candidate_count = len(observations)
         self._last_unassigned_observation_count = 0
+        self._last_unassigned_observations = []
         if len(observations) != self.expected_roster_count:
             self._roster_stable_observation_frames = 0
             self._last_roster_reason = (
@@ -185,6 +216,7 @@ class CourtMultiObjectTracker:
         assignment_sources = {}
         self._last_roster_candidate_count = len(observations)
         self._last_unassigned_observation_count = 0
+        self._last_unassigned_observations = []
 
         # A confirmed ByteTrack key takes priority over metric association.
         # It may revive a temporarily missing court track after an occlusion.
@@ -198,9 +230,9 @@ class CourtMultiObjectTracker:
             unmatched_track_ids.remove(track_id)
             unmatched_observations.remove(index)
 
-        # Greedy assignment is deterministic, and sufficient for the two-player
-        # first version.  Its gate is in metres, so a side/oblique image view
-        # has exactly the same identity behavior as a rear view.
+        # Greedy metric assignment covers continuous observations. Its gate is
+        # in metres, so a side/oblique image view has exactly the same identity
+        # behavior as a rear view.
         candidates = []
         for track_id, track in self.tracks.items():
             if track_id not in unmatched_track_ids:
@@ -229,6 +261,26 @@ class CourtMultiObjectTracker:
             unmatched_track_ids.remove(track_id)
             unmatched_observations.remove(index)
 
+        # After a long physical overlap, the normal motion gate deliberately
+        # expires.  In a locked doubles roster we may still recover a *real*
+        # returning pose when there is exactly one missing ID and exactly one
+        # unassigned detector observation on the same current court end.
+        #
+        # This is not a team/upper/lower identity rule: court end is only a
+        # short-lived spatial constraint at the recovery timestamp.  Two
+        # teammates returning on the same end remain unassigned rather than
+        # being guessed, and the recovered association is explicitly low
+        # confidence for downstream analytics.
+        for track_id, index in self._unambiguous_long_gap_recoveries(
+            unmatched_track_ids,
+            unmatched_observations,
+            observations,
+        ):
+            assignments.append((track_id, index))
+            assignment_sources[(track_id, index)] = "roster_end_recovery"
+            unmatched_track_ids.remove(track_id)
+            unmatched_observations.remove(index)
+
         for track_id, index in assignments:
             self._apply_observation(
                 self.tracks[track_id],
@@ -240,6 +292,10 @@ class CourtMultiObjectTracker:
             # The roster is a match fact: detections outside it are retained as
             # a count in the evidence, but may not silently become a new player.
             self._last_unassigned_observation_count = len(unmatched_observations)
+            self._last_unassigned_observations = [
+                self._unassigned_observation_evidence(observations[index])
+                for index in sorted(unmatched_observations)
+            ]
         else:
             for index in sorted(unmatched_observations):
                 self._create_track(frame_index, observations[index])
@@ -296,6 +352,7 @@ class CourtMultiObjectTracker:
                 "detected_frames": metrics["detected_frames"],
                 "predicted_frames": metrics["predicted_frames"],
                 "missing_frames": metrics["missing_frames"],
+                "recovered_detected_frames": metrics["recovered_detected_frames"],
                 "distance_m": round(metrics["distance_m"], 3),
                 "zone_frames": dict(sorted(metrics["zone_frames"].items())),
                 "analytics_scope": "movement_and_space_only",
@@ -313,8 +370,14 @@ class CourtMultiObjectTracker:
             if predicted:
                 self.track_metrics[track_id]["predicted_frames"] += 1
             location_evidence = dict(track.last_evidence)
+            # ``pose`` below is the sole exported raw-skeleton field.  Keeping
+            # historical points here would duplicate large arrays and make a
+            # predicted row look as though it contained a new pose reading.
+            location_evidence.pop("keypoints_image", None)
+            location_evidence.pop("keypoint_scores", None)
             location_evidence["measurement_frame"] = int(track.last_observation_frame)
             location_evidence["is_current_measurement"] = not predicted and not missing
+            pose = self._pose_record(track, is_current_measurement=not predicted and not missing)
             records.append(
                 {
                     "track_id": track.track_id,
@@ -330,8 +393,13 @@ class CourtMultiObjectTracker:
                     "association": {
                         "key": track.association_key,
                         "source": track.association_source,
+                        "identity_confidence": round(track.association_identity_confidence, 4),
                     },
                     "location_evidence": location_evidence,
+                    # Keep pose separate from foot-point evidence.  Consumers can
+                    # read one stable, per-track raw-pose contract without
+                    # mistaking a retained location record for a fresh skeleton.
+                    "pose": pose,
                     "trajectory_image": [self._as_list(point) for point in track.image_history],
                 }
             )
@@ -349,6 +417,7 @@ class CourtMultiObjectTracker:
             "locked_frame": self.roster_locked_frame,
             "track_ids": list(self.roster_track_ids),
             "unassigned_observation_count": self._last_unassigned_observation_count,
+            "unassigned_observations": list(self._last_unassigned_observations),
             "reason": self._last_roster_reason,
             "policy": (
                 "Roster members are fixed after bootstrap. Extra detections are not new players; "
@@ -376,6 +445,7 @@ class CourtMultiObjectTracker:
             last_evidence=self._evidence(observation),
             association_key=observation.get("association_key"),
             association_source=association_source,
+            association_identity_confidence=self._identity_confidence_for_source(association_source),
             image_history=[image_xy] if image_xy is not None else [],
         )
         if observation.get("association_key"):
@@ -384,6 +454,7 @@ class CourtMultiObjectTracker:
             "detected_frames": 1,
             "predicted_frames": 0,
             "missing_frames": 0,
+            "recovered_detected_frames": 0,
             "distance_m": 0.0,
             "zone_frames": {self.court_space.zone_for(observation["court_xy"]): 1},
         }
@@ -408,6 +479,7 @@ class CourtMultiObjectTracker:
         track.observations += 1
         track.last_evidence = self._evidence(observation)
         track.association_source = association_source
+        track.association_identity_confidence = self._identity_confidence_for_source(association_source)
         association_key = observation.get("association_key")
         if association_key:
             if track.association_key and track.association_key != association_key:
@@ -416,7 +488,12 @@ class CourtMultiObjectTracker:
             self._association_keys[association_key] = track.track_id
         metrics = self.track_metrics[track.track_id]
         metrics["detected_frames"] += 1
-        metrics["distance_m"] += distance
+        if association_source == "roster_end_recovery":
+            # This measurement is kept for review, but the long missing gap
+            # must not become a fabricated movement segment in player stats.
+            metrics["recovered_detected_frames"] += 1
+        else:
+            metrics["distance_m"] += distance
         zone = self.court_space.zone_for(new_xy)
         metrics["zone_frames"][zone] = metrics["zone_frames"].get(zone, 0) + 1
 
@@ -437,6 +514,65 @@ class CourtMultiObjectTracker:
         """
         return min(3.5, max(1.2, 0.35 + self.max_speed_mps * self.roster_reacquire_frames / self.fps))
 
+    def _unambiguous_long_gap_recoveries(self, unmatched_track_ids, unmatched_observations, observations):
+        """Return conservative one-to-one locked-roster recovery pairs.
+
+        A player seen again after a long detector gap cannot safely be joined
+        by a wider distance gate alone.  The only allowed fallback is one
+        missing track and one raw observation on a current court end.  This
+        preserves the evidence when an overlap separates while avoiding a
+        forced ID switch between two same-side doubles partners.
+        """
+        if not self.lock_match_roster or self.match_mode != "doubles":
+            return []
+
+        tracks_by_end = {}
+        for track_id in unmatched_track_ids:
+            track = self.tracks[track_id]
+            if track.missed_frames <= self.roster_reacquire_frames:
+                continue
+            court_end = self._court_end(track.court_xy)
+            if court_end is not None:
+                tracks_by_end.setdefault(court_end, []).append(track_id)
+
+        observations_by_end = {}
+        for index in unmatched_observations:
+            court_end = self._court_end(observations[index].get("court_xy"))
+            if court_end is not None:
+                observations_by_end.setdefault(court_end, []).append(index)
+
+        recoveries = []
+        for court_end in sorted(set(tracks_by_end).intersection(observations_by_end)):
+            candidates = tracks_by_end[court_end]
+            detected = observations_by_end[court_end]
+            if len(candidates) == 1 and len(detected) == 1:
+                recoveries.append((candidates[0], detected[0]))
+        return recoveries
+
+    @staticmethod
+    def _identity_confidence_for_source(association_source):
+        """Keep association uncertainty available to consumers and reviewers."""
+        return {
+            "bytetrack": 0.95,
+            "roster_bootstrap": 0.95,
+            "court_association": 0.85,
+            "roster_reassociation": 0.72,
+            "roster_end_recovery": 0.55,
+        }.get(str(association_source), 0.60)
+
+    @staticmethod
+    def _unassigned_observation_evidence(observation):
+        """Export a reviewable real pose candidate without inventing an ID."""
+        return {
+            "image_xy": CourtMultiObjectTracker._as_list(observation.get("image_xy")),
+            "bbox_xyxy": CourtMultiObjectTracker._as_list(observation.get("bbox_xyxy")),
+            "court_xy_m": CourtMultiObjectTracker._as_list(observation.get("court_xy")),
+            "confidence": round(float(observation.get("confidence", 0.0)), 4),
+            "location_confidence": round(float(observation.get("location_confidence", 0.0)), 4),
+            "source": observation.get("source"),
+            "reason": "unassigned_after_locked_roster_association",
+        }
+
     @staticmethod
     def _distance(left, right):
         return hypot(float(left[0]) - float(right[0]), float(left[1]) - float(right[1]))
@@ -455,6 +591,46 @@ class CourtMultiObjectTracker:
         return "end_a" if float(court_xy[1]) < self.court_space.net_y_m else "end_b"
 
     @staticmethod
+    def pose_keypoint_contract():
+        """Return the immutable interpretation contract for raw pose arrays."""
+        return {
+            "field": "spatial.tracks[].pose",
+            "format": POSE_KEYPOINT_FORMAT,
+            "coordinate_system": "full_source_image_pixels",
+            "keypoint_order": list(COCO17_KEYPOINT_NAMES),
+            "point_encoding": "[x, y] or null; array order is always COCO17",
+            "score_encoding": "confidence in [0, 1] aligned with keypoint_order",
+            "evidence_policy": (
+                "Only current detected measurements carry pose points. "
+                "Predicted and missing track states use null points and null scores."
+            ),
+        }
+
+    @classmethod
+    def _pose_record(cls, track, is_current_measurement):
+        """Serialize raw joints without copying a prior frame into a new one.
+
+        Court tracking can bridge a short foot-point gap, but it must never
+        imply that a skeleton was detected in the bridged source frame.  The
+        last measurement frame remains traceable for diagnostics while the raw
+        values themselves are deliberately null outside a current detection.
+        """
+        keypoints = None
+        scores = None
+        if is_current_measurement:
+            keypoints = cls._keypoints_or_none(track.last_evidence.get("keypoints_image"))
+            scores = cls._keypoint_scores_or_none(track.last_evidence.get("keypoint_scores"))
+        return {
+            "format": POSE_KEYPOINT_FORMAT,
+            "coordinate_system": "full_source_image_pixels",
+            "is_current_measurement": bool(is_current_measurement),
+            "measurement_frame": int(track.last_observation_frame) if is_current_measurement else None,
+            "last_measurement_frame": int(track.last_observation_frame),
+            "keypoints_image": keypoints,
+            "keypoint_scores": scores,
+        }
+
+    @staticmethod
     def _evidence(observation):
         bbox = observation.get("bbox_xyxy")
         if bbox is None:
@@ -465,6 +641,10 @@ class CourtMultiObjectTracker:
             "source": observation.get("source"),
             "bbox_xyxy": CourtMultiObjectTracker._as_list(bbox),
             "hands_image": observation.get("hands_image"),
+            # These raw arrays are retained inside tracker state so the
+            # top-level ``pose`` record can be emitted for the exact source
+            # measurement frame.  They are intentionally not duplicated in
+            # ``location_evidence`` on every JSONL row.
             "keypoints_image": CourtMultiObjectTracker._points_or_none(
                 observation.get("keypoints_image")
             ),
@@ -481,11 +661,14 @@ class CourtMultiObjectTracker:
         try:
             points = []
             for point in value:
+                if point is None:
+                    points.append(None)
+                    continue
                 if len(point) < 2:
                     return None
                 points.append([round(float(point[0]), 3), round(float(point[1]), 3)])
             return points
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, IndexError):
             return None
 
     @staticmethod
@@ -493,9 +676,21 @@ class CourtMultiObjectTracker:
         if value is None:
             return None
         try:
-            return [round(float(item), 4) for item in value]
+            return [round(float(item), 4) if item is not None else None for item in value]
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _keypoints_or_none(value):
+        """Return exactly 17 aligned image points, preserving invisible slots."""
+        points = CourtMultiObjectTracker._points_or_none(value)
+        return points[:17] if points is not None and len(points) >= 17 else None
+
+    @staticmethod
+    def _keypoint_scores_or_none(value):
+        """Return exactly 17 confidence values aligned to the COCO17 points."""
+        scores = CourtMultiObjectTracker._numbers_or_none(value)
+        return scores[:17] if scores is not None and len(scores) >= 17 else None
 
 
 class MonocularShuttleReconstructor:

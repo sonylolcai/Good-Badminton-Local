@@ -7,11 +7,13 @@ from badminton_analysis.analysis.offline_shot_reconstruction import (
     build_rallies_from_manual_terminals,
     build_shot_events,
     build_rallies,
+    apply_huji_play_state_context,
     detect_rally_terminal_candidates,
     evaluate_rally_terminal_predictions,
     generate_offline_artifacts,
     infer_missing_shuttle_events,
     reconstruct_shuttle_track,
+    _deduplicate_seeds,
     write_jsonl,
 )
 
@@ -57,6 +59,87 @@ class OfflineShotReconstructionTests(unittest.TestCase):
         self.assertEqual(events[0]["trajectory"]["outbound_speed"]["basis"], "first_two_post_hit_trajectory_points")
         self.assertEqual(events[0]["trajectory"]["outbound_speed"]["unit"], "px/s")
         self.assertFalse(events[0]["decision"]["eligible_for_statistics"])
+
+    def test_hand_supported_heading_change_catches_a_return_that_is_not_a_full_reversal(self):
+        """A fast descending shuttle can leave sideways after a real return.
+
+        The old detector required a near-180-degree image-plane reversal, which
+        misses this common fixed-camera contact signature.  The player hand is
+        deliberately included as supporting evidence; a trajectory bend alone
+        must remain insufficient.
+        """
+        rows = [
+            self._row(1, [100, 100], accepted=True, confidence=0.9),
+            self._row(
+                2,
+                [102, 150],
+                accepted=True,
+                confidence=0.9,
+                visible_tracks=["track_004"],
+                hands_by_track={"track_004": {"right": [104, 155]}},
+            ),
+            self._row(3, [50, 158], accepted=True, confidence=0.9),
+        ]
+
+        events = build_shot_events(rows, reconstruct_shuttle_track(rows, fps=10), fps=10)
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("trajectory_heading_change_near_hand", events[0]["candidate_source"])
+        self.assertEqual("track_004", events[0]["hitter"]["track_id"])
+        self.assertEqual("detected", events[0]["hitter"]["measurement_status"])
+        self.assertFalse(events[0]["decision"]["eligible_for_statistics"])
+
+    def test_short_tracknet_gap_near_hand_is_an_explicit_inferred_candidate(self):
+        """A short detector gap near a visible hand is review evidence, not a measurement."""
+        rows = [
+            self._row(1, [100, 200], accepted=True, confidence=0.9),
+            self._row(2, [120, 250], accepted=True, confidence=0.9),
+            self._row(
+                3,
+                None,
+                visible_tracks=["track_004"],
+                hands_by_track={"track_004": {"right": [140, 235]}},
+            ),
+            self._row(
+                4,
+                None,
+                visible_tracks=["track_004"],
+                hands_by_track={"track_004": {"right": [160, 220]}},
+            ),
+            self._row(5, [180, 210], accepted=True, confidence=0.9),
+        ]
+
+        events = build_shot_events(rows, reconstruct_shuttle_track(rows, fps=10), fps=10)
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("reconstructed_gap_hand_proximity", events[0]["candidate_source"])
+        self.assertEqual("motion_constraint_candidate", events[0]["event_origin"])
+        self.assertEqual("track_004", events[0]["hitter"]["track_id"])
+        self.assertIsNone(events[0]["trajectory"]["outbound_speed"]["value"])
+        self.assertFalse(events[0]["decision"]["eligible_for_statistics"])
+
+    def test_short_gap_contact_after_a_supported_turn_is_not_deduplicated_as_the_same_hit(self):
+        """Manual review showed two contacts 0.36 s apart; the gap cue is 0.32 s later."""
+        seeds = _deduplicate_seeds(
+            [
+                {
+                    "frame": 279,
+                    "time_sec": 11.16,
+                    "source": "trajectory_heading_change_near_hand",
+                    "confidence": 0.28,
+                },
+                {
+                    "frame": 287,
+                    "time_sec": 11.48,
+                    "source": "reconstructed_gap_hand_proximity",
+                    "confidence": 0.18,
+                    "event_origin": "motion_constraint_candidate",
+                },
+            ]
+        )
+
+        self.assertEqual(2, len(seeds))
+        self.assertEqual("reconstructed_gap_hand_proximity", seeds[1]["source"])
 
     def test_generator_writes_separate_derived_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -189,6 +272,24 @@ class OfflineShotReconstructionTests(unittest.TestCase):
         self.assertEqual("terminal_evidence_direction_reversal_after_gap", rallies[0]["end_reason"])
         self.assertEqual(0.8, rallies[0]["terminal_evidence"]["confidence"])
 
+    def test_active_huji_play_state_only_blocks_gap_reversal_candidate(self):
+        candidates = apply_huji_play_state_context(
+            [
+                {"time_sec": 3.0, "source": "direction_reversal_after_gap", "confidence": 0.8},
+                {"time_sec": 6.0, "source": "ground_facing_boundary_exit", "confidence": 0.74},
+            ],
+            [
+                {"time_sec": 4.0, "action_type": "play_ball", "is_playing": True, "source": "huji_test"},
+                {"time_sec": 7.0, "action_type": "play_ball", "is_playing": True, "source": "huji_test"},
+            ],
+        )
+
+        self.assertEqual("candidate_conflicted_by_active_play", candidates[0]["status"])
+        self.assertEqual(0.64, candidates[0]["confidence"])
+        self.assertEqual(0.8, candidates[0]["confidence_before_play_state"])
+        self.assertEqual(0.74, candidates[1]["confidence"])
+        self.assertNotIn("confidence_before_play_state", candidates[1])
+
     def test_terminal_candidate_detector_keeps_low_confidence_evidence_separate_from_scores(self):
         tracks = [
             {"time_sec": 1.0, "status": "detected", "confidence": 0.9, "image_xy": [100, 100]},
@@ -244,9 +345,23 @@ class OfflineShotReconstructionTests(unittest.TestCase):
         self.assertEqual(len(infer_missing_shuttle_events(rows, events)), 2)
 
     @staticmethod
-    def _row(frame, point, accepted=False, confidence=0.0, hit=None, zone=None, match_mode=None, visible_tracks=None):
+    def _row(
+        frame,
+        point,
+        accepted=False,
+        confidence=0.0,
+        hit=None,
+        zone=None,
+        match_mode=None,
+        visible_tracks=None,
+        hands_by_track=None,
+    ):
         tracks = []
         for track_id in visible_tracks or ([hit] if hit else []):
+            hands = (hands_by_track or {}).get(track_id) or {
+                "left": [point[0] if point else 0, point[1] if point else 0],
+                "right": None,
+            }
             tracks.append(
                 {
                     "track_id": track_id,
@@ -254,7 +369,7 @@ class OfflineShotReconstructionTests(unittest.TestCase):
                     "confidence": 0.9,
                     "zone_id": zone if track_id == hit else "rear_center",
                     "court_xy_m": [3.0, 3.0],
-                    "location_evidence": {"hands_image": {"left": [point[0] if point else 0, point[1] if point else 0], "right": None}},
+                    "location_evidence": {"hands_image": hands},
                 }
             )
         return {
