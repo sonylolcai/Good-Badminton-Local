@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     # The file to upload through the GPU provider's browser upload page.
-    [string]$OutputPath = (Join-Path $PSScriptRoot 'good-badminton-gpu-api-upload.zip'),
+    [string]$OutputPath = '',
 
     # Adds extended annotation and benchmark tooling.  The primary TrackNet
     # runtime adapters are always included below; no upstream source or model
@@ -11,6 +11,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    # Parameter defaults are evaluated before PowerShell reliably populates
+    # $PSScriptRoot for this script. Resolve the conventional output path only
+    # after entering the script body so the documented no-argument command
+    # works in both Windows PowerShell 5.1 and PowerShell 7.
+    $OutputPath = Join-Path $PSScriptRoot 'good-badminton-gpu-api-upload.zip'
+}
 $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("good-badminton-gpu-package-" + [guid]::NewGuid().ToString('N'))
 $packageRoot = Join-Path $stagingRoot 'good-badminton-gpu-api'
 
@@ -22,13 +29,28 @@ $packageRoot = Join-Path $stagingRoot 'good-badminton-gpu-api'
 $requiredExtraFiles = @(
     'deploy/refresh_gpu_api_from_zip.sh',
     'deploy/package_gpu_api.ps1',
+    'deploy/run_performance_gate.sh',
     'deploy/setup_tracknet_v3_ab.sh',
     'deploy/run_tracknet_v3_ab.sh',
     # TrackNet is the selectable primary shuttle source on the current branch.
     # These adapters are application code, not external model source or weights.
     'badminton_analysis/detection/tracknet_v3.py',
+    'badminton_analysis/analysis/huji_play_state.py',
+    # The package is built from a working tree while several runtime modules
+    # may be newly created before their review commit. Keep direct API imports
+    # explicit so deployment never omits a required local module merely because
+    # `git ls-files` does not list untracked files.
+    'badminton_analysis/cancellation.py',
+    'badminton_analysis/visualization/spatial_player_positions.py',
+    'webui/task_control.py',
     'evaluation/shuttle_tracknet_ab/fast_predict_tracknet_v3.py',
-    'evaluation/shuttle_tracknet_ab/run_tracknet_v3.py'
+    'evaluation/shuttle_tracknet_ab/run_tracknet_v3.py',
+    # The performance gate is intentionally dependency-free and is run after
+    # a relevant GPU deployment against the completed job trace.
+    'evaluation/performance/__init__.py',
+    'evaluation/performance/performance_gate.py',
+    'evaluation/performance/rtx_3090_production_v1.json',
+    'evaluation/performance/README.md'
 )
 
 $trackNetABFiles = @(

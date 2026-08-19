@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "profile_id": "rtx_3090_24gb_production_v1",
+  "description": "Fixed-camera production profile. It is intentionally stricter than a development or evidence run.",
+  "production_options": {
+    "pose_imgsz": 960,
+    "pose_sample_hz": 10.0,
+    "shuttle_detector": "tracknet_v3",
+    "max_llm_requests_per_match": 1
+  },
+  "regression": {
+    "max_stage_regression_percent": 15.0
+  },
+  "streaming_slo": {
+    "segment_duration_seconds": 2.0,
+    "max_segment_p95_seconds": 1.5,
+    "max_backlog_seconds_at_video_end": 360.0,
+    "max_finalize_seconds": 120.0,
+    "max_llm_seconds": 75.0,
+    "max_final_tail_seconds": 600.0
+  }
+}
