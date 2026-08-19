@@ -387,6 +387,25 @@ TrackNet 源码与权重会固定保存在
 `/root/good-badminton-gpu-api-state/tracknet_ab/`。原始 YOLO 输出、正式 API 和 WebUI
 模型路径均不会被覆盖。
 
+### 可选：Huji 兼容比赛进行中证据
+
+Huji 的动作分类器只区分画面是否处于打球过程，不能提供羽毛球位置、击球、落点或得分。
+因此它在本项目中仅用于一个保守用途：当“羽毛球丢失后的方向反转”可能误切回合、而场景模型
+仍显示比赛持续时，将该候选降为人工复核；它不会覆盖落地、出界、人工边界或自动计分。
+
+Huji 的公开仓库配置引用了单打/双打 `best.pt` 分类权重路径，但项目不能假设这些训练权重已经
+公开可用或适合本机位。只有已取得、已审核且类别包含 `play_ball` 的 Ultralytics 分类模型时才配置：
+
+```bash
+set -a; source /root/good-badminton-gpu-api-state/.gpu-api.env; set +a
+export GOOD_BADMINTON_HUJI_ACTION_MODEL=/root/good-badminton-gpu-api-state/models/huji/badminton_scene_best.pt
+export GOOD_BADMINTON_HUJI_SAMPLE_HZ=6
+```
+
+将这两个变量写入持久 `.gpu-api.env` 后重启 GPU API。每次完成分析会额外写出
+`derived/huji_play_state_v1.jsonl`，并在 `metadata.json -> derived.play_state` 中记录是否可用。
+未配置模型时正常分析不会变慢，也不会产生任何 Huji 推断结果。
+
 ### 模型权重属于独立发布物
 
 `weights/yolo11n-pose.pt` 与 `weights/yolo11s-ball.pt` 不应依赖运行时自动下载：租赁实例无公网时，首次分析会因此失败。每个新实例首次部署时，将经校验的模型权重包上传并解压到应用目录的 `weights/`；代码升级时仅当权重版本变更才重新上传。记录权重文件名、SHA-256、来源和对应代码提交，避免代码与模型不匹配。

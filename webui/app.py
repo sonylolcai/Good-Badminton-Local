@@ -16,6 +16,7 @@ import cv2
 import gradio as gr
 import numpy as np
 
+from badminton_analysis.cancellation import AnalysisCancelled
 from webui.pipeline import (
     _max_template_match_score,
     imread_safe,
@@ -47,9 +48,11 @@ from webui.shot_review import (
     timeline_state,
 )
 from webui.task_ledger import BusinessTaskLedger
+from webui.task_control import AnalysisTaskController
 
 _MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MB
+_ANALYSIS_TASKS = AnalysisTaskController()
 
 
 def _write_execution_metadata(result, execution):
@@ -253,6 +256,9 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "output_video_style": output_video_style,
         "shuttle_detector": shuttle_detector,
         "pose_imgsz": int(pose_imgsz),
+        # A 10 Hz measurement is enough for fixed-camera movement analysis
+        # and keeps 30/60 FPS input within the production compute budget.
+        # Full-frame evidence remains an explicit API-only 0 Hz option.
         "pose_sample_hz": 10.0,
         "pose_conf": float(pose_conf),
         "far_player_enhancement": far_player_enhancement,
@@ -268,6 +274,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "ball_model": ball_model or "weights/yolo11s-ball.pt",
     }
 
+    task_handle = _ANALYSIS_TASKS.start()
     events = queue.Queue()
     finished = threading.Event()
     outcome = {}
@@ -298,11 +305,40 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                     video_path=video_file, template_path=template_path, corners=corners,
                     options=options, output_dir=remote_output_dir, status_cb=remote_status,
                     business_task_id=business_task_id,
+                    cancel_cb=task_handle.is_cancelled,
                 )
                 outcome["result"] = result
-                ledger.record_terminal(business_task_id, status="succeeded")
+                trace_record = ledger.archive_performance_trace(
+                    business_task_id,
+                    result.get("performance_trace"),
+                )
+                ledger.record_terminal(
+                    business_task_id,
+                    status="succeeded",
+                    details={"performance_trace": trace_record} if trace_record else None,
+                )
                 publish({"mode": "remote_gpu", "phase": "succeeded", "business_task_id": business_task_id})
             except RemoteAnalysisError as remote_exc:
+                remote_trace_record = ledger.archive_performance_trace(
+                    business_task_id,
+                    getattr(remote_exc, "performance_trace_path", None),
+                )
+                if task_handle.is_cancelled():
+                    message = f"本地已停止等待，但远端 GPU 中断未确认：{remote_exc}"
+                    outcome["interrupt_unconfirmed"] = message
+                    if ledger is not None and business_task_id is not None:
+                        ledger.record_terminal(
+                            business_task_id,
+                            status="interrupted_unconfirmed",
+                            error={"type": "RemoteCancellationUnconfirmed", "message": message},
+                            details={"performance_trace": remote_trace_record} if remote_trace_record else None,
+                        )
+                    publish({
+                        "phase": "interrupted_unconfirmed",
+                        "message": message,
+                        "business_task_id": business_task_id,
+                    })
+                    return
                 fallback_reason = str(remote_exc)
                 if shuttle_detector == "tracknet_v3":
                     raise RuntimeError(
@@ -311,7 +347,10 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                     ) from remote_exc
                 print(f"Remote GPU analysis failed; falling back locally: {fallback_reason}")
                 ledger.record_terminal(
-                    business_task_id, status="local_fallback", error={"message": fallback_reason}
+                    business_task_id,
+                    status="local_fallback",
+                    error={"message": fallback_reason},
+                    details={"performance_trace": remote_trace_record} if remote_trace_record else None,
                 )
                 publish({
                     "mode": "local_fallback", "phase": "local_analyzing",
@@ -329,6 +368,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                 result = run_analysis(
                     video_path=video_file, template_path=template_path, corners=corners,
                     options=options, progress_cb=local_progress,
+                    cancel_cb=task_handle.is_cancelled,
                 )
                 _write_execution_metadata(result, {
                     "mode": "local_fallback", "fallback_used": True,
@@ -340,6 +380,20 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                     "mode": "local_fallback", "phase": "succeeded",
                     "fallback_reason": fallback_reason, "business_task_id": business_task_id,
                 })
+        except AnalysisCancelled as exc:
+            outcome["cancelled"] = str(exc)
+            if ledger is not None and business_task_id is not None:
+                trace_record = ledger.archive_performance_trace(
+                    business_task_id,
+                    getattr(exc, "performance_trace_path", None),
+                )
+                ledger.record_terminal(
+                    business_task_id,
+                    status="cancelled",
+                    error={"type": "TaskCancelled", "message": str(exc)},
+                    details={"performance_trace": trace_record} if trace_record else None,
+                )
+            publish({"phase": "cancelled", "message": str(exc), "business_task_id": business_task_id})
         except Exception as exc:
             traceback.print_exc()
             outcome["error"] = exc
@@ -347,7 +401,30 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                 ledger.record_terminal(business_task_id, status="failed", error={"message": str(exc)})
             publish({"phase": "failed", "error": str(exc), "business_task_id": business_task_id})
         finally:
+            # Finalize only after every success/failure/cancellation path has
+            # written its durable terminal ledger event.  This is deliberately
+            # outside the remote client so a single document can cover client
+            # upload, GPU timing, polling, result transfer and local storage.
+            if ledger is not None and business_task_id is not None:
+                try:
+                    task = ledger.get(business_task_id) or {}
+                    if task.get("status") in {"succeeded", "failed", "cancelled", "interrupted_unconfirmed"}:
+                        end_to_end_trace = ledger.finalize_end_to_end_trace(business_task_id)
+                        if outcome.get("result") is not None and end_to_end_trace:
+                            outcome["result"]["end_to_end_trace"] = end_to_end_trace.get("result_copy_path")
+                        publish({
+                            "mode": "remote_gpu",
+                            "phase": task.get("status"),
+                            "business_task_id": business_task_id,
+                            "end_to_end_trace": end_to_end_trace,
+                        })
+                except Exception:
+                    # Observability must never conceal the original analysis
+                    # outcome.  The traceback still makes a broken trace
+                    # implementation diagnosable from the business process.
+                    traceback.print_exc()
             finished.set()
+            _ANALYSIS_TASKS.finish(task_handle)
 
     threading.Thread(target=worker, name="webui-analysis-status", daemon=True).start()
     status = {"mode": "remote_gpu", "phase": "preparing", "elapsed_seconds": 0}
@@ -360,12 +437,39 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             except queue.Empty:
                 break
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        if task_handle.is_cancelled() and status.get("phase") not in {"cancelled", "succeeded", "failed"}:
+            status["phase"] = "cancelling"
+            status["cancellation_requested"] = True
         if updated or status["phase"] == "preparing":
             yield None, None, None, None, None, None, None, None, status.copy()
         time.sleep(0.4)
 
+    if "cancelled" in outcome:
+        status.update({"phase": "cancelled", "message": outcome["cancelled"]})
+        status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        yield None, None, None, None, None, None, None, None, status.copy()
+        return
+    if "interrupt_unconfirmed" in outcome:
+        status.update({
+            "phase": "interrupted_unconfirmed",
+            "message": outcome["interrupt_unconfirmed"],
+        })
+        status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        yield None, None, None, None, None, None, None, None, status.copy()
+        return
     if "error" in outcome:
-        raise gr.Error(f"分析失败：{outcome['error']}") from outcome["error"]
+        # Preserve the failure in the visible progress panel.  Raising a
+        # Gradio exception immediately can replace the last streamed JSON with
+        # a short toast, which made transport failures impossible to diagnose.
+        status.update({
+            "phase": "failed",
+            "error": str(outcome["error"]),
+            "error_type": type(outcome["error"]).__name__,
+            "action": "请查看 error 字段；若为上传/连接失败，请先恢复 127.0.0.1:8080 SSH 隧道。",
+        })
+        status["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        yield None, None, None, None, None, None, None, None, status.copy()
+        return
     result = outcome["result"]
 
     for warning in result.get("warnings", []):
@@ -397,6 +501,22 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         output_video, viz_images or None, metadata_content, detections_file,
         tracknet_raw_file, performance_report_file, rally_summary, rally_rows, status.copy(),
     )
+
+
+def interrupt_active_analysis(language="zh"):
+    """Signal the active WebUI task; its worker exits at the next safe checkpoint."""
+    active = _ANALYSIS_TASKS.request_cancel()
+    if active is None:
+        return {
+            "phase": "idle",
+            "message": "当前没有可中断的分析任务。" if language == "zh" else "No analysis task is running.",
+        }
+    return {
+        "phase": "cancelling",
+        "message": "已请求中断；正在等待当前帧或子进程安全退出。" if language == "zh"
+        else "Interrupt requested; waiting for the current frame or child process to exit safely.",
+        **active,
+    }
 
 
 def _rally_summary_from_result(result, metadata):
@@ -489,6 +609,7 @@ _UI_TEXT = {
         "apply_btn": "应用手动角点",
         "step2": "### 第二步 — 运行分析",
         "run_btn": "运行分析",
+        "interrupt_btn": "中断当前任务",
         "results": "### 结果",
         "out_video": "标注视频",
         "out_status": "分析进度（执行任务）",
@@ -540,6 +661,7 @@ _UI_TEXT = {
         "apply_btn": "Apply Manual Corners",
         "step2": "### Step 2 — Run Analysis",
         "run_btn": "Run Analysis",
+        "interrupt_btn": "Interrupt Current Task",
         "results": "### Results",
         "out_video": "Annotated Video",
         "out_status": "Analysis Progress (Execution Job)",
@@ -696,6 +818,7 @@ def _switch_language(lang):
         gr.update(value=t["apply_btn"]),
         gr.update(value=t["step2"]),
         gr.update(value=t["run_btn"]),
+        gr.update(value=t["interrupt_btn"]),
         gr.update(value=t["results"]),
         gr.update(label=t["out_status"]),
         gr.update(label=t["out_video"]),
@@ -1459,7 +1582,9 @@ def build_ui():
                     apply_btn = gr.Button(t["apply_btn"], variant="secondary")
 
                     md_step2 = gr.Markdown(t["step2"])
-                    run_btn = gr.Button(t["run_btn"], variant="primary")
+                    with gr.Row():
+                        run_btn = gr.Button(t["run_btn"], variant="primary")
+                        interrupt_btn = gr.Button(t["interrupt_btn"], variant="stop")
 
                     md_results = gr.Markdown(t["results"])
                     output_status = gr.JSON(
@@ -1851,7 +1976,7 @@ def build_ui():
             show_shuttlecock_trajectory, show_player_stats, show_pose_roi,
             visualize_positions, yolo_pose_model, ball_model,
             md_step1, detect_btn, court_image, corner_status, apply_btn,
-            md_step2, run_btn, md_results,
+            md_step2, run_btn, interrupt_btn, md_results,
             output_status, output_video, output_gallery, output_metadata, output_detections,
         ]
         language.change(fn=_switch_language, inputs=[language], outputs=lang_outputs)
@@ -1914,6 +2039,13 @@ def build_ui():
                 output_performance_report,
                 output_rally_summary, output_rallies, output_status,
             ],
+        )
+        interrupt_btn.click(
+            fn=interrupt_active_analysis,
+            inputs=[language],
+            outputs=[output_status],
+            queue=False,
+            show_progress="hidden",
         )
 
     return demo

@@ -62,6 +62,8 @@ class GpuApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["status"], "queued")
         self.assertEqual(payload["execution"]["mode"], "remote_gpu")
+        self.assertEqual(payload["timing"]["current_stage"], "queue_wait")
+        self.assertEqual(payload["timing"]["stages"][0]["name"], "queue_wait")
         self.assertTrue(payload["receipt"]["accepted"])
         self.assertFalse(payload["receipt"]["reused"])
         job_id = payload["job_id"]
@@ -71,6 +73,7 @@ class GpuApiTests(unittest.TestCase):
         )
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.json()["job_id"], job_id)
+        self.assertEqual(status_response.json()["timing"]["current_stage"], "queue_wait")
 
         repeated = self.client.post(
             "/api/v1/jobs",
@@ -134,6 +137,39 @@ class GpuApiTests(unittest.TestCase):
         stored = self.app.state.job_manager.get_job(job["job_id"])
         self.assertEqual(stored["options"]["shuttle_detector"], "tracknet_v3")
 
+    def test_operator_can_cancel_a_queued_job_without_deleting_its_record(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-cancel"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={"court_corners": "[[1,1],[2,1],[2,2],[1,2]]"},
+        )
+        job_id = response.json()["job_id"]
+
+        cancelled = self.client.delete(
+            f"/api/v1/jobs/{job_id}", headers={"X-API-Key": "test-api-key"}
+        )
+
+        self.assertEqual(cancelled.status_code, 200)
+        payload = cancelled.json()
+        self.assertEqual(payload["status"], "cancelled")
+        self.assertEqual(payload["error"]["type"], "TaskCancelled")
+        self.assertIsNotNone(payload["finished_at"])
+        self.assertEqual(payload["performance_trace"]["relative_path"], "performance_trace.json")
+        self.assertTrue(any(item["event"] == "cancellation_requested" for item in payload["state_history"]))
+
+        trace_response = self.client.get(
+            f"/api/v1/jobs/{job_id}/performance-trace", headers={"X-API-Key": "test-api-key"}
+        )
+        self.assertEqual(trace_response.status_code, 200)
+        trace = trace_response.json()
+        self.assertEqual(trace["task"]["job_id"], job_id)
+        self.assertEqual(trace["task"]["status"], "cancelled")
+        self.assertEqual(trace["timing"]["current_stage"], "cancelled")
+
     def test_job_uses_960_and_10hz_pose_defaults(self):
         response = self.client.post(
             "/api/v1/jobs",
@@ -149,6 +185,24 @@ class GpuApiTests(unittest.TestCase):
         self.assertEqual(stored["options"]["pose_imgsz"], 960)
         self.assertEqual(stored["options"]["pose_sample_hz"], 10.0)
         self.assertEqual(stored["tracking"]["phase"], "waiting_for_analysis")
+
+    def test_job_allows_an_explicit_full_frame_pose_evidence_run(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-full-pose"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"pose_sample_hz":0}',
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["options"]["pose_sample_hz"], 0.0)
 
     def test_job_keeps_an_opaque_match_reference_without_participant_identity(self):
         response = self.client.post(

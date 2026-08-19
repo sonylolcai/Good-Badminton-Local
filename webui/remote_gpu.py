@@ -17,6 +17,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from badminton_analysis.cancellation import AnalysisCancelled, raise_if_cancelled
+
 
 DEFAULT_GPU_API_URL = "http://xn-g.suanjiayun.com:52028"
 CHUNK_BYTES = 1024 * 1024
@@ -52,8 +54,9 @@ def _load_local_config_file():
 
 
 def run_remote_analysis(video_path, template_path, corners, options, output_dir, progress_cb=None, status_cb=None,
-                        business_task_id=None):
+                        business_task_id=None, cancel_cb=None):
     """Submit, wait for, and retrieve one remote job into *output_dir*."""
+    raise_if_cancelled(cancel_cb)
     config = remote_gpu_config()
     if not config["api_key"]:
         raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured in the WebUI process")
@@ -68,6 +71,7 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
         progress_cb=progress_cb,
         status_cb=status_cb,
         idempotency_key=business_task_id,
+        cancel_cb=cancel_cb,
     )
     job_id = job["job_id"]
     receipt = job.get("receipt") or {}
@@ -77,14 +81,41 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
         "status_url": receipt.get("status_url"),
         "submission_reused": bool(receipt.get("reused")),
     })
-    latest = _wait_for_job(config, job_id, progress_cb=progress_cb, status_cb=status_cb)
+    latest = _wait_for_job(
+        config, job_id, progress_cb=progress_cb, status_cb=status_cb, cancel_cb=cancel_cb,
+    )
+    terminal_trace = _download_terminal_performance_trace(
+        config,
+        job_id,
+        latest,
+        output_dir,
+        # A terminal trace is small and must survive a user cancellation too.
+        cancel_cb=None,
+        status_cb=status_cb,
+    )
+    if latest.get("status") == "cancelled":
+        exc = AnalysisCancelled("远端 GPU 任务已中断。")
+        exc.performance_trace_path = terminal_trace
+        raise exc
     if latest.get("status") != "succeeded":
         error = latest.get("error") or {}
-        raise RemoteAnalysisError(error.get("message") or f"remote job {job_id} ended as {latest.get('status')}")
+        exc = RemoteAnalysisError(error.get("message") or f"remote job {job_id} ended as {latest.get('status')}")
+        exc.performance_trace_path = terminal_trace
+        raise exc
 
+    try:
+        raise_if_cancelled(cancel_cb)
+    except AnalysisCancelled as exc:
+        exc.performance_trace_path = terminal_trace
+        raise
     _emit(status_cb, {"mode": "remote_gpu", "phase": "downloading", "job_id": job_id})
     result = _json_request(config, f"/api/v1/jobs/{job_id}/result")
-    downloaded = _download_result(config, job_id, result, output_dir)
+    downloaded = _download_result(
+        config, job_id, result, output_dir,
+        cancel_cb=cancel_cb, status_cb=status_cb,
+    )
+    if terminal_trace and not downloaded.get("performance_trace"):
+        downloaded["performance_trace"] = terminal_trace
     _emit(status_cb, {"mode": "remote_gpu", "phase": "downloaded", "job_id": job_id})
     return downloaded
 
@@ -100,7 +131,7 @@ def _remote_options(options):
 
 
 def _submit_multipart(config, video_path, template_path, corners, options, progress_cb=None, status_cb=None,
-                      idempotency_key=None):
+                      idempotency_key=None, cancel_cb=None):
     parsed = urlparse(config["base_url"])
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_URL must be an http(s) URL")
@@ -126,12 +157,15 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
             connection.putheader("X-Idempotency-Key", idempotency_key)
         connection.endheaders()
         for name, value in fields.items():
+            raise_if_cancelled(cancel_cb)
             connection.send(_field_part(boundary, name, value))
         for name, path in (("video", video_path), ("template", template_path)):
+            raise_if_cancelled(cancel_cb)
             path = Path(path)
             connection.send(_file_header(boundary, name, path))
             with path.open("rb") as source:
                 while chunk := source.read(CHUNK_BYTES):
+                    raise_if_cancelled(cancel_cb)
                     connection.send(chunk)
                     sent += len(chunk)
                     if progress_cb and total_upload:
@@ -141,8 +175,17 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
         connection.send(f"--{boundary}--\r\n".encode("utf-8"))
         response = connection.getresponse()
         body = response.read().decode("utf-8", "replace")
+    except TimeoutError as exc:
+        raise RemoteAnalysisError(
+            "远端 GPU 上传在 "
+            f"{config['timeout_seconds']:g} 秒内未收到接收回执；"
+            "请先检查本地 127.0.0.1:8080 SSH 隧道和远端 /api/v1/health。"
+        ) from exc
     except OSError as exc:
-        raise RemoteAnalysisError(f"remote GPU upload failed: {exc}") from exc
+        raise RemoteAnalysisError(
+            "远端 GPU 上传连接失败；请先检查本地 127.0.0.1:8080 SSH 隧道和远端服务。"
+            f" 原始错误：{exc}"
+        ) from exc
     finally:
         connection.close()
     if response.status not in {200, 201, 202}:
@@ -150,22 +193,37 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
     return _parse_json(body, "remote job submission")
 
 
-def _wait_for_job(config, job_id, progress_cb=None, status_cb=None):
+def _wait_for_job(config, job_id, progress_cb=None, status_cb=None, cancel_cb=None):
     deadline = time.monotonic() + float(os.environ.get("GOOD_BADMINTON_GPU_JOB_TIMEOUT", "43200"))
+    cancellation_sent = False
     while time.monotonic() < deadline:
+        if cancel_cb is not None and cancel_cb() and not cancellation_sent:
+            cancelled = _json_request(config, f"/api/v1/jobs/{job_id}", method="DELETE")
+            _emit(status_cb, {
+                "mode": "remote_gpu", "phase": cancelled.get("status") or "cancelling",
+                "job_id": job_id, "cancellation_requested": True,
+            })
+            cancellation_sent = True
         job = _json_request(config, f"/api/v1/jobs/{job_id}")
         state = job.get("status")
         details = job.get("progress") or {}
+        timing = job.get("timing") or {}
+        stages = timing.get("stages") or []
+        current_stage = stages[-1] if stages else {}
         _emit(status_cb, {
             "mode": "remote_gpu", "phase": state, "job_id": job_id,
             "processed_frames": details.get("processed_frames", 0),
             "total_frames": details.get("total_frames"), "ratio": details.get("ratio", 0.0),
             "tracking": job.get("tracking"),
+            "timing": timing,
+            "performance_trace": job.get("performance_trace"),
+            "stage": timing.get("current_stage"),
+            "stage_detail": current_stage.get("details"),
         })
         if progress_cb:
             ratio = float(details.get("ratio") or 0.0)
             progress_cb(0.25 + ratio * 0.75, f"GPU {state}: {details.get('processed_frames', 0)}/{details.get('total_frames') or '?'} 帧")
-        if state in {"succeeded", "failed"}:
+        if state in {"succeeded", "failed", "cancelled"}:
             return job
         time.sleep(config["poll_seconds"])
     raise RemoteAnalysisError(f"remote GPU job {job_id} polling timed out")
@@ -191,28 +249,43 @@ def recover_remote_task(business_task_id, remote_job_id, output_dir, status_cb=N
         })
     job = _json_request(config, f"/api/v1/jobs/{job_id}")
     details = job.get("progress") or {}
+    timing = job.get("timing") or {}
+    stages = timing.get("stages") or []
+    current_stage = stages[-1] if stages else {}
     _emit(status_cb, {
         "mode": "remote_gpu", "phase": job.get("status"), "job_id": job_id,
         "processed_frames": details.get("processed_frames", 0),
         "total_frames": details.get("total_frames"), "ratio": details.get("ratio", 0.0),
         "tracking": job.get("tracking"),
+        "timing": timing,
+        "performance_trace": job.get("performance_trace"),
+        "stage": timing.get("current_stage"),
+        "stage_detail": current_stage.get("details"),
         "recovered": True,
     })
     if job.get("status") != "succeeded":
         return job, None
     _emit(status_cb, {"mode": "remote_gpu", "phase": "downloading", "job_id": job_id, "recovered": True})
     result = _json_request(config, f"/api/v1/jobs/{job_id}/result")
-    downloaded = _download_result(config, job_id, result, output_dir)
+    downloaded = _download_result(config, job_id, result, output_dir, status_cb=status_cb)
     _emit(status_cb, {"mode": "remote_gpu", "phase": "downloaded", "job_id": job_id, "recovered": True})
     return job, downloaded
 
 
-def _download_result(config, job_id, result, output_dir):
+def _download_result(config, job_id, result, output_dir, cancel_cb=None, status_cb=None):
+    """Download result artifacts in a documented, deterministic serial order.
+
+    Result transfer is intentionally reported one artifact at a time.  The
+    current implementation is serial, so these lifecycle events provide the
+    evidence needed to decide whether parallel egress is worth adding rather
+    than making an unverified performance claim.
+    """
     target = Path(output_dir)
     target.mkdir(parents=True, exist_ok=True)
     artifacts = (result.get("result") or {}).get("artifacts") or {}
     downloaded = {}
     for name, artifact in artifacts.items():
+        raise_if_cancelled(cancel_cb)
         relative_path = artifact.get("relative_path") or name
         destination = (target / relative_path).resolve()
         try:
@@ -220,8 +293,22 @@ def _download_result(config, job_id, result, output_dir):
         except ValueError as exc:
             raise RemoteAnalysisError("remote API returned an unsafe artifact path") from exc
         destination.parent.mkdir(parents=True, exist_ok=True)
-        _download(config, artifact.get("url") or f"/api/v1/jobs/{job_id}/artifacts/{name}", destination)
+        _emit(status_cb, {
+            "mode": "remote_gpu", "phase": "artifact_downloading", "job_id": job_id,
+            "artifact": name, "relative_path": relative_path,
+        })
+        _download(
+            config,
+            artifact.get("url") or f"/api/v1/jobs/{job_id}/artifacts/{name}",
+            destination,
+            cancel_cb=cancel_cb,
+        )
         downloaded[name] = str(destination)
+        _emit(status_cb, {
+            "mode": "remote_gpu", "phase": "artifact_downloaded", "job_id": job_id,
+            "artifact": name, "relative_path": relative_path,
+            "size_bytes": destination.stat().st_size,
+        })
 
     metadata_path = downloaded.get("metadata")
     metadata = {}
@@ -238,6 +325,10 @@ def _download_result(config, job_id, result, output_dir):
     else:
         metadata_path = str(target / "metadata.remote.json")
         Path(metadata_path).write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _emit(status_cb, {
+        "mode": "remote_gpu", "phase": "local_metadata_persisted", "job_id": job_id,
+        "metadata_path": metadata_path,
+    })
 
     return {
         "output_dir": str(target),
@@ -246,17 +337,54 @@ def _download_result(config, job_id, result, output_dir):
         "detections": downloaded.get("detections"),
         "tracknet_raw_csv": downloaded.get("tracknet_raw_csv"),
         "performance_report": downloaded.get("performance_report"),
+        "performance_trace": downloaded.get("performance_trace"),
+        "position_evidence_summary": downloaded.get("position_evidence_summary"),
         "visualizations": [path for name, path in downloaded.items() if name.startswith("visualization_")],
         "warnings": (result.get("result") or {}).get("warnings", []),
         "execution": metadata["execution"],
     }
 
 
-def _json_request(config, path):
+def _download_terminal_performance_trace(config, job_id, job, output_dir, cancel_cb=None, status_cb=None):
+    """Fetch a terminal trace for success, failure, or cancellation.
+
+    Failed jobs do not expose the normal result manifest, so this uses the
+    dedicated endpoint and deliberately never masks the original task error if
+    archival download itself is unavailable.
+    """
+    trace = (job or {}).get("performance_trace") or {}
+    if not trace:
+        return None
+    target = Path(output_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    destination = target / "performance_trace.json"
+    try:
+        _emit(status_cb, {
+            "mode": "remote_gpu", "phase": "artifact_downloading", "job_id": job_id,
+            "artifact": "performance_trace", "relative_path": "performance_trace.json",
+            "terminal_trace": True,
+        })
+        _download(
+            config,
+            trace.get("url") or f"/api/v1/jobs/{job_id}/performance-trace",
+            destination,
+            cancel_cb=cancel_cb,
+        )
+    except (RemoteAnalysisError, OSError):
+        return None
+    _emit(status_cb, {
+        "mode": "remote_gpu", "phase": "artifact_downloaded", "job_id": job_id,
+        "artifact": "performance_trace", "relative_path": "performance_trace.json",
+        "size_bytes": destination.stat().st_size, "terminal_trace": True,
+    })
+    return str(destination) if destination.is_file() else None
+
+
+def _json_request(config, path, method="GET"):
     request = Request(
         config["base_url"] + path,
         headers={"X-API-Key": config["api_key"]},
-        method="GET",
+        method=method,
     )
     try:
         with urlopen(request, timeout=config["timeout_seconds"], context=_ssl_context(config["base_url"])) as response:
@@ -266,11 +394,12 @@ def _json_request(config, path):
     return _parse_json(body, "remote GPU response")
 
 
-def _download(config, path, destination):
+def _download(config, path, destination, cancel_cb=None):
     request = Request(config["base_url"] + path, headers={"X-API-Key": config["api_key"]}, method="GET")
     try:
         with urlopen(request, timeout=config["timeout_seconds"], context=_ssl_context(config["base_url"])) as response, destination.open("wb") as output:
             while chunk := response.read(CHUNK_BYTES):
+                raise_if_cancelled(cancel_cb)
                 output.write(chunk)
     except OSError as exc:
         raise RemoteAnalysisError(f"artifact download failed: {exc}") from exc

@@ -1,8 +1,10 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from webui.task_ledger import BusinessTaskLedger
+from webui.task_control import AnalysisTaskController
 
 
 class BusinessTaskLedgerTests(unittest.TestCase):
@@ -25,3 +27,117 @@ class BusinessTaskLedgerTests(unittest.TestCase):
             self.assertEqual([item["event"] for item in task["history"]], [
                 "submission_started", "remote_receipt_confirmed", "remote_status_polled",
             ])
+
+    def test_webui_interrupt_is_scoped_to_the_active_task(self):
+        controller = AnalysisTaskController()
+        first = controller.start()
+
+        snapshot = controller.request_cancel()
+
+        self.assertTrue(first.is_cancelled())
+        self.assertTrue(snapshot["cancel_requested"])
+        controller.finish(first)
+        self.assertIsNone(controller.snapshot())
+
+        second = controller.start()
+        self.assertFalse(second.is_cancelled())
+        controller.finish(second)
+
+    def test_performance_trace_is_copied_outside_the_prunable_result_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger = BusinessTaskLedger(root / "business_tasks")
+            task_id = ledger.start_task(output_dir=str(root / "temporary_result"), remote_base_url="http://gpu")
+            source = root / "temporary_result" / "performance_trace.json"
+            source.parent.mkdir()
+            source.write_text(
+                '{"schema_version":"1.0","task":{"job_id":"job-1","status":"succeeded"}}\n',
+                encoding="utf-8",
+            )
+
+            record = ledger.archive_performance_trace(task_id, source)
+            source.unlink()
+
+            task = ledger.get(task_id)
+            archived = ledger.root / record["relative_path"]
+            self.assertTrue(archived.is_file())
+            self.assertEqual(task["performance_trace"]["source_job_id"], "job-1")
+            self.assertEqual(task["history"][-1]["event"], "performance_trace_archived")
+
+    def test_end_to_end_trace_joins_client_and_gpu_evidence_and_marks_serial_work(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "remote_result"
+            ledger = BusinessTaskLedger(root / "business_tasks")
+            task_id = ledger.start_task(output_dir=str(output), remote_base_url="http://gpu")
+
+            # These events model the complete client-side path: upload, a
+            # receipt, non-blocking polling, then deterministic artifact I/O.
+            ledger.record_remote_event(task_id, {
+                "phase": "uploading", "uploaded_bytes": 0, "total_upload_bytes": 100,
+            })
+            ledger.record_remote_event(task_id, {
+                "phase": "uploading", "uploaded_bytes": 100, "total_upload_bytes": 100,
+            })
+            ledger.record_remote_event(task_id, {
+                "phase": "accepted", "job_id": "job-1", "accepted_at": "2026-01-01T00:00:01+00:00",
+            })
+            ledger.record_remote_event(task_id, {"phase": "running", "job_id": "job-1"})
+            ledger.record_remote_event(task_id, {"phase": "succeeded", "job_id": "job-1"})
+            ledger.record_remote_event(task_id, {
+                "phase": "downloading", "job_id": "job-1",
+            })
+            ledger.record_remote_event(task_id, {
+                "phase": "artifact_downloading", "job_id": "job-1",
+                "artifact": "detections", "relative_path": "detections.jsonl",
+            })
+            ledger.record_remote_event(task_id, {
+                "phase": "artifact_downloaded", "job_id": "job-1",
+                "artifact": "detections", "relative_path": "detections.jsonl", "size_bytes": 123,
+            })
+            ledger.record_remote_event(task_id, {
+                "phase": "local_metadata_persisted", "job_id": "job-1",
+                "metadata_path": str(output / "metadata.json"),
+            })
+            ledger.record_remote_event(task_id, {"phase": "downloaded", "job_id": "job-1"})
+
+            source = output / "performance_trace.json"
+            output.mkdir(parents=True, exist_ok=True)
+            source.write_text(
+                """{
+                  "schema_version": "1.0",
+                  "task": {
+                    "job_id": "job-1",
+                    "status": "succeeded",
+                    "created_at": "2026-01-01T00:00:01+00:00",
+                    "started_at": "2026-01-01T00:00:02+00:00",
+                    "finished_at": "2026-01-01T00:00:12+00:00"
+                  },
+                  "timing": {
+                    "stages": [
+                      {"name": "queue_wait", "started_at": "2026-01-01T00:00:01+00:00", "finished_at": "2026-01-01T00:00:02+00:00"},
+                      {"name": "tracknet.inference", "started_at": "2026-01-01T00:00:02+00:00", "finished_at": "2026-01-01T00:00:06+00:00"},
+                      {"name": "human_frame_processing", "started_at": "2026-01-01T00:00:06+00:00", "finished_at": "2026-01-01T00:00:12+00:00"}
+                    ]
+                  }
+                }\n""",
+                encoding="utf-8",
+            )
+            ledger.archive_performance_trace(task_id, source)
+            ledger.record_terminal(task_id, status="succeeded")
+
+            record = ledger.finalize_end_to_end_trace(task_id)
+            trace_path = ledger.root / record["relative_path"]
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+
+            self.assertTrue((output / "end_to_end_trace.json").is_file())
+            self.assertEqual(trace["timeline"]["upload"]["media_bytes"], 100)
+            self.assertEqual(trace["timeline"]["result_transfer"]["artifacts"][0]["artifact"], "detections")
+            self.assertEqual(trace["execution_topology"]["current_execution_model"],
+                             "complete_upload_then_single_gpu_worker_then_sequential_artifact_download")
+            self.assertEqual(trace["execution_topology"]["actual_parallelism"][0]["scope"],
+                             "control-plane observation only")
+            self.assertEqual(trace["execution_topology"]["nodes"][1]["serialized_stages"], [
+                "queue_wait", "tracknet.inference", "human_frame_processing",
+            ])
+            self.assertEqual(ledger.finalize_end_to_end_trace(task_id), record)

@@ -23,6 +23,19 @@ from pathlib import Path
 from typing import Iterator
 
 
+EVENT_PREFIX = "GOOD_BADMINTON_TRACKNET_EVENT="
+
+
+def emit_event(stage: str, **details) -> None:
+    """Write a machine-readable heartbeat for the API job manifest.
+
+    The outer process forwards these lines directly into the durable job
+    timing trace.  Human-readable logs remain below for SSH diagnosis.
+    """
+    payload = {"stage": stage, **details}
+    print(EVENT_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video-file", required=True, type=Path)
@@ -56,6 +69,7 @@ def main() -> int:
     from utils.general import HEIGHT, WIDTH, generate_frames, get_model, write_pred_csv
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
+    emit_event("checkpoint_load")
     checkpoint = torch.load(args.tracknet_file, map_location="cpu", weights_only=False)
     param_dict = checkpoint["param_dict"]
     seq_len = int(param_dict["seq_len"])
@@ -63,10 +77,13 @@ def main() -> int:
     print(f"TrackNet runtime: seq_len={seq_len}, bg_mode={bg_mode}, batch={args.batch_size}", flush=True)
 
     started = time.perf_counter()
+    emit_event("video_decode")
     bgr_frames = generate_frames(str(args.video_file))
     if not bgr_frames:
         raise SystemExit("Video contains no decodable frames")
-    print(f"Decoded {len(bgr_frames)} frames in {time.perf_counter() - started:.1f}s", flush=True)
+    decode_elapsed = time.perf_counter() - started
+    print(f"Decoded {len(bgr_frames)} frames in {decode_elapsed:.1f}s", flush=True)
+    emit_event("frame_preprocess", frame_count=len(bgr_frames), decode_seconds=round(decode_elapsed, 3))
     height, width = bgr_frames[0].shape[:2]
     rgb_frames = [frame[..., ::-1] for frame in bgr_frames]
 
@@ -77,10 +94,12 @@ def main() -> int:
     del bgr_frames, rgb_frames
     print(f"Prepared {len(processed)} resized frames for GPU batches", flush=True)
 
+    emit_event("model_initialize", frame_count=len(processed))
     model = get_model("TrackNet", seq_len, bg_mode).cuda()
     model.load_state_dict(checkpoint["model"])
     model.eval()
     del checkpoint
+    emit_event("inference", frame_count=len(processed))
 
     median_channels = _prepare_median_channels(np, Image, background, bg_mode, WIDTH, HEIGHT)
     predictions = _infer_weighted(
@@ -97,9 +116,11 @@ def main() -> int:
         get_ensemble_weight=get_ensemble_weight,
         height=HEIGHT,
         width=WIDTH,
+        event_cb=emit_event,
     )
 
     output_csv = args.save_dir / f"{args.video_file.stem}_ball.csv"
+    emit_event("csv_export", frame_count=len(processed))
     write_pred_csv(predictions, save_file=str(output_csv))
     metadata = {
         "schema_version": "1.0",
@@ -122,6 +143,7 @@ def main() -> int:
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    emit_event("complete", frame_count=len(processed), raw_csv=str(output_csv))
     print(f"Done. raw_csv={output_csv}", flush=True)
     return 0
 
@@ -202,6 +224,7 @@ def _infer_weighted(
     get_ensemble_weight,
     height: int,
     width: int,
+    event_cb=None,
 ) -> dict:
     frame_count = len(processed)
     image_scaler = (image_size[0] / width, image_size[1] / height)
@@ -215,6 +238,14 @@ def _infer_weighted(
     sample_count = 0
     total_batches = math.ceil(window_count / batch_size)
     started = time.perf_counter()
+    if event_cb is not None:
+        event_cb(
+            "inference",
+            batch_completed=0,
+            batch_total=total_batches,
+            windows_completed=0,
+            windows_total=window_count,
+        )
 
     for batch_number, (indices_np, inputs_np) in enumerate(
         _iter_batches(np, processed, median_channels, sequence_length, batch_size),
@@ -260,6 +291,15 @@ def _infer_weighted(
                 f"windows {sample_count}/{window_count}, elapsed {elapsed:.1f}s",
                 flush=True,
             )
+            if event_cb is not None:
+                event_cb(
+                    "inference",
+                    batch_completed=batch_number,
+                    batch_total=total_batches,
+                    windows_completed=sample_count,
+                    windows_total=window_count,
+                    elapsed_seconds=round(elapsed, 3),
+                )
     return results
 
 

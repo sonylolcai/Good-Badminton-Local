@@ -106,6 +106,12 @@ def create_app(data_dir=None, start_worker=True):
         job = _require_job(manager, job_id)
         return _job_response(job)
 
+    @app.delete("/api/v1/jobs/{job_id}", dependencies=[Depends(require_api_key)])
+    def cancel_job(job_id: str):
+        _require_job(manager, job_id)
+        job = manager.cancel_job(job_id)
+        return _job_response(job)
+
     @app.get("/api/v1/jobs/{job_id}/result", dependencies=[Depends(require_api_key)])
     def get_result(job_id: str):
         job = _require_job(manager, job_id)
@@ -115,6 +121,15 @@ def create_app(data_dir=None, start_worker=True):
         for name in response["result"]["artifacts"]:
             response["result"]["artifacts"][name]["url"] = f"/api/v1/jobs/{job_id}/artifacts/{name}"
         return response
+
+    @app.get("/api/v1/jobs/{job_id}/performance-trace", dependencies=[Depends(require_api_key)])
+    def get_performance_trace(job_id: str):
+        """Download the durable timing trace for any terminal task state."""
+        _require_job(manager, job_id)
+        path = manager.performance_trace_path(job_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Performance trace is not available yet")
+        return FileResponse(path, media_type="application/json", filename=path.name)
 
     @app.get("/api/v1/jobs/{job_id}/artifacts/{artifact_name}", dependencies=[Depends(require_api_key)])
     def get_artifact(job_id: str, artifact_name: str):
@@ -147,6 +162,8 @@ def _job_response(job, receipt_reused=None):
         "progress": job.get("progress"),
         "error": job.get("error"),
         "execution": job.get("execution"),
+        "timing": job.get("timing"),
+        "performance_trace": job.get("performance_trace"),
         "tracking": job.get("tracking"),
         "result": result,
         "state_history": job.get("state_history", []),
@@ -159,6 +176,11 @@ def _job_response(job, receipt_reused=None):
             "status_url": f"/api/v1/jobs/{job['job_id']}",
             "result_url": f"/api/v1/jobs/{job['job_id']}/result",
             "poll_after_seconds": 2,
+        }
+    if response["performance_trace"] is not None:
+        response["performance_trace"] = {
+            **response["performance_trace"],
+            "url": f"/api/v1/jobs/{job['job_id']}/performance-trace",
         }
     return response
 
@@ -201,9 +223,9 @@ def _parse_options(value):
         "show_pose_roi": False,
         "visualize_positions": True,
         "output_video_style": "skeleton",
-        # Fixed-camera matches use 10 Hz pose evidence by default. 960 keeps
-        # distant-player detail while leaving capacity for TrackNet and the
-        # post-match report on a 24 GB GPU.
+        # Fixed-camera production keeps a timestamped 10 Hz pose budget.  A
+        # caller can still explicitly request 0 for an offline full-frame
+        # evidence run, but it is not suitable as the streaming default.
         "pose_imgsz": 960,
         "pose_sample_hz": 10.0,
         "pose_conf": 0.15,
@@ -223,8 +245,12 @@ def _parse_options(value):
     options = {**defaults, **received}
     if options["pose_imgsz"] not in {640, 960, 1280}:
         raise HTTPException(status_code=422, detail="pose_imgsz must be 640, 960, or 1280")
-    if not 1.0 <= float(options["pose_sample_hz"]) <= 30.0:
-        raise HTTPException(status_code=422, detail="pose_sample_hz must be between 1 and 30")
+    sample_hz = float(options["pose_sample_hz"])
+    if sample_hz < 0.0 or (0.0 < sample_hz < 1.0):
+        raise HTTPException(
+            status_code=422,
+            detail="pose_sample_hz must be 0 (every source frame) or at least 1",
+        )
     if not 0 < float(options["pose_conf"]) <= 1:
         raise HTTPException(status_code=422, detail="pose_conf must be in (0, 1]")
     if options["output_video_style"] not in {"annotated", "skeleton"}:
