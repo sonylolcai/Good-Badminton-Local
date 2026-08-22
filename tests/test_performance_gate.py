@@ -7,7 +7,7 @@ PROFILE = {
     "profile_id": "test-3090",
     "production_options": {
         "pose_imgsz": 960,
-        "pose_sample_hz": 10.0,
+        "analysis_sample_hz": 10.0,
         "shuttle_detector": "yolo",
         "max_llm_requests_per_match": 1,
     },
@@ -22,7 +22,7 @@ PROFILE = {
 }
 
 
-def make_trace(pose_sample_hz=10.0, human_seconds=8.0):
+def make_trace(analysis_sample_hz=10.0, human_seconds=8.0):
     return {
         "task": {
             "status": "succeeded",
@@ -31,7 +31,8 @@ def make_trace(pose_sample_hz=10.0, human_seconds=8.0):
         },
         "options": {
             "pose_imgsz": 960,
-            "pose_sample_hz": pose_sample_hz,
+            "analysis_sample_hz": analysis_sample_hz,
+            "pose_sample_hz": analysis_sample_hz,
             "shuttle_detector": "yolo",
         },
         "progress": {"total_frames": 300},
@@ -67,10 +68,10 @@ class PerformanceGateTests(unittest.TestCase):
         self.assertTrue(any(check["name"] == "streaming_slo.evidence" for check in report["checks"]))
 
     def test_production_parameter_drift_fails_gate(self):
-        report = build_report(make_trace(pose_sample_hz=0.0), PROFILE)
+        report = build_report(make_trace(analysis_sample_hz=0.0), PROFILE)
 
         self.assertEqual(report["status"], FAIL)
-        pose_check = next(check for check in report["checks"] if check["name"] == "production_option.pose_sample_hz")
+        pose_check = next(check for check in report["checks"] if check["name"] == "production_option.analysis_sample_hz")
         self.assertEqual(pose_check["status"], FAIL)
 
     def test_stream_replay_can_prove_slo(self):

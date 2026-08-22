@@ -18,14 +18,18 @@
 
 | 数据 | 固定目标 | 15 分钟上限 | 原则 |
 |---|---:|---:|---|
-| YOLO Pose | 10 Hz，`imgsz=960` | 9,000 次人体测量时刻 | 30 FPS 每 3 帧、60 FPS 每 6 帧；跳过帧不是姿态测量。 |
-| TrackNetV3 球点 | `min(源 FPS, 30 Hz)` | 27,000 个输入时刻 | 60 FPS 输入降采样至 30 Hz，保留真实源时间戳与原始帧号。 |
-| 球场校验 | 开场标定 + 分片轻量校验 | 不重复全片检测 | 固定机位失效时进入 `camera_invalid`，不继续解释运动数据。 |
+| 统一分析采样 | 10 / 15 / 30 Hz，默认 10 Hz | 10 Hz 时 9,000 个分析时刻 | YOLO Pose、YOLO 羽毛球、Track/roster、轨迹/回合派生和 JSONL 共用一个时间桶。30 FPS 的 10 Hz 为每 3 帧一次；60 FPS 为每 6 帧一次。 |
+| TrackNetV3（可选） | 全时序模型 | 仅人工主动启用 | 它仍需连续 8 帧窗口才能保持已验证的模型语义；当前不假装它能靠后处理降采样获得同等速度。其输出只在统一分析时间桶进入主数据链路。 |
+| 球场校验 | 开场标定 + 2 Hz 轻量健康检查 | 不重复全片模板匹配 | 固定机位失效时进入 `camera_invalid`，不继续解释运动数据。 |
 | 报告 | 整场一次 LLM 请求 | 75 秒默认超时 | 一次请求包含全部 Track ID，不能按四名球员串行请求。 |
 
-人体在跳过帧只可保留时间追踪的 `predicted` 位置；关节关键点只记录在真正的
-10 Hz Pose 测量帧，并保存其 `measurement_frame`。这使后续肢体分析不会把旧骨架
-错误视为当前动作。
+跳过的原始帧不会调用人物/球模型、不会更新 roster、不会写入 JSONL，也不会被误记为
+“零人”或“球丢失”。关节关键点只记录在真正的统一分析测量帧，并保存其
+`measurement_frame`。这使后续肢体分析不会把旧骨架错误视为当前动作。
+
+`TrackNetV3` 是唯一明确列出的模型级例外：为保持官方 8 帧时序窗口，它在被主动启用时
+仍进行连续时序推理；它绝不会被静默当成 10 Hz 快模型。生产默认 `YOLO` 或“不检测球”，
+两者都完全遵守统一采样频率。
 
 ## 流式会话契约
 
@@ -109,6 +113,12 @@ queue_wait → analysis_bootstrap → preparing.*
 0.5 秒持久化一次（结束帧立即写入）。旧任务不具备此计时记录，不能将历史总时长
 事后精确归因。
 
+完成任务的 `performance_trace.json.execution.analysis_metrics` 还会记录每个组件的
+`calls` 与 `elapsed_seconds`：视频解码、球场健康检查、Pose、YOLO 球、球轨迹、空间
+Track/roster、旧数据兼容 PlayerTracker、JSONL 写入、可选绘制/编码，以及赛后派生。
+业务端生成的 `end_to_end_trace.json.timeline.remote_gpu.component_metrics` 原样带回这份
+证据；由此可区分 GPU 推理、CPU 跟踪、磁盘写入和后处理，而不是只看到一个总耗时。
+
 第一次带此计时记录的 1080p 30 FPS 和 60 FPS 实测，才是调整 Pose 采样率、TrackNet
 批量、FP16/TensorRT 或视频导出方案的基准；在此之前不得把当前完整文件批处理速度
 当作流式 SLA 的证明。
@@ -140,7 +150,8 @@ outputs/remote_jobs/<run>/end_to_end_trace.json                    # 本次结�
 
 ## 当前实现状态
 
-- 已完成：批处理默认改为 Pose `960 + 10 Hz`；关键点与真实测量帧持久化到
+- 已完成：批处理默认改为 Pose `960 + 统一 10 Hz`；YOLO 球、Track ID/roster、回合派生
+  和 JSONL 与该频率同步；跳帧不会重置开场 roster；关键点与真实测量帧持久化到
   `spatial.tracks`；任务轮询可返回开场锁定的候选 Track ID；赛后生成可审计的
   表现证据包和一次受限 LLM 报告调用接口。
 - 未完成：上述 `stream-sessions` 分片接收/跨分片模型状态、TrackNet 连续推理、15 分钟
@@ -155,7 +166,7 @@ outputs/remote_jobs/<run>/end_to_end_trace.json                    # 本次结�
 bash deploy/run_performance_gate.sh /path/to/performance_trace.json
 ```
 
-门禁锁定生产参数：Pose `960 + 10 Hz`、TrackNetV3，以及整场最多一次 LLM 请求；它还能
+门禁锁定生产参数：Pose `960 + 统一分析 10 Hz`、YOLO 球，以及整场最多一次 LLM 请求；它还能
 与同源视频的上一个 trace 比较每阶段回退。工具和报告格式见
 [`evaluation/performance/README.md`](evaluation/performance/README.md)。
 

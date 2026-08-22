@@ -75,11 +75,12 @@ class BadmintonAnalysisSystem:
                  pose_mode='balanced', pose_family='rtmpose',
                  yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True,
                  output_video_style='annotated', pose_imgsz=960,
-                 pose_sample_hz=0.0,
+                 pose_sample_hz=0.0, analysis_sample_hz=None,
+                 court_health_check_hz=2.0,
                  pose_conf=0.15, far_player_enhancement=False,
                  far_pose_roi=(0.12, 0.30, 0.86, 0.82), net_image_line=None,
-                 match_mode='singles', tracker_backend='court_association',
-                 enable_bytetrack=False, lock_match_roster=True,
+                 match_mode='singles', tracker_backend='bytetrack',
+                 enable_bytetrack=True, lock_match_roster=True,
                  roster_stable_frames=2, shuttle_detector='yolo',
                  tracknet_measurements_path=None, huji_action_model=None,
                  huji_sample_hz=6.0, generate_annotated_video=False,
@@ -106,9 +107,19 @@ class BadmintonAnalysisSystem:
         self.yolo_pose_model = yolo_pose_model
         self.show_pose_roi = show_pose_roi
         self.pose_imgsz = int(pose_imgsz)
-        self.pose_sample_hz = float(pose_sample_hz)
-        if self.pose_sample_hz < 0.0 or (0.0 < self.pose_sample_hz < 1.0):
-            raise ValueError("pose_sample_hz must be 0 (every source frame) or at least 1")
+        # ``pose_sample_hz`` remains a compatible alias for older callers.
+        # New analysis work has one shared measurement cadence: pose, YOLO
+        # shuttle, temporal tracking, rally/hit derivation, and JSONL records
+        # are all produced only on these timestamps.
+        if analysis_sample_hz is None:
+            analysis_sample_hz = pose_sample_hz
+        self.analysis_sample_hz = float(analysis_sample_hz)
+        if self.analysis_sample_hz < 0.0 or (0.0 < self.analysis_sample_hz < 1.0):
+            raise ValueError("analysis_sample_hz must be 0 (every source frame) or at least 1")
+        self.pose_sample_hz = self.analysis_sample_hz
+        self.court_health_check_hz = float(court_health_check_hz)
+        if self.court_health_check_hz <= 0.0:
+            raise ValueError("court_health_check_hz must be greater than 0")
         self.pose_conf = float(pose_conf)
         if not 0.0 < self.pose_conf <= 1.0:
             raise ValueError("pose_conf must be greater than 0 and no more than 1")
@@ -240,6 +251,76 @@ class BadmintonAnalysisSystem:
         self.performance_log_interval_frames = 150
         self.pose_processed_frames = 0
         self.performance_report = None
+        self.execution_metrics = self._new_execution_metrics()
+        self._last_is_court_view = None
+
+    @staticmethod
+    def _new_execution_metrics():
+        """Create a compact, additive trace for one analysis run.
+
+        The values are wall-clock measurements around concrete components.  A
+        GPU call is intentionally measured through its synchronous result
+        boundary, so the number remains meaningful on CPU and CUDA runtimes.
+        """
+        component_names = (
+            "video_decode", "court_health_check", "pose_inference",
+            "shuttle_inference", "shuttle_trajectory", "spatial_tracking",
+            "player_tracking", "jsonl_write", "visual_output", "spatial_finalize",
+            "offline_shot_reconstruction", "performance_report", "video_export", "cleanup",
+        )
+        return {
+            "schema_version": "1.0",
+            "sampling": {
+                "source_frames": 0,
+                "analysis_measurement_frames": 0,
+                "analysis_skipped_source_frames": 0,
+                "court_health_checks": 0,
+                "court_health_skipped_source_frames": 0,
+            },
+            "components": {
+                name: {"calls": 0, "elapsed_seconds": 0.0}
+                for name in component_names
+            },
+        }
+
+    def _record_execution_metric(self, component, elapsed_seconds, calls=1):
+        entry = self.execution_metrics["components"].setdefault(
+            component, {"calls": 0, "elapsed_seconds": 0.0}
+        )
+        entry["calls"] += int(calls)
+        entry["elapsed_seconds"] += max(0.0, float(elapsed_seconds))
+
+    def _finalize_execution_metrics(self, total_frames, video_duration):
+        metrics = self.execution_metrics
+        metrics["video"] = {
+            "source_fps": float(self.fps),
+            "total_source_frames": int(total_frames),
+            "duration_seconds": float(video_duration),
+        }
+        metrics["sampling"].update({
+            "requested_analysis_sample_hz": self.analysis_sample_hz,
+            "effective_analysis_sample_hz": (
+                float(self.fps) if self.analysis_sample_hz == 0
+                else min(float(self.fps), self.analysis_sample_hz)
+            ),
+            "court_health_check_hz": min(float(self.fps), self.court_health_check_hz),
+        })
+        metrics["total_elapsed_seconds"] = max(0.0, float(self.end_time - self.start_time))
+        metrics["topology"] = {
+            "analysis_measurements": "serial within one video worker",
+            "video_decode": "serial source-frame read",
+            "post_processing": "serial after raw measurement collection",
+            "remote_polling": "external to this worker and asynchronous",
+        }
+        for entry in metrics["components"].values():
+            entry["elapsed_seconds"] = round(float(entry["elapsed_seconds"]), 6)
+
+        if not os.path.isfile(self.metadata_path):
+            return
+        with open(self.metadata_path, "r", encoding="utf-8") as source:
+            metadata = json.load(source)
+        metadata["execution_metrics"] = metrics
+        write_json(self.metadata_path, metadata)
     def process_video(self, progress_callback=None, state_callback=None, cancel_callback=None):
         """Process the input video.
 
@@ -321,10 +402,13 @@ class BadmintonAnalysisSystem:
 
         while cap.isOpened():
             raise_if_cancelled(cancel_callback)
+            decode_t0 = time.perf_counter()
             ret, frame = cap.read()
+            self._record_execution_metric("video_decode", time.perf_counter() - decode_t0)
             if not ret:
                 break
             frame_count += 1
+            self.execution_metrics["sampling"]["source_frames"] += 1
             frame, detect_frame_count = self._process_frame(
                 frame, template_gray, corners, roi_corners, frame_count, out,
                 detect_frame_count, state_callback=state_callback,
@@ -333,15 +417,19 @@ class BadmintonAnalysisSystem:
                 progress_callback(frame_count, total_frames)
             raise_if_cancelled(cancel_callback)
 
+        cleanup_t0 = time.perf_counter()
+        self._cleanup(cap, state_callback=state_callback)
+        self._record_execution_metric("cleanup", time.perf_counter() - cleanup_t0)
+
         self.end_time = time.time()
+        self._finalize_execution_metrics(total_frames, video_duration)
         processing_time = self.end_time - self.start_time
-        
+
         print(f"\n处理完成:")
         print(f"原始视频时长: {video_duration:.2f} 秒")
         print(f"处理耗时: {processing_time:.2f} 秒")
         print(f"处理速度比: {processing_time/video_duration:.2f}x")
-        
-        self._cleanup(cap, state_callback=state_callback)
+        return self.execution_metrics
 
     def _write_metadata(self, fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height):
         metadata = {
@@ -399,14 +487,14 @@ class BadmintonAnalysisSystem:
                     # source frame, then persist raw COCO17 joints for every
                     # detected track observation.  A positive value is an
                     # opt-in performance/storage trade-off.
-                    "requested_sample_hz": self.pose_sample_hz,
-                    "effective_sample_hz": float(fps) if self.pose_sample_hz == 0 else min(float(fps), self.pose_sample_hz),
+                    "requested_sample_hz": self.analysis_sample_hz,
+                    "effective_sample_hz": float(fps) if self.analysis_sample_hz == 0 else min(float(fps), self.analysis_sample_hz),
                     "processed_frame_count": 0,
                     "raw_keypoint_contract": self.fixed_camera_match.tracker.pose_keypoint_contract(),
                     "sampling_policy": (
-                        "every_source_frame" if self.pose_sample_hz == 0 else
-                        "timestamp buckets retain source timestamps; skipped frames carry explicit "
-                        "predicted/missing track state and are never pose measurements"
+                        "every_source_frame" if self.analysis_sample_hz == 0 else
+                        "shared timestamp buckets: pose, shuttle, tracking and JSONL are measured together; "
+                        "skipped source frames create no detector or tracking evidence"
                     ),
                     "court_filter_margins_m": {
                         "lateral": self.player_pose_visualizer.court_filter_margin,
@@ -425,6 +513,10 @@ class BadmintonAnalysisSystem:
                     "unit": "meter",
                     "width": 6.1,
                     "length": 13.4,
+                },
+                "fixed_camera_health_check": {
+                    "requested_hz": self.court_health_check_hz,
+                    "policy": "template validation is a low-frequency camera health check, not a per-frame detector",
                 },
             },
             "outputs": {
@@ -481,84 +573,101 @@ class BadmintonAnalysisSystem:
 
     def _process_frame(self, frame, template_gray, corners, roi_corners, frame_count, out, detect_frame_count,
                        state_callback=None):
+        court_check_due = self._should_sample_court_health(frame_count)
+        if court_check_due:
+            court_t0 = time.perf_counter()
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            is_court = self.is_court_view(gray_frame, template_gray)
+            self._record_execution_metric("court_health_check", time.perf_counter() - court_t0)
+            self.execution_metrics["sampling"]["court_health_checks"] += 1
+            self._last_is_court_view = bool(is_court)
 
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # frame = self.draw_court_roi(frame, corners, roi_corners)
+            # Fixed-camera template comparison is only a health signal.  It
+            # needs consecutive health samples, not every decoded source
+            # frame, otherwise 2 Hz checks would accidentally become a five
+            # source-frame (0.17 s) state transition.
+            if is_court:
+                self.is_court_view_count += 1
+                self.consecutive_non_court_frames = 0
+            else:
+                self.consecutive_non_court_frames += 1
+                self.is_court_view_count = 0
 
-        is_court = self.is_court_view(gray_frame, template_gray)
-        
-        if is_court:
-            self.is_court_view_count += 1
-            self.consecutive_non_court_frames = 0
+            if self.is_court_view_count >= self.court_view_frames_threshold and not self.rally_active:
+                self.rally_active = True
+                self.rally_count += 1
+                self.player_tracker.start_new_rally()
+
+            if self.consecutive_non_court_frames >= self.non_court_frames_threshold and self.rally_active:
+                self.rally_active = False
+                self.shuttlecock_tracker.clear_trajectory()
         else:
-            self.consecutive_non_court_frames += 1
-            self.is_court_view_count = 0
-            
-
-        if self.is_court_view_count >= self.court_view_frames_threshold and not self.rally_active:
-            self.rally_active = True
-
-            self.rally_count += 1
-
-            self.player_tracker.start_new_rally()
-            
-
-        if self.consecutive_non_court_frames >= self.non_court_frames_threshold and self.rally_active:
-            self.rally_active = False
-
-            self.shuttlecock_tracker.clear_trajectory()
-
+            self.execution_metrics["sampling"]["court_health_skipped_source_frames"] += 1
+            # The initial source frame is always a health sample.  This
+            # fallback makes the branch safe for direct unit-test calls too.
+            is_court = bool(self._last_is_court_view)
 
         if not is_court:
             output_frame = self._create_output_frame(frame) if self._needs_visual_output() else frame
             self._write_output_frame(output_frame, frame_count, out)
             return output_frame, detect_frame_count
 
+        analysis_was_sampled = self._should_sample_analysis(frame_count)
+        if not analysis_was_sampled:
+            self.execution_metrics["sampling"]["analysis_skipped_source_frames"] += 1
+            output_frame = self._create_output_frame(frame) if self._needs_visual_output() else frame
+            self._write_output_frame(output_frame, frame_count, out)
+            return output_frame, detect_frame_count
+
+        self.execution_metrics["sampling"]["analysis_measurement_frames"] += 1
         detect_frame_count += 1
 
         x1, y1 = roi_corners[0]
         x2, y2 = roi_corners[1]
         roi = frame[y1:y2, x1:x2]
-        pose_t0 = time.time()
-        pose_was_sampled = self._should_sample_pose(frame_count)
-        if pose_was_sampled:
-            centroids, point_left_hands, point_right_hands = self.player_pose_visualizer.detect_players(roi, x1, y1)
-            self.pose_processed_frames += 1
-        else:
-            # Never carry a preceding pose forward as a new measurement.
-            # The multi-object tracker will emit an explicit predicted/missing
-            # state for this source timestamp instead.
-            self.player_pose_visualizer.clear_current_pose_data()
-            centroids, point_left_hands, point_right_hands = [], {}, {}
-        pose_elapsed = time.time() - pose_t0
+        pose_t0 = time.perf_counter()
+        centroids, point_left_hands, point_right_hands = self.player_pose_visualizer.detect_players(roi, x1, y1)
+        self.pose_processed_frames += 1
+        pose_elapsed = time.perf_counter() - pose_t0
+        self._record_execution_metric("pose_inference", pose_elapsed)
 
-        ball_t0 = time.time()
         if self.shuttle_detector == 'tracknet_v3':
             detected_ball_position = None
+            ball_t0 = time.perf_counter()
             ball_position = self.shuttlecock_tracker.update_external_measurement(
                 self.tracknet_measurements.measurement_for_frame(frame_count - 1),
                 roi_corners=roi_corners,
             )
+            self._record_execution_metric("shuttle_trajectory", time.perf_counter() - ball_t0)
         elif self.shuttle_detector == 'yolo':
+            ball_t0 = time.perf_counter()
             detected_ball_position = self.shuttlecock_tracker.detect_ball(frame, roi_corners=roi_corners)
+            self._record_execution_metric("shuttle_inference", time.perf_counter() - ball_t0)
+            trajectory_t0 = time.perf_counter()
             ball_position = self.shuttlecock_tracker.update_trajectory(detected_ball_position, roi_corners)
+            self._record_execution_metric("shuttle_trajectory", time.perf_counter() - trajectory_t0)
         else:
             # An operator opt-out is not a missing/predicted ball track.
             detected_ball_position = None
+            trajectory_t0 = time.perf_counter()
             ball_position = self.shuttlecock_tracker.mark_not_requested()
-        ball_elapsed = time.time() - ball_t0
+            self._record_execution_metric("shuttle_trajectory", time.perf_counter() - trajectory_t0)
+        ball_elapsed = 0.0
         
 
         pose_data = self.player_pose_visualizer.get_current_pose_data() or {}
+        spatial_t0 = time.perf_counter()
         spatial_state = self.fixed_camera_match.update(
             frame_index=frame_count,
             observations=self._spatial_observations(pose_data.get("detections", [])),
             shuttlecock=self._spatial_shuttle_input(
                 ball_position, self.shuttlecock_tracker.get_last_detection()
             ),
+            has_fresh_observations=True,
         )
+        self._record_execution_metric("spatial_tracking", time.perf_counter() - spatial_t0)
         self._emit_tracking_state(state_callback, frame_count, spatial_state)
+        player_t0 = time.perf_counter()
         players = self.player_tracker.update(
             frame_count,
             centroids,
@@ -570,6 +679,12 @@ class BadmintonAnalysisSystem:
             ball_detection=self.shuttlecock_tracker.get_last_detection(),
             spatial_state=spatial_state,
         )
+        player_elapsed = time.perf_counter() - player_t0
+        player_timing = getattr(self.player_tracker, "last_update_timing", {})
+        jsonl_elapsed = float(player_timing.get("jsonl_write_seconds", 0.0))
+        self._record_execution_metric("player_tracking", max(0.0, player_elapsed - jsonl_elapsed))
+        if jsonl_elapsed > 0.0:
+            self._record_execution_metric("jsonl_write", jsonl_elapsed)
         
 
         if frame_count == 1 or not self.cached_movement_stats:
@@ -638,7 +753,7 @@ class BadmintonAnalysisSystem:
         if should_log_performance:
             print(
                 f"Frame {frame_count}: pose {pose_elapsed:.2f}s "
-                f"({'sampled' if pose_was_sampled else 'skipped'}), "
+                "(shared analysis sample), "
                 f"shuttlecock {ball_elapsed:.2f}s, "
                 f"shuttle draw {shuttle_draw_elapsed:.2f}s, "
                 f"players draw {players_draw_elapsed:.2f}s, "
@@ -679,21 +794,29 @@ class BadmintonAnalysisSystem:
             }
         )
 
-    def _should_sample_pose(self, frame_count):
-        """Return whether this source frame carries a new pose measurement.
-
-        ``pose_sample_hz=0`` is the data-complete default and means every
-        source frame.  A positive rate is an explicit timestamp-based sampling
-        policy; skipped frames have no fresh pose keypoints and must stay null.
-        """
-        if self.pose_sample_hz == 0 or self.pose_sample_hz >= self.fps:
+    def _should_sample_at_rate(self, frame_count, sample_hz):
+        """Return whether ``frame_count`` starts a timestamp sampling bucket."""
+        if sample_hz == 0 or sample_hz >= self.fps:
             return True
         index = max(0, int(frame_count) - 1)
         if index == 0:
             return True
-        previous_bucket = int(((index - 1) * self.pose_sample_hz) // self.fps)
-        current_bucket = int((index * self.pose_sample_hz) // self.fps)
+        previous_bucket = int(((index - 1) * sample_hz) // self.fps)
+        current_bucket = int((index * sample_hz) // self.fps)
         return current_bucket != previous_bucket
+
+    def _should_sample_analysis(self, frame_count):
+        """Return whether all model/data components run at this timestamp."""
+        sample_hz = float(getattr(self, "analysis_sample_hz", self.pose_sample_hz))
+        return self._should_sample_at_rate(frame_count, sample_hz)
+
+    def _should_sample_pose(self, frame_count):
+        """Backward-compatible alias for the shared analysis cadence."""
+        return self._should_sample_analysis(frame_count)
+
+    def _should_sample_court_health(self, frame_count):
+        """Low-frequency fixed-camera template health check cadence."""
+        return self._should_sample_at_rate(frame_count, self.court_health_check_hz)
 
     def _spatial_observations(self, pose_detections):
         """Translate pose evidence to court coordinates for the new tracker."""
@@ -808,6 +931,8 @@ class BadmintonAnalysisSystem:
         """Write every source frame so the exported video keeps its full timeline."""
         if frame is None:
             return
+        has_visual_sink = bool(self.show_display or out is not None or self.save_images)
+        started = time.perf_counter() if has_visual_sink else None
         if self.show_display:
             cv2.imshow('frame', frame)
             cv2.waitKey(1)
@@ -815,6 +940,8 @@ class BadmintonAnalysisSystem:
             out.write(frame)
         if self.save_images:
             cv2.imwrite(os.path.join(self.images_save_dir, f"{frame_count}.png"), frame)
+        if started is not None:
+            self._record_execution_metric("visual_output", time.perf_counter() - started)
 
     def _get_template_path(self):
         """Get the court template image path."""
@@ -901,6 +1028,7 @@ class BadmintonAnalysisSystem:
     def _cleanup(self, cap, state_callback=None):
         """Clean up resources and merge audio when needed."""
         if hasattr(self, "fixed_camera_match"):
+            spatial_finalize_t0 = time.perf_counter()
             if state_callback is not None:
                 state_callback({"phase": "post_processing", "stage": "spatial_finalize"})
             spatial_summary = self.fixed_camera_match.finalize()
@@ -915,6 +1043,7 @@ class BadmintonAnalysisSystem:
                     "processed_frame_count"
                 ] = int(self.pose_processed_frames)
                 write_json(self.metadata_path, metadata)
+            self._record_execution_metric("spatial_finalize", time.perf_counter() - spatial_finalize_t0)
         if self.detection_writer is not None:
             self.detection_writer.close()
             self.detection_writer = None
@@ -933,6 +1062,7 @@ class BadmintonAnalysisSystem:
                 write_json(self.metadata_path, metadata)
         else:
             try:
+                reconstruction_t0 = time.perf_counter()
                 if state_callback is not None:
                     state_callback({"phase": "post_processing", "stage": "offline_shot_reconstruction"})
                 from .analysis.offline_shot_reconstruction import generate_offline_artifacts
@@ -980,18 +1110,25 @@ class BadmintonAnalysisSystem:
                     f"{self.offline_artifacts.get('rally_count', 0)} candidate rallies, "
                     f"{self.offline_artifacts.get('inferred_shot_count', 0)} motion-inferred shots"
                 )
+                self._record_execution_metric(
+                    "offline_shot_reconstruction", time.perf_counter() - reconstruction_t0
+                )
             except Exception as exc:
                 # The annotated video and immutable detections are still usable if
                 # a post-processing artifact fails. Do not silently claim derived
                 # shot data exists; leave a visible console diagnostic instead.
                 self.offline_artifacts = {"status": "failed", "error": str(exc)}
                 print(f"Offline shuttle reconstruction failed: {exc}")
+                self._record_execution_metric(
+                    "offline_shot_reconstruction", time.perf_counter() - reconstruction_t0
+                )
 
         # Start the single bounded report request before the optional audio
         # remux/export stage. Report generation depends on the finalized
         # detections and spatial summary, but should not wait behind a costly
         # browser-video encode at the end of a match.
         try:
+            performance_report_t0 = time.perf_counter()
             if state_callback is not None:
                 state_callback({"phase": "post_processing", "stage": "performance_report"})
             from .analysis.performance_report import generate_performance_report
@@ -1010,14 +1147,17 @@ class BadmintonAnalysisSystem:
                     "evidence_path": self.performance_report.get("evidence_path"),
                 }
                 write_json(self.metadata_path, metadata)
+            self._record_execution_metric("performance_report", time.perf_counter() - performance_report_t0)
         except Exception as exc:
             self.performance_report = {
                 "status": "failed",
                 "reason": f"Unable to generate performance report: {exc}",
             }
             print(f"Performance report generation failed: {exc}")
+            self._record_execution_metric("performance_report", time.perf_counter() - performance_report_t0)
 
         if self.generate_annotated_video:
+            video_export_t0 = time.perf_counter()
             if state_callback is not None:
                 state_callback({"phase": "post_processing", "stage": "video_writer_finalize"})
             if self.video_writer is not None:
@@ -1046,6 +1186,7 @@ class BadmintonAnalysisSystem:
                 raise RuntimeError(
                     "Annotated video export failed. Open the backend console for the FFmpeg error."
                 )
+            self._record_execution_metric("video_export", time.perf_counter() - video_export_t0)
             return
 
         # Data-only mode avoids the temporary writer and both FFmpeg export

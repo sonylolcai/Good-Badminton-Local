@@ -31,6 +31,19 @@ class PerformanceSloTests(unittest.TestCase):
 
         self.assertTrue(all(system._should_sample_pose(index) for index in range(1, 31)))
 
+    def test_shared_analysis_cadence_controls_primary_measurement_timestamps(self):
+        system = object.__new__(BadmintonAnalysisSystem)
+        system.analysis_sample_hz = 15.0
+        system.pose_sample_hz = 10.0  # Legacy field must not override the shared one.
+        system.court_health_check_hz = 2.0
+        system.fps = 30.0
+
+        analysis_frames = [index for index in range(1, 12) if system._should_sample_analysis(index)]
+        health_frames = [index for index in range(1, 32) if system._should_sample_court_health(index)]
+
+        self.assertEqual(analysis_frames, [1, 3, 5, 7, 9, 11])
+        self.assertEqual(health_frames, [1, 16, 31])
+
     def test_pose_keypoints_remain_tied_to_their_measurement_frame(self):
         tracker = CourtMultiObjectTracker(CourtSpace(self.CORNERS), fps=10)
         observation = {

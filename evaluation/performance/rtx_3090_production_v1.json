@@ -4,7 +4,7 @@
   "description": "Fixed-camera production profile. It is intentionally stricter than a development or evidence run.",
   "production_options": {
     "pose_imgsz": 960,
-    "pose_sample_hz": 10.0,
+    "analysis_sample_hz": 10.0,
     "shuttle_detector": "yolo",
     "max_llm_requests_per_match": 1
   },

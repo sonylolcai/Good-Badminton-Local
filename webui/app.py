@@ -250,7 +250,7 @@ def ensure_court_for_analysis(video_file, template_path, corners, click_corners,
 def run_full_analysis(analysis_ready, video_file, template_path, corners,
                        pose_family, pose_mode, language, audio, match_mode,
                        output_video_style, shuttle_detector,
-                       pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
+                       pose_imgsz, analysis_sample_hz, pose_conf, far_player_enhancement, far_pose_roi,
                        generate_annotated_video, browser_video_reencode,
                        show_skeletons, show_player_trajectories,
                       show_court_trajectory, show_shuttlecock_trajectory,
@@ -287,6 +287,8 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "match_mode": match_mode,
         "lock_match_roster": True,
         "roster_stable_frames": 2,
+        "tracker_backend": "bytetrack",
+        "enable_bytetrack": True,
         "output_video_style": output_video_style,
         "generate_annotated_video": generate_annotated_video,
         "browser_video_reencode": browser_video_reencode,
@@ -294,10 +296,10 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         # does not invoke a shuttle detector or create ball evidence.
         "shuttle_detector": shuttle_detector,
         "pose_imgsz": int(pose_imgsz),
-        # A 10 Hz measurement is enough for fixed-camera movement analysis
-        # and keeps 30/60 FPS input within the production compute budget.
-        # Full-frame evidence remains an explicit API-only 0 Hz option.
-        "pose_sample_hz": 10.0,
+        # One selection controls every primary evidence-producing component:
+        # pose, YOLO shuttle, track/roster updates, derived rallies and JSONL.
+        "analysis_sample_hz": float(analysis_sample_hz),
+        "pose_sample_hz": float(analysis_sample_hz),
         "pose_conf": float(pose_conf),
         "far_player_enhancement": far_player_enhancement,
         "far_pose_roi": parsed_far_roi,
@@ -639,6 +641,7 @@ _UI_TEXT = {
         "audio": "保留音频",
         "output_style": "输出视频样式",
         "pose_imgsz": "YOLO Pose 输入尺寸",
+        "analysis_sample_hz": "统一分析频率",
         "pose_conf": "远端人体置信阈值",
         "far_player_enhancement": "远端球员增强（全场640 + 远端ROI 640）",
         "far_pose_roi": "远端 ROI（相对姿态区域 x1,y1,x2,y2）",
@@ -691,6 +694,7 @@ _UI_TEXT = {
         "audio": "Keep Audio",
         "output_style": "Output Video Style",
         "pose_imgsz": "YOLO Pose Input Size",
+        "analysis_sample_hz": "Unified Analysis Sampling Rate",
         "pose_conf": "Far-player confidence threshold",
         "far_player_enhancement": "Far-player enhancement (full 640 + far ROI 640)",
         "far_pose_roi": "Far ROI (relative pose region x1,y1,x2,y2)",
@@ -849,6 +853,7 @@ def _switch_language(lang):
         gr.update(label=t["pose_mode"]),
         gr.update(label=t["audio"]),
         gr.update(label=t["pose_imgsz"]),
+        gr.update(label=t["analysis_sample_hz"]),
         gr.update(label=t["pose_conf"]),
         gr.update(label=t["far_player_enhancement"]),
         gr.update(label=t["far_pose_roi"]),
@@ -1752,6 +1757,11 @@ def build_ui():
                     pose_imgsz = gr.Dropdown(
                         choices=[640, 960, 1280], value=960, label=t["pose_imgsz"],
                     )
+                    analysis_sample_hz = gr.Dropdown(
+                        choices=[10, 15, 30], value=10,
+                        label=t["analysis_sample_hz"],
+                        info="人物、YOLO 羽毛球、ByteTrack 持续 ID、回合派生和 JSONL 使用同一频率；10Hz 为默认生产模式。",
+                    )
                     pose_conf = gr.Slider(
                         minimum=0.10, maximum=0.50, step=0.01, value=0.15,
                         label=t["pose_conf"],
@@ -2229,7 +2239,7 @@ def build_ui():
         lang_outputs = [
             md_title, md_inputs, video_input, template_input,
             md_settings, pose_family, pose_mode, audio,
-            pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi, adv_accordion,
+            pose_imgsz, analysis_sample_hz, pose_conf, far_player_enhancement, far_pose_roi, adv_accordion,
             show_skeletons, show_player_trajectories, show_court_trajectory,
             show_shuttlecock_trajectory, show_player_stats, show_pose_roi,
             visualize_positions, yolo_pose_model, ball_model,
@@ -2289,7 +2299,7 @@ def build_ui():
             inputs=[
                  analysis_ready_state, video_input, template_path_state, corners_state,
                  pose_family, pose_mode, language, audio, match_mode, output_video_style, shuttle_detector,
-                 pose_imgsz, pose_conf, far_player_enhancement, far_pose_roi,
+                 pose_imgsz, analysis_sample_hz, pose_conf, far_player_enhancement, far_pose_roi,
                  generate_annotated_video, browser_video_reencode,
                  show_skeletons, show_player_trajectories,
                 show_court_trajectory, show_shuttlecock_trajectory,

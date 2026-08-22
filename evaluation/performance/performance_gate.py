@@ -108,6 +108,8 @@ def summarize_trace(trace: Dict[str, Any]) -> Dict[str, Any]:
     total_frames = _number(progress.get("total_frames"))
     duration = (total_frames / fps) if total_frames and fps else None
     wall_seconds = _elapsed_between(task.get("started_at"), task.get("finished_at"))
+    execution = trace.get("execution") or {}
+    analysis_metrics = execution.get("analysis_metrics") or {}
     return {
         "job_status": task.get("status"),
         "wall_seconds": wall_seconds,
@@ -116,6 +118,7 @@ def summarize_trace(trace: Dict[str, Any]) -> Dict[str, Any]:
         "source_duration_seconds": round(duration, 3) if duration is not None else None,
         "batch_realtime_factor": round(wall_seconds / duration, 4) if wall_seconds is not None and duration else None,
         "stage_seconds": stages,
+        "component_metrics": analysis_metrics.get("components") or {},
         "options": trace.get("options") or {},
     }
 
@@ -133,9 +136,16 @@ def evaluate_trace(trace: Dict[str, Any], profile: Dict[str, Any]) -> List[Dict[
             "succeeded", summary["job_status"],
         ))
 
-    for option_name in ("pose_imgsz", "pose_sample_hz", "shuttle_detector"):
+    for option_name in ("pose_imgsz", "analysis_sample_hz", "shuttle_detector"):
         required = expected.get(option_name)
+        if required is None and option_name == "analysis_sample_hz":
+            # Older gate profiles and traces used this name when pose was the
+            # only sampled component. Keep their results interpretable while
+            # new profiles lock the shared cadence instead.
+            required = expected.get("pose_sample_hz")
         actual = options.get(option_name)
+        if actual is None and option_name == "analysis_sample_hz":
+            actual = options.get("pose_sample_hz")
         if actual != required:
             checks.append(_new_check(
                 f"production_option.{option_name}", FAIL,

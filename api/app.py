@@ -231,6 +231,10 @@ def _parse_options(value):
         # caller can still explicitly request 0 for an offline full-frame
         # evidence run, but it is not suitable as the streaming default.
         "pose_imgsz": 960,
+        # One shared cadence for all measurement-producing components.  The
+        # legacy pose_sample_hz key remains accepted for older business
+        # clients, but is normalized to this value below.
+        "analysis_sample_hz": 10.0,
         "pose_sample_hz": 10.0,
         "pose_conf": 0.15,
         "far_player_enhancement": False,
@@ -238,6 +242,11 @@ def _parse_options(value):
         "match_mode": "singles",
         "lock_match_roster": True,
         "roster_stable_frames": 2,
+        # ByteTrack is the production association source. It is invoked only
+        # on the same timestamp buckets as pose/shuttle/JSONL measurement;
+        # it never turns a 10/15/30 Hz task back into full-frame tracking.
+        "tracker_backend": "bytetrack",
+        "enable_bytetrack": True,
         # YOLO remains the low-latency default.  TrackNetV3 is an explicit,
         # slower accuracy experiment and must never start from an omitted API
         # option.
@@ -250,13 +259,17 @@ def _parse_options(value):
     if unsupported:
         raise HTTPException(status_code=422, detail=f"Unsupported options: {sorted(unsupported)}")
     options = {**defaults, **received}
+    if "analysis_sample_hz" in received:
+        options["pose_sample_hz"] = options["analysis_sample_hz"]
+    else:
+        options["analysis_sample_hz"] = options["pose_sample_hz"]
     if options["pose_imgsz"] not in {640, 960, 1280}:
         raise HTTPException(status_code=422, detail="pose_imgsz must be 640, 960, or 1280")
-    sample_hz = float(options["pose_sample_hz"])
+    sample_hz = float(options["analysis_sample_hz"])
     if sample_hz < 0.0 or (0.0 < sample_hz < 1.0):
         raise HTTPException(
             status_code=422,
-            detail="pose_sample_hz must be 0 (every source frame) or at least 1",
+            detail="analysis_sample_hz must be 0 (every source frame) or at least 1",
         )
     if not 0 < float(options["pose_conf"]) <= 1:
         raise HTTPException(status_code=422, detail="pose_conf must be in (0, 1]")
@@ -271,6 +284,15 @@ def _parse_options(value):
         options["browser_video_reencode"] = False
     if options["match_mode"] not in {"singles", "doubles"}:
         raise HTTPException(status_code=422, detail="match_mode must be singles or doubles")
+    if options["tracker_backend"] not in {"court_association", "bytetrack"}:
+        raise HTTPException(status_code=422, detail="tracker_backend must be court_association or bytetrack")
+    if not isinstance(options["enable_bytetrack"], bool):
+        raise HTTPException(status_code=422, detail="enable_bytetrack must be a JSON boolean")
+    if options["tracker_backend"] == "bytetrack" and not options["enable_bytetrack"]:
+        raise HTTPException(
+            status_code=422,
+            detail="enable_bytetrack must be true when tracker_backend is bytetrack",
+        )
     if options["shuttle_detector"] not in {"none", "yolo", "tracknet_v3"}:
         raise HTTPException(status_code=422, detail="shuttle_detector must be none, yolo, or tracknet_v3")
     if int(options["roster_stable_frames"]) < 1 or int(options["roster_stable_frames"]) > 10:
@@ -280,8 +302,10 @@ def _parse_options(value):
     ):
         raise HTTPException(status_code=422, detail="match_session_ref must be a safe opaque reference")
     options["lock_match_roster"] = bool(options["lock_match_roster"])
+    options["enable_bytetrack"] = bool(options["enable_bytetrack"])
     options["roster_stable_frames"] = int(options["roster_stable_frames"])
-    options["pose_sample_hz"] = float(options["pose_sample_hz"])
+    options["analysis_sample_hz"] = float(options["analysis_sample_hz"])
+    options["pose_sample_hz"] = options["analysis_sample_hz"]
     options["match_session_ref"] = (
         str(options["match_session_ref"]) if options["match_session_ref"] is not None else None
     )

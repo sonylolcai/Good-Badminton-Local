@@ -119,6 +119,7 @@ class CourtMultiObjectTracker:
         expected_roster_count=None,
         roster_stable_frames=2,
         roster_reacquire_seconds=1.0,
+        require_association_keys=False,
     ):
         if match_mode not in {"singles", "doubles"}:
             raise ValueError("match_mode must be 'singles' or 'doubles'")
@@ -138,6 +139,12 @@ class CourtMultiObjectTracker:
         if self.expected_roster_count <= 0:
             raise ValueError("expected_roster_count must be positive")
         self.roster_stable_frames = max(1, int(roster_stable_frames))
+        # A production ByteTrack roster must be built from confirmed tracker
+        # keys.  Otherwise the roster can lock during ByteTrack's tentative
+        # warm-up period and lose the durable association it was meant to
+        # preserve.  The court-only fallback intentionally remains usable for
+        # deterministic tests and backwards-compatible callers.
+        self.require_association_keys = bool(require_association_keys)
         # Keep the normal short prediction window unchanged, then allow one
         # additional bounded window for a real detection to reclaim a locked
         # roster ID. Beyond this, a location-only guess is not trustworthy.
@@ -160,13 +167,23 @@ class CourtMultiObjectTracker:
         self._last_unassigned_observation_count = 0
         self._last_unassigned_observations = []
 
-    def update(self, frame_index, observations):
+    def update(self, frame_index, observations, has_fresh_observations=True):
+        """Update tracks from a pose measurement when one is available.
+
+        ``has_fresh_observations`` distinguishes a real empty detector result
+        from a source frame intentionally skipped by the configured sampling
+        policy.  Treating both as ``[]`` made a 10 Hz detector reset the
+        roster on every intervening 30 fps source frame.
+        """
         observations = [
             item for item in observations
             if item.get("court_xy") is not None
             and self.court_space.contains(item["court_xy"], margin_m=0.35)
         ]
         if self.lock_match_roster and self.roster_status != "locked":
+            if not has_fresh_observations:
+                self._last_roster_reason = "awaiting_next_fresh_pose_measurement"
+                return self.snapshot(frame_index)
             return self._bootstrap_roster(frame_index, observations)
 
         return self._update_locked_or_open_tracks(frame_index, observations)
@@ -187,6 +204,13 @@ class CourtMultiObjectTracker:
                 "waiting_for_expected_on_court_count"
                 f" (observed={len(observations)}, expected={self.expected_roster_count})"
             )
+            return self.snapshot(frame_index)
+
+        if self.require_association_keys and any(
+            not observation.get("association_key") for observation in observations
+        ):
+            self._roster_stable_observation_frames = 0
+            self._last_roster_reason = "awaiting_bytetrack_confirmation"
             return self.snapshot(frame_index)
 
         self._roster_stable_observation_frames += 1
@@ -749,19 +773,26 @@ class RallyStateMachine:
         self._rally_id = 0
         self._current = None
         self.completed = []
+        self._last_update_frame = None
 
     def update(self, frame_index, tracks, shuttle, hit_events):
+        frame_index = int(frame_index)
+        elapsed_source_frames = (
+            1 if self._last_update_frame is None
+            else max(1, frame_index - self._last_update_frame)
+        )
+        self._last_update_frame = frame_index
         has_players = len([track for track in tracks if track["status"] == "detected"]) >= 2
         has_shuttle = shuttle is not None and shuttle.get("status") == "approximate"
         if self.state == "idle" and has_players and has_shuttle:
             self.state = "candidate"
-            self._active_frames = 1
+            self._active_frames = elapsed_source_frames
         elif self.state == "candidate":
-            self._active_frames = self._active_frames + 1 if has_shuttle else 0
+            self._active_frames = self._active_frames + elapsed_source_frames if has_shuttle else 0
             if self._active_frames >= self.min_active_frames:
                 self._start(frame_index - self._active_frames + 1)
         elif self.state == "active":
-            self._missing_frames = 0 if has_shuttle else self._missing_frames + 1
+            self._missing_frames = 0 if has_shuttle else self._missing_frames + elapsed_source_frames
             if hit_events:
                 self._current["hit_events"].extend(hit_events)
             if self._missing_frames >= self.end_gap_frames:
@@ -850,19 +881,24 @@ class FixedCameraMatchPipeline:
             lock_match_roster=lock_match_roster,
             expected_roster_count=2 if match_mode == "singles" else 4,
             roster_stable_frames=roster_stable_frames,
+            require_association_keys=tracker_backend == "bytetrack",
         )
         self.shuttle = MonocularShuttleReconstructor()
         self.rallies = RallyStateMachine(fps=fps)
         self._last_frame = 0
 
-    def update(self, frame_index, observations, shuttlecock):
+    def update(self, frame_index, observations, shuttlecock, has_fresh_observations=True):
         self._last_frame = int(frame_index)
         observations = [dict(item) for item in observations]
         if self.byte_tracker is not None:
             association_keys = self.byte_tracker.update(observations)
             for index, association_key in association_keys.items():
                 observations[index]["association_key"] = association_key
-        tracks = self.tracker.update(frame_index, observations)
+        tracks = self.tracker.update(
+            frame_index,
+            observations,
+            has_fresh_observations=has_fresh_observations,
+        )
         shuttle = self._shuttle_record(frame_index, shuttlecock)
         hit_events = self._detect_hit_events(tracks, shuttle)
         rally = self.rallies.update(frame_index, tracks, shuttle, hit_events)

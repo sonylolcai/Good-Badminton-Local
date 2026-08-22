@@ -6,6 +6,7 @@ from badminton_analysis.analysis.fixed_camera_match import (
     CourtMultiObjectTracker,
     CourtSpace,
     FixedCameraMatchPipeline,
+    RallyStateMachine,
 )
 from badminton_analysis.tracking.bytetrack_adapter import ByteTrackAdapter
 
@@ -19,6 +20,22 @@ class _FakeByteTracker:
         if not len(batch):
             return np.empty((0, 8), dtype=np.float32)
         return np.asarray([[10, 20, 30, 60, 7, 0.88, 0, 0]], dtype=np.float32)
+
+
+class _DelayedTwoPersonByteTracker:
+    """Emit no identifiers once, then confirm both pose detections."""
+
+    def __init__(self, _args):
+        self.calls = 0
+
+    def update(self, batch):
+        self.calls += 1
+        if self.calls == 1 or not len(batch):
+            return np.empty((0, 8), dtype=np.float32)
+        return np.asarray([
+            [10, 20, 30, 60, 17, 0.90, 0, 0],
+            [40, 20, 60, 60, 18, 0.91, 0, 1],
+        ], dtype=np.float32)
 
 
 class MultiTrackModeTests(unittest.TestCase):
@@ -120,6 +137,103 @@ class MultiTrackModeTests(unittest.TestCase):
             after_extra_detection["match_roster"]["unassigned_observations"][0]["reason"],
             "unassigned_after_locked_roster_association",
         )
+
+    def test_bytetrack_roster_waits_for_confirmed_association_keys(self):
+        """Do not bind durable roster IDs before ByteTrack has confirmed them."""
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="singles",
+            tracker_backend="bytetrack",
+            enable_bytetrack=True,
+            byte_tracker_factory=_DelayedTwoPersonByteTracker,
+            lock_match_roster=True,
+            roster_stable_frames=1,
+        )
+        observations = [
+            self._observation((2.0, 2.0), None),
+            self._observation((4.0, 11.0), None),
+        ]
+
+        unconfirmed = pipeline.update(1, observations, None)
+        self.assertEqual(unconfirmed["match_roster"]["status"], "bootstrapping")
+        self.assertEqual(
+            unconfirmed["match_roster"]["reason"],
+            "awaiting_bytetrack_confirmation",
+        )
+
+        locked = pipeline.update(2, observations, None)
+        self.assertEqual(locked["match_roster"]["status"], "locked")
+        self.assertEqual(
+            {track["association"]["key"] for track in locked["tracks"]},
+            {"bytetrack_17", "bytetrack_18"},
+        )
+
+    def test_roster_bootstrap_ignores_frames_without_a_fresh_pose_measurement(self):
+        """Sampling gaps must not be mistaken for a zero-person detection.
+
+        A 10 Hz pose detector on a 30 fps source has two source timestamps
+        between every real measurement.  Those timestamps have no new pose
+        evidence, so they must neither advance nor reset roster bootstrap.
+        """
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=30,
+            match_mode="singles",
+            lock_match_roster=True,
+            roster_stable_frames=2,
+        )
+        observations = [
+            self._observation((2.0, 2.0), None),
+            self._observation((4.0, 11.0), None),
+        ]
+
+        first = pipeline.update(1, observations, None, has_fresh_observations=True)
+        self.assertEqual(first["match_roster"]["stable_observation_frames"], 1)
+
+        skipped_one = pipeline.update(2, [], None, has_fresh_observations=False)
+        skipped_two = pipeline.update(3, [], None, has_fresh_observations=False)
+        self.assertEqual(skipped_one["match_roster"]["stable_observation_frames"], 1)
+        self.assertEqual(skipped_two["match_roster"]["stable_observation_frames"], 1)
+        self.assertEqual(skipped_two["match_roster"]["status"], "bootstrapping")
+
+        locked = pipeline.update(4, observations, None, has_fresh_observations=True)
+        self.assertEqual(locked["match_roster"]["status"], "locked")
+        self.assertEqual(len(locked["tracks"]), 2)
+
+    def test_roster_bootstrap_still_resets_on_a_fresh_incomplete_measurement(self):
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=30,
+            match_mode="singles",
+            lock_match_roster=True,
+            roster_stable_frames=2,
+        )
+        complete = [
+            self._observation((2.0, 2.0), None),
+            self._observation((4.0, 11.0), None),
+        ]
+        pipeline.update(1, complete, None, has_fresh_observations=True)
+        incomplete = pipeline.update(
+            4, [self._observation((2.0, 2.0), None)], None, has_fresh_observations=True
+        )
+        self.assertEqual(incomplete["match_roster"]["stable_observation_frames"], 0)
+
+    def test_rally_gap_threshold_uses_source_time_when_measurements_are_sampled(self):
+        rallies = RallyStateMachine(fps=30, min_active_frames=4, end_gap_frames=36)
+        tracks = [{"status": "detected"}, {"status": "detected"}]
+        shuttle = {"status": "approximate"}
+
+        # 10 Hz measurements on a 30 fps source are three source frames apart.
+        rallies.update(1, tracks, shuttle, [])
+        active = rallies.update(4, tracks, shuttle, [])
+        self.assertEqual(active["state"], "active")
+
+        # One 36-source-frame absence is a 1.2 second real gap, not 36
+        # sparse samples (which would incorrectly become 3.6 seconds).
+        ended = rallies.update(40, tracks, {"status": "missing"}, [])
+        self.assertEqual(ended["state"], "idle")
+        self.assertEqual(rallies.completed[-1]["end_reason"], "shuttle_evidence_gap")
 
     def test_locked_roster_reassociates_brief_gap_without_creating_a_new_id(self):
         pipeline = FixedCameraMatchPipeline(

@@ -597,15 +597,27 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     Returns:
         dict with output file paths.
     """
+    pipeline_started = time.perf_counter()
+    pipeline_components = {}
+
+    def record_pipeline_component(name, started):
+        entry = pipeline_components.setdefault(name, {"calls": 0, "elapsed_seconds": 0.0})
+        entry["calls"] += 1
+        entry["elapsed_seconds"] += max(0.0, time.perf_counter() - started)
+
     raise_if_cancelled(cancel_cb)
+    runtime_t0 = time.perf_counter()
     _emit_analysis_stage(state_cb, "preparing", "runtime_dependencies")
     _ensure_dependencies()
+    record_pipeline_component("runtime_dependencies", runtime_t0)
     if cleanup_outputs:
         _emit_analysis_stage(state_cb, "preparing", "output_retention_cleanup")
         _cleanup_old_outputs()
 
+    template_check_t0 = time.perf_counter()
     _emit_analysis_stage(state_cb, "preparing", "template_compatibility")
     match_score = _max_template_match_score(video_path, template_path, cancel_cb=cancel_cb)
+    record_pipeline_component("template_compatibility_check", template_check_t0)
     raise_if_cancelled(cancel_cb)
     if match_score is not None and match_score < 0.75:
         raise RuntimeError(
@@ -613,6 +625,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
             "运行要求 0.750）。请清空已上传的模板图，再从当前视频自动选择球场帧。"
         )
 
+    court_setup_t0 = time.perf_counter()
     _emit_analysis_stage(state_cb, "preparing", "court_configuration")
     corners = _scale_corners_to_video(corners, template_path, video_path)
 
@@ -635,6 +648,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         f.write(f"corners={corners}\n")
         f.write(f"roi_corners={roi_corners}\n")
         f.write(f"mid_height={mid_height}\n")
+    record_pipeline_component("court_configuration", court_setup_t0)
 
     language = options.get("language", "zh")
     pose_family = options.get("pose_family", "yolo-pose")
@@ -657,13 +671,18 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     visualize_positions = options.get("visualize_positions", True)
     output_video_style = options.get("output_video_style", "annotated")
     pose_imgsz = int(options.get("pose_imgsz", 960))
-    pose_sample_hz = float(options.get("pose_sample_hz", 10.0))
+    # All evidence-producing components share this cadence.  The legacy pose
+    # option is retained as a fallback for saved tasks submitted before this
+    # option was introduced.
+    analysis_sample_hz = float(options.get("analysis_sample_hz", options.get("pose_sample_hz", 10.0)))
     pose_conf = float(options.get("pose_conf", 0.15))
     far_player_enhancement = bool(options.get("far_player_enhancement", False))
     far_pose_roi = options.get("far_pose_roi", (0.12, 0.30, 0.86, 0.82))
     match_mode = options.get("match_mode", "singles")
-    tracker_backend = options.get("tracker_backend", "court_association")
-    enable_bytetrack = bool(options.get("enable_bytetrack", False))
+    # ByteTrack only receives already-sampled pose detections. The shared
+    # timestamp cadence remains the sole detector/tracker update budget.
+    tracker_backend = options.get("tracker_backend", "bytetrack")
+    enable_bytetrack = bool(options.get("enable_bytetrack", True))
     lock_match_roster = bool(options.get("lock_match_roster", True))
     roster_stable_frames = int(options.get("roster_stable_frames", 2))
     shuttle_detector = options.get("shuttle_detector", "yolo")
@@ -671,12 +690,14 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
     tracknet_measurements_path = None
     if shuttle_detector == "tracknet_v3":
+        tracknet_t0 = time.perf_counter()
         tracknet_measurements_path = _prepare_tracknet_v3_raw(
             video_path,
             output_dir,
             cancel_cb=cancel_cb,
             state_cb=state_cb,
         )
+        record_pipeline_component("tracknet_v3_full_temporal", tracknet_t0)
     _emit_analysis_stage(state_cb, "human_tracking", "human_tracking_setup")
 
     system = BadmintonAnalysisSystem(
@@ -699,7 +720,8 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         show_pose_roi=show_pose_roi,
         output_video_style=output_video_style,
         pose_imgsz=pose_imgsz,
-        pose_sample_hz=pose_sample_hz,
+        pose_sample_hz=analysis_sample_hz,
+        analysis_sample_hz=analysis_sample_hz,
         pose_conf=pose_conf,
         far_player_enhancement=far_player_enhancement,
         far_pose_roi=far_pose_roi,
@@ -714,7 +736,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         browser_video_reencode=browser_video_reencode,
     )
     system.keep_audio = keep_audio
-    system.process_video(
+    execution_metrics = system.process_video(
         progress_callback=progress_cb,
         state_callback=state_cb,
         cancel_callback=cancel_cb,
@@ -744,6 +766,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
 
     position_evidence_summary = None
     if visualize_positions and has_detections:
+        visualizations_t0 = time.perf_counter()
         _emit_analysis_stage(state_cb, "post_processing", "position_visualizations")
         vis_dir = os.path.join(output_dir, "position_visualizations")
         raise_if_cancelled(cancel_cb)
@@ -785,12 +808,15 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
             warnings.append(
                 "已经生成位置检测数据，但图表渲染失败。请打开右下角后台输出查看详情。"
             )
+        record_pipeline_component("position_visualizations", visualizations_t0)
 
     web_video_path = None
     if generate_annotated_video:
         if browser_video_reencode:
+            browser_reencode_t0 = time.perf_counter()
             _emit_analysis_stage(state_cb, "post_processing", "browser_video_reencode")
             web_video_path = _reencode_for_browser(system.output_video_path, output_dir, cancel_cb=cancel_cb)
+            record_pipeline_component("browser_video_reencode", browser_reencode_t0)
         else:
             _emit_analysis_stage(
                 state_cb,
@@ -812,6 +838,13 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
             "本次按高级选项跳过标注视频绘制与编码；人物轨迹、速度、距离、JSONL 和统计结果已照常保存。"
         )
 
+    execution_metrics = dict(execution_metrics or {})
+    component_metrics = execution_metrics.setdefault("components", {})
+    component_metrics.update(pipeline_components)
+    execution_metrics["pipeline_total_elapsed_seconds"] = round(
+        max(0.0, time.perf_counter() - pipeline_started), 6
+    )
+
     result = {
         "output_dir": output_dir,
         "video": web_video_path,
@@ -821,6 +854,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         "performance_report": (getattr(system, "performance_report", None) or {}).get("report_path"),
         "position_evidence_summary": position_evidence_summary,
         "derived": getattr(system, "offline_artifacts", None),
+        "execution_metrics": execution_metrics,
         "visualizations": [],
         "warnings": warnings,
     }

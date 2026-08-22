@@ -3,6 +3,11 @@
 这套工具把“视频分析应该够快”变成版本化、可审计的约束。它不执行模型推理；它读取
 GPU 服务生成的不可变 `performance_trace.json`，验证生产参数并比较阶段回退。
 
+当前生产参数锁定 `YOLO Pose imgsz=960`、统一分析频率 `10 Hz` 与 `YOLO` 羽毛球。
+统一频率会同时约束 Pose、YOLO 球、持续 Track ID/roster、回合派生和 JSONL；不再只检查
+Pose 的采样率。trace 内的 `execution.analysis_metrics.components` 还会给出这些组件实际
+调用次数和耗时，便于在每次迭代后定位回退来自 GPU 推理、CPU 跟踪还是写入/后处理。
+
 ## 日常使用
 
 完成一次远端 GPU 任务后，在服务器仓库内运行：

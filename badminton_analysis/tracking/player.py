@@ -1,4 +1,5 @@
 from collections import deque
+import time
 
 import numpy as np
 
@@ -46,6 +47,10 @@ class PlayerTracker:
         }
 
         self.court_mapper = CourtMapper(corners)
+        self.last_update_timing = {
+            "player_tracking_seconds": 0.0,
+            "jsonl_write_seconds": 0.0,
+        }
 
     def _empty_player_record(self):
         return {
@@ -86,8 +91,9 @@ class PlayerTracker:
 
     def write_detection_record(self, frame_index, players_record, ball_image_position, detect_frame_count,
                                ball_detection=None, spatial_state=None):
+        started = time.perf_counter()
         if self.detection_writer is None:
-            return
+            return 0.0
 
         shuttlecock_record = {
             "image": self._point_or_none(ball_image_position, zero_is_none=True),
@@ -131,9 +137,11 @@ class PlayerTracker:
             # persistent identity is track_id and zone_id is only instantaneous.
             record["spatial"] = spatial_state
         self.detection_writer.write(record)
+        return time.perf_counter() - started
 
     def update(self, frame_index, centroids, ball_image_position, left_hand_positions, right_hand_positions,
                detect_frame_count, pose_detections=None, ball_detection=None, spatial_state=None):
+        started = time.perf_counter()
         players_record = self._initialize_player_record()
         pose_detections = pose_detections or []
 
@@ -176,7 +184,7 @@ class PlayerTracker:
                 import traceback
                 traceback.print_exc()
 
-        self.write_detection_record(
+        jsonl_write_seconds = self.write_detection_record(
             frame_index,
             players_record,
             ball_image_position,
@@ -184,6 +192,10 @@ class PlayerTracker:
             ball_detection=ball_detection,
             spatial_state=spatial_state,
         )
+        self.last_update_timing = {
+            "player_tracking_seconds": max(0.0, time.perf_counter() - started - jsonl_write_seconds),
+            "jsonl_write_seconds": float(jsonl_write_seconds),
+        }
         return self.players
 
     def _select_region_candidate(self, region, candidates):

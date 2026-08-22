@@ -201,7 +201,10 @@ class GpuApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         stored = self.app.state.job_manager.get_job(response.json()["job_id"])
         self.assertEqual(stored["options"]["pose_imgsz"], 960)
+        self.assertEqual(stored["options"]["analysis_sample_hz"], 10.0)
         self.assertEqual(stored["options"]["pose_sample_hz"], 10.0)
+        self.assertEqual(stored["options"]["tracker_backend"], "bytetrack")
+        self.assertTrue(stored["options"]["enable_bytetrack"])
         self.assertEqual(stored["options"]["shuttle_detector"], "yolo")
         self.assertFalse(stored["options"]["generate_annotated_video"])
         self.assertFalse(stored["options"]["browser_video_reencode"])
@@ -259,7 +262,27 @@ class GpuApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 202)
         stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["options"]["analysis_sample_hz"], 0.0)
         self.assertEqual(stored["options"]["pose_sample_hz"], 0.0)
+
+    def test_shared_analysis_frequency_overrides_legacy_pose_frequency(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-cadence"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"analysis_sample_hz":15,"pose_sample_hz":10}',
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["options"]["analysis_sample_hz"], 15.0)
+        self.assertEqual(stored["options"]["pose_sample_hz"], 15.0)
 
     def test_job_keeps_an_opaque_match_reference_without_participant_identity(self):
         response = self.client.post(
