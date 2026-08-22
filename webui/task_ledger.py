@@ -289,6 +289,7 @@ class BusinessTaskLedger:
         remote = dict(task.get("remote") or {})
         performance_trace = self._read_archived_performance_trace(task)
         timing = dict((performance_trace or {}).get("timing") or {})
+        execution = dict((performance_trace or {}).get("execution") or {})
         stages = list(timing.get("stages") or [])
 
         submission = self._first_event(history, "submission_started")
@@ -347,6 +348,7 @@ class BusinessTaskLedger:
                     "server_wall_seconds": self._duration(server_started_at, server_finished_at),
                     "timing": timing,
                     "stages": stages,
+                    "component_metrics": execution.get("analysis_metrics"),
                 },
                 "polling": {
                     "poll_count": int(remote.get("poll_count") or 0),

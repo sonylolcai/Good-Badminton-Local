@@ -28,6 +28,7 @@ $packageRoot = Join-Path $stagingRoot 'good-badminton-gpu-api'
 # experiments.  We only need source code and deployment files for an upgrade.
 $requiredExtraFiles = @(
     'deploy/refresh_gpu_api_from_zip.sh',
+    'deploy/install_lap.sh',
     'deploy/package_gpu_api.ps1',
     'deploy/run_performance_gate.sh',
     'deploy/setup_tracknet_v3_ab.sh',

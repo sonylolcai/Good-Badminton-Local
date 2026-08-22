@@ -83,8 +83,10 @@ fi
 
 [[ -f "$SOURCE_DIR/deploy/start_gpu_api_container.sh" ]] || \
   fail "Package is missing deploy/start_gpu_api_container.sh"
+[[ -f "$SOURCE_DIR/deploy/install_lap.sh" ]] || \
+  fail "Package is missing deploy/install_lap.sh"
 
-echo "[2/6] Checking the existing Python/GPU runtime..."
+echo "[2/7] Checking the existing Python/GPU runtime..."
 "$PYTHON_BIN" - <<'PY'
 import importlib.util
 required = ("cv2", "fastapi", "multipart", "torch", "ultralytics", "uvicorn")
@@ -97,7 +99,13 @@ if not torch.cuda.is_available():
 print(f"Python GPU runtime ready: torch={torch.__version__}, cuda={torch.version.cuda}")
 PY
 
-echo "[3/6] Preparing persistent state..."
+echo "[3/7] Ensuring the ByteTrack lap dependency..."
+GOOD_BADMINTON_PYTHON_BIN="$PYTHON_BIN" \
+GOOD_BADMINTON_WHEELHOUSE="${GOOD_BADMINTON_WHEELHOUSE:-}" \
+GOOD_BADMINTON_PIP_INDEX_URL="${GOOD_BADMINTON_PIP_INDEX_URL:-}" \
+  bash "$SOURCE_DIR/deploy/install_lap.sh"
+
+echo "[4/7] Preparing persistent state..."
 mkdir -p "$STATE_DIR" "$DATA_DIR" "$WEIGHTS_DIR"
 chmod 700 "$STATE_DIR" "$DATA_DIR" "$WEIGHTS_DIR"
 
@@ -165,7 +173,7 @@ mv "$env_tmp" "$ENV_FILE"
 [[ -f "$WEIGHTS_DIR/yolo11s-ball.pt" ]] || fail \
   "Missing $WEIGHTS_DIR/yolo11s-ball.pt. Upload the checked ball-model weight there once; it is preserved on later code upgrades."
 
-echo "[4/6] Stopping the old API, if present..."
+echo "[5/7] Stopping the old API, if present..."
 stop_existing_api() {
   local source_dir="$1"
   [[ -d "$source_dir" ]] || return 0
@@ -184,13 +192,14 @@ if [[ -n "$LEGACY_APP_DIR" ]]; then
   stop_existing_api "$LEGACY_APP_DIR"
 fi
 
-echo "[5/6] Replacing only application code..."
+echo "[6/7] Replacing only application code..."
 # APP_DIR is validated above.  STATE_DIR is a sibling and survives this rm.
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR"
 cp -a "$SOURCE_DIR/." "$APP_DIR/"
 chmod +x "$APP_DIR/deploy/start_gpu_api_container.sh" \
   "$APP_DIR/deploy/stop_gpu_api_container.sh" \
+  "$APP_DIR/deploy/install_lap.sh" \
   "$APP_DIR/deploy/refresh_gpu_api_from_zip.sh"
 
 # Make the code see the persistent state through its normal paths.  This
@@ -201,7 +210,7 @@ ln -s "$ENV_FILE" "$APP_DIR/.gpu-api.env"
 ln -s "$DATA_DIR" "$APP_DIR/api_data"
 ln -s "$WEIGHTS_DIR" "$APP_DIR/weights"
 
-echo "[6/6] Starting and verifying the refreshed API..."
+echo "[7/7] Starting and verifying the refreshed API..."
 GOOD_BADMINTON_ENV_FILE="$ENV_FILE" \
 GOOD_BADMINTON_PYTHON_BIN="$PYTHON_BIN" \
   "$APP_DIR/deploy/start_gpu_api_container.sh" "$APP_DIR"

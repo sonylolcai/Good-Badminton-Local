@@ -189,6 +189,13 @@ class BusinessTaskLedgerTests(unittest.TestCase):
                       {"name": "tracknet.inference", "started_at": "2026-01-01T00:00:02+00:00", "finished_at": "2026-01-01T00:00:06+00:00"},
                       {"name": "human_frame_processing", "started_at": "2026-01-01T00:00:06+00:00", "finished_at": "2026-01-01T00:00:12+00:00"}
                     ]
+                  },
+                  "execution": {
+                    "analysis_metrics": {
+                      "components": {
+                        "pose_inference": {"calls": 100, "elapsed_seconds": 3.2}
+                      }
+                    }
                   }
                 }\n""",
                 encoding="utf-8",
@@ -210,4 +217,8 @@ class BusinessTaskLedgerTests(unittest.TestCase):
             self.assertEqual(trace["execution_topology"]["nodes"][1]["serialized_stages"], [
                 "queue_wait", "tracknet.inference", "human_frame_processing",
             ])
+            self.assertEqual(
+                trace["timeline"]["remote_gpu"]["component_metrics"]["components"]["pose_inference"]["calls"],
+                100,
+            )
             self.assertEqual(ledger.finalize_end_to_end_trace(task_id), record)

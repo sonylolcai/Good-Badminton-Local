@@ -80,6 +80,14 @@ grep -vE '^(--extra-index-url|torch==|torchvision==)' "$APP_DIR/requirements.txt
 "$PYTHON_BIN" -m pip install "${PIP_SOURCE_ARGS[@]}" -r "$APP_DIR/.requirements-server.txt"
 rm -f "$APP_DIR/.requirements-server.txt"
 
+# ByteTrack is the default production tracker.  Keep this explicit runtime
+# check even though requirements.txt already declares lap: it verifies that
+# the selected CUDA/Conda Python, rather than an unrelated system Python, can
+# actually import it.
+GOOD_BADMINTON_PYTHON_BIN="$PYTHON_BIN" \
+GOOD_BADMINTON_WHEELHOUSE="${GOOD_BADMINTON_WHEELHOUSE:-}" \
+  "$APP_DIR/deploy/install_lap.sh"
+
 if [[ ! -f "$APP_DIR/.gpu-api.env" ]]; then
   umask 077
   api_key="$(openssl rand -hex 32)"

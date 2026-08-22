@@ -304,6 +304,14 @@ class AnalysisJobManager:
                 finished_at=utc_now(),
                 progress={**job["progress"], "ratio": 1.0},
             )
+            # Component-level measurements are produced by the analysis
+            # worker.  Persist them in the job before freezing the terminal
+            # performance trace, so client-side end_to_end_trace.json can
+            # expose where serial processing time was spent.
+            job["execution"] = {
+                **(job.get("execution") or {}),
+                "analysis_metrics": result.get("execution_metrics"),
+            }
             self._finish_timing(job, "succeeded")
             self._persist_performance_trace(job)
             job["result"] = self._result_manifest(result, output_dir)

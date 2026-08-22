@@ -20,6 +20,10 @@ api_data/
 *.log
 # Local deployment artifact: upload it to the GPU provider, never commit it.
 deploy/good-badminton-gpu-api-upload.zip
+# Deployment archives are generated from the tracked scripts. The TrackNet
+# archive and Ultralytics checkout are third-party inputs, not project source.
+deploy/*.zip
+Ultralytics/
 
 # Model weights are intentionally not published
 weights/*
