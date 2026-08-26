@@ -25,6 +25,12 @@ from webui.pipeline import (
     run_analysis,
 )
 from webui.remote_gpu import RemoteAnalysisError, remote_gpu_config, run_remote_analysis
+from webui.stream_replay import (
+    StreamReplayError,
+    iter_local_stream_replay,
+    poll_local_stream_replay,
+    start_local_stream_replay,
+)
 from webui.reconcile_remote_tasks import reconcile_once
 from webui.shot_review import (
     REVIEW_DECISIONS,
@@ -108,7 +114,7 @@ def _bgr_to_rgb(img):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def detect_court(video_file, template_file, language="zh"):
+def detect_court(video_file, template_file, language="zh", progress=gr.Progress(track_tqdm=False)):
     """Use an uploaded template when supplied; otherwise generate one from video."""
     text = _UI_TEXT.get(language, _UI_TEXT["zh"])
     if template_file:
@@ -120,7 +126,13 @@ def detect_court(video_file, template_file, language="zh"):
         if video_file is None:
             raise gr.Error(text["need_video"])
         _validate_file_size(video_file, _MAX_VIDEO_BYTES, "Video")
-        result = prepare_court_from_video(video_file)
+        result = prepare_court_from_video(
+            video_file,
+            progress_cb=lambda current, total, frame: progress(
+                (current, total),
+                desc=f"正在检查球场候选帧 {current}/{total}（源帧 {frame}）",
+            ),
+        )
         template_path = result["template_path"]
         selection = result["selection"]
 
@@ -249,13 +261,14 @@ def ensure_court_for_analysis(video_file, template_path, corners, click_corners,
 
 def run_full_analysis(analysis_ready, video_file, template_path, corners,
                        pose_family, pose_mode, language, audio, match_mode,
-                       output_video_style, shuttle_detector,
+                       output_video_style, shuttle_detector, tracker_backend,
+                       movement_rally_settle_seconds, enable_huji_play_state,
                        pose_imgsz, analysis_sample_hz, pose_conf, far_player_enhancement, far_pose_roi,
                        generate_annotated_video, browser_video_reencode,
                        show_skeletons, show_player_trajectories,
                       show_court_trajectory, show_shuttlecock_trajectory,
-                      show_player_stats, show_pose_roi, visualize_positions,
-                      yolo_pose_model, ball_model,
+                       show_player_stats, show_pose_roi, visualize_positions,
+                      yolo_pose_model, ball_model, gpu_base_url,
                       progress=gr.Progress(track_tqdm=False)):
     if not analysis_ready:
         gr.Warning("已切换到当前视频帧，请在预览图中点击四个球场角点，然后应用手动角点。")
@@ -285,16 +298,23 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "language": language,
         "audio": audio,
         "match_mode": match_mode,
-        "lock_match_roster": True,
+        # The upload UI intentionally does not ask for singles/doubles.  The
+        # legacy full-file pipeline therefore stays in open anonymous-track
+        # mode: detected people are retained instead of withholding the entire
+        # result until a predeclared 2- or 4-person roster happens to appear.
+        # A later business flow may bind teams and identities to these tracks.
+        "lock_match_roster": False,
         "roster_stable_frames": 2,
-        "tracker_backend": "bytetrack",
-        "enable_bytetrack": True,
+        "tracker_backend": tracker_backend,
+        "enable_bytetrack": tracker_backend == "bytetrack",
         "output_video_style": output_video_style,
         "generate_annotated_video": generate_annotated_video,
         "browser_video_reencode": browser_video_reencode,
         # This is an execution mode rather than a display toggle. ``none``
         # does not invoke a shuttle detector or create ball evidence.
         "shuttle_detector": shuttle_detector,
+        "movement_rally_settle_seconds": float(movement_rally_settle_seconds),
+        "enable_huji_play_state": bool(enable_huji_play_state),
         "pose_imgsz": int(pose_imgsz),
         # One selection controls every primary evidence-producing component:
         # pose, YOLO shuttle, track/roster updates, derived rallies and JSONL.
@@ -333,7 +353,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             ledger = BusinessTaskLedger()
             business_task_id = ledger.start_task(
                 output_dir=remote_output_dir,
-                remote_base_url=remote_gpu_config()["base_url"],
+                remote_base_url=remote_gpu_config(gpu_base_url)["base_url"],
             )
 
             def remote_status(event):
@@ -346,7 +366,9 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                     options=options, output_dir=remote_output_dir, status_cb=remote_status,
                     business_task_id=business_task_id,
                     cancel_cb=task_handle.is_cancelled,
+                    gpu_base_url=gpu_base_url,
                 )
+                _attach_business_interpretation(result, remote_status)
                 outcome["result"] = result
                 trace_record = ledger.archive_performance_trace(
                     business_task_id,
@@ -410,6 +432,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                     options=options, progress_cb=local_progress,
                     cancel_cb=task_handle.is_cancelled,
                 )
+                _attach_business_interpretation(result, remote_status)
                 _write_execution_metadata(result, {
                     "mode": "local_fallback", "fallback_used": True,
                     "remote_failure": fallback_reason,
@@ -481,13 +504,13 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             status["phase"] = "cancelling"
             status["cancellation_requested"] = True
         if updated or status["phase"] == "preparing":
-            yield None, None, None, None, None, None, None, None, status.copy()
+            yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy()
         time.sleep(0.4)
 
     if "cancelled" in outcome:
         status.update({"phase": "cancelled", "message": outcome["cancelled"]})
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
-        yield None, None, None, None, None, None, None, None, status.copy()
+        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy()
         return
     if "interrupt_unconfirmed" in outcome:
         status.update({
@@ -495,7 +518,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             "message": outcome["interrupt_unconfirmed"],
         })
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
-        yield None, None, None, None, None, None, None, None, status.copy()
+        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy()
         return
     if "error" in outcome:
         # Preserve the failure in the visible progress panel.  Raising a
@@ -508,7 +531,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             "action": "请查看 error 字段；若为上传/连接失败，请先恢复 127.0.0.1:8080 SSH 隧道。",
         })
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
-        yield None, None, None, None, None, None, None, None, status.copy()
+        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy()
         return
     result = outcome["result"]
 
@@ -532,6 +555,18 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
     if performance_report_file and not os.path.isfile(performance_report_file):
         performance_report_file = None
     rally_summary, rally_rows = _rally_summary_from_result(result, metadata_content)
+    movement_metrics_file = result.get("movement_metrics")
+    if movement_metrics_file and not os.path.isfile(movement_metrics_file):
+        movement_metrics_file = None
+    movement_rally_window_sweep_file = result.get("movement_rally_window_sweep")
+    if movement_rally_window_sweep_file and not os.path.isfile(movement_rally_window_sweep_file):
+        movement_rally_window_sweep_file = None
+    movement_metrics_detail = _read_json_mapping(
+        movement_metrics_file,
+        {"status": "not_generated", "message": "本次分析未生成运动数据。"},
+    )
+    movement_metric_rows = _movement_metric_summary_rows(movement_metrics_detail)
+    body_profile_rows = _body_profile_rows_from_metrics(movement_metrics_file)
 
     status["phase"] = "succeeded"
     status["elapsed_seconds"] = round(time.monotonic() - started, 1)
@@ -540,8 +575,160 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         status["match_roster"] = roster
     yield (
         output_video, viz_images or None, metadata_content, detections_file,
-        tracknet_raw_file, performance_report_file, rally_summary, rally_rows, status.copy(),
+        tracknet_raw_file, performance_report_file, rally_summary, rally_rows,
+        movement_metrics_file, movement_metric_rows, movement_metrics_detail,
+        movement_rally_window_sweep_file,
+        body_profile_rows, result.get("output_dir"), status.copy(),
     )
+
+
+def run_local_stream_replay(
+    analysis_ready,
+    video_file,
+    corners,
+    shuttle_detector,
+    tracker_backend,
+    pose_imgsz,
+    analysis_sample_hz,
+    generate_annotated_video,
+    far_player_enhancement,
+    gpu_base_url,
+):
+    """Submit a recording and surface the business-derived movement metrics."""
+
+    if not analysis_ready:
+        raise gr.Error("请先自动检测或手动确认四个球场角点，再启动模拟流式分析。")
+    if video_file is None:
+        raise gr.Error("请先上传视频。")
+    try:
+        initial = start_local_stream_replay(
+            video_file,
+            corners,
+            shuttle_detector=shuttle_detector,
+            tracker_backend=tracker_backend,
+            pose_imgsz=int(pose_imgsz),
+            analysis_sample_hz=int(analysis_sample_hz),
+            generate_annotated_video=bool(generate_annotated_video),
+            far_player_enhancement=bool(far_player_enhancement),
+            gpu_base_url=gpu_base_url,
+        )
+        for status in iter_local_stream_replay(initial):
+            derivation = ((status.get("result") or {}).get("business_derivation") or {})
+            metrics_path = derivation.get("movement_metrics_path")
+            if metrics_path and not os.path.isfile(metrics_path):
+                metrics_path = None
+            metrics = _read_json_mapping(
+                metrics_path,
+                {
+                    "status": "processing",
+                    "message": "GPU 已收到流分片；等待业务侧汇总真实高置信人物观测。",
+                },
+            )
+            analysis_dir = str(Path(metrics_path).parents[1]) if metrics_path else None
+            yield (
+                metrics_path,
+                _movement_metric_summary_rows(metrics),
+                metrics,
+                _body_profile_rows_from_metrics(metrics_path),
+                analysis_dir,
+                status,
+            )
+    except StreamReplayError as exc:
+        yield (
+            None,
+            [],
+            {"status": "failed", "message": str(exc)},
+            [],
+            None,
+            {
+                "mode": "local_business_to_gpu_segment_replay",
+                "status": "failed",
+                "error": str(exc),
+                "action": "确认本地业务网关 127.0.0.1:8081 和 GPU API 127.0.0.1:8080 都已启动。",
+            },
+        )
+
+
+def load_local_stream_replay_result(business_task_id: str):
+    """Reload one durable stream-replay result into the visible WebUI.
+
+    A stream replay runs asynchronously in the separate business gateway.  A
+    browser refresh must not make its already-derived metrics invisible or
+    force the user to replay the source video.  This is intentionally a read
+    operation: it never creates a GPU session, reuploads a segment, or edits
+    the received evidence.
+    """
+
+    task_id = str(business_task_id or "").strip()
+    if not task_id:
+        raise gr.Error("请输入业务任务 ID，例如 bstr_xxx。")
+    try:
+        status = poll_local_stream_replay(task_id)
+    except StreamReplayError as exc:
+        raise gr.Error(str(exc)) from exc
+    derivation = ((status.get("result") or {}).get("business_derivation") or {})
+    metrics_path = derivation.get("movement_metrics_path")
+    if status.get("status") != "completed" or not metrics_path or not os.path.isfile(metrics_path):
+        detail = status.get("error") or derivation.get("message") or "任务尚未生成可读取的运动数据。"
+        raise gr.Error(f"任务 {task_id} 当前状态为 {status.get('status')!r}：{detail}")
+    metrics = _read_json_mapping(metrics_path, {"status": "missing"})
+    status = dict(status)
+    status["display_source"] = "loaded_existing_stream_replay"
+    status["movement_metrics_path"] = metrics_path
+    return (
+        metrics_path,
+        _movement_metric_summary_rows(metrics),
+        metrics,
+        _body_profile_rows_from_metrics(metrics_path),
+        str(Path(metrics_path).parents[1]),
+        status,
+    )
+
+
+def _attach_business_interpretation(result, publish=None):
+    """Derive lightweight outputs after artifacts reach the business side.
+
+    Metric/report failure never invalidates anonymous GPU evidence. The status
+    remains explicit and retryable without another video upload or inference.
+    """
+    output_dir = (result or {}).get("output_dir")
+    if not output_dir:
+        return result
+    started = time.monotonic()
+    if publish is not None:
+        publish({"mode": "business_gateway", "phase": "business_interpretation_running"})
+    try:
+        from business_gateway.post_match import generate_business_interpretation
+
+        interpretation = generate_business_interpretation(output_dir)
+    except (OSError, ValueError) as exc:
+        status = {
+            "status": "failed",
+            "owner": "business_gateway",
+            "reason": str(exc),
+            "retryable_without_video_analysis": True,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+        result["business_interpretation"] = status
+        result.setdefault("warnings", []).append(
+            f"匿名视频数据已保存，但业务指标生成失败，可直接重试，无需重新分析视频：{exc}"
+        )
+        if publish is not None:
+            publish({"mode": "business_gateway", "phase": "business_interpretation_failed", **status})
+        return result
+
+    result["movement_metrics"] = interpretation.get("movement_metrics_path")
+    result["performance_report"] = interpretation.get("performance_report_path")
+    result["business_interpretation"] = interpretation
+    if publish is not None:
+        publish({
+            "mode": "business_gateway",
+            "phase": "business_interpretation_succeeded",
+            "elapsed_seconds": interpretation.get("elapsed_seconds"),
+            "movement_metrics": interpretation.get("movement_metrics_path"),
+            "performance_report": interpretation.get("performance_report_path"),
+        })
+    return result
 
 
 def interrupt_active_analysis(language="zh"):
@@ -575,7 +762,30 @@ def _rally_summary_from_result(result, metadata):
         .get("shuttlecock_detection", {})
         .get("primary_source")
     )
-    if shuttle_source == "none" or derived.get("status") == "not_requested":
+    if shuttle_source == "none" or derived.get("status") == "movement_only":
+        movement_rallies_path = Path(result.get("movement_rallies") or derived.get("rallies_path") or "")
+        if movement_rallies_path.is_file():
+            try:
+                movement_payload = json.loads(movement_rallies_path.read_text(encoding="utf-8"))
+                rallies = list(movement_payload.get("rallies") or [])
+            except (OSError, ValueError):
+                rallies = []
+            rows = [
+                [
+                    item.get("rally_id"),
+                    round(float(item.get("start_frame", 0)) / _result_fps(metadata), 2),
+                    round(float(item.get("end_frame", 0)) / _result_fps(metadata), 2),
+                    0, 0, 0, item.get("end_reason"),
+                    round(float(item.get("confidence", 0.0)), 3),
+                ]
+                for item in rallies
+            ]
+            return (
+                "### 人体稳定候选回合（待人工复核）\n"
+                f"共 **{len(rallies)}** 个候选回合；未检测羽毛球，因此**不生成拍数、球速、球种或得分**。"
+                "边界仅由所有预期球员连续稳定的窗口产生，任何检测缺失都会使窗口失效。",
+                rows,
+            )
         return (
             "### 回合与拍数\n"
             "本次选择了**不检测羽毛球**：只输出人物跑位、姿态和持续追踪数据，"
@@ -628,6 +838,185 @@ def _rally_summary_from_result(result, metadata):
     )
 
 
+def _result_fps(metadata):
+    fps = float(((metadata or {}).get("video") or {}).get("fps") or 0.0)
+    return fps if fps > 0 else 30.0
+
+
+def _body_profile_rows_from_metrics(metrics_path):
+    """Seed a reviewable body-profile table from visual tracks only."""
+    if not metrics_path or not os.path.isfile(metrics_path):
+        return []
+    try:
+        payload = json.loads(Path(metrics_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    profile_by_track = {}
+    profile_path = Path(metrics_path).parent / "player_body_profiles_v1.json"
+    try:
+        profile_by_track = {
+            str(item.get("track_id")): item
+            for item in json.loads(profile_path.read_text(encoding="utf-8")).get("profiles") or []
+            if isinstance(item, dict) and item.get("track_id")
+        }
+    except (OSError, ValueError):
+        pass
+    return [
+        [
+            item.get("track_id"),
+            (profile_by_track.get(str(item.get("track_id"))) or {}).get("weight_kg"),
+            (profile_by_track.get(str(item.get("track_id"))) or {}).get("height_cm"),
+        ]
+        for item in payload.get("players") or []
+        if item.get("track_id")
+    ]
+
+
+def _read_json_mapping(path, fallback=None):
+    """Read a derived JSON artifact for direct WebUI display.
+
+    Files remain the durable/exportable contract, while this helper gives the
+    operator the same evidence in-page immediately after an analysis or a
+    body-profile refresh.
+    """
+    if not path or not os.path.isfile(path):
+        return fallback if fallback is not None else {}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return fallback if fallback is not None else {}
+    return payload if isinstance(payload, dict) else (fallback if fallback is not None else {})
+
+
+def _movement_metric_summary_rows(metrics):
+    """Flatten per-track movement evidence into a readable result table.
+
+    The complete object is shown in a JSON panel as well. This table is only
+    a navigation aid: it retains data coverage and quality so a large distance
+    or speed cannot be read without its evidence limitations.
+    """
+    rows = []
+    for item in (metrics or {}).get("players") or []:
+        movement = item.get("movement") or {}
+        coverage = item.get("measurement_coverage") or {}
+        energy = item.get("energy_estimate") or {}
+        energy_value = energy.get("estimated_kcal_rounded")
+        if energy_value is None and energy.get("estimated_kcal") is not None:
+            energy_value = int(round(float(energy["estimated_kcal"])))
+        # Existing result folders can still contain the previous range-only
+        # schema. Display its midpoint as one migration-safe product value;
+        # a subsequent save/refresh writes the new single-value schema.
+        energy_range = energy.get("estimated_kcal_range") or []
+        if energy_value is None and len(energy_range) >= 2:
+            energy_value = int(round((float(energy_range[0]) + float(energy_range[1])) / 2.0))
+        if energy_value is not None:
+            energy_display = str(energy_value)
+        else:
+            energy_display = "待填写体重"
+        rows.append([
+            item.get("track_id"),
+            movement.get("distance_m"),
+            movement.get("mean_speed_mps"),
+            movement.get("peak_speed_mps"),
+            movement.get("moving_time_sec"),
+            movement.get("high_intensity_movement_time_sec"),
+            movement.get("acceleration_event_count"),
+            movement.get("deceleration_event_count"),
+            f"{movement.get('direction_change_count') or 0} / {movement.get('peak_direction_changes_30s') or 0}",
+            round(float(coverage.get("usable_measurement_ratio") or 0.0) * 100.0, 1),
+            energy_display,
+            (item.get("quality") or {}).get("status"),
+        ])
+    return rows
+
+
+def _load_latest_movement_display():
+    """Hydrate the analysis tab from the newest completed local result.
+
+    Restarting the WebUI must not force an operator to upload and analyse the
+    same video again merely to inspect or amend already-generated movement
+    data. This reads only durable local artifacts and never reruns inference.
+    """
+    run_dir = default_analysis_run("outputs")
+    if not run_dir:
+        return None, [], {"status": "waiting_for_analysis"}, [], None, {
+            "status": "waiting_for_analysis",
+            "message": "尚未找到可展示的本地运动数据。",
+        }
+    metrics_path = Path(run_dir) / "derived" / "player_movement_metrics_v1.json"
+    metrics = _read_json_mapping(
+        metrics_path,
+        {"status": "not_generated", "message": "该结果尚未生成运动数据。"},
+    )
+    return (
+        str(metrics_path) if metrics_path.is_file() else None,
+        _movement_metric_summary_rows(metrics),
+        metrics,
+        _body_profile_rows_from_metrics(metrics_path),
+        str(run_dir),
+        {
+            "status": "loaded_existing_result",
+            "analysis_dir": str(run_dir),
+            "movement_metrics": str(metrics_path) if metrics_path.is_file() else None,
+        },
+    )
+
+
+def save_body_profiles_and_refresh_metrics(analysis_dir, profile_rows, consent):
+    """Save explicit user inputs, recompute lightweight metrics, then refresh one report."""
+    run_dir = Path(str(analysis_dir or ""))
+    if not run_dir.is_dir():
+        raise gr.Error("请先完成一次视频分析，再填写体重和身高。")
+    if not consent:
+        raise gr.Error("请确认同意仅将身高体重用于本次赛后运动消耗估算。")
+    rows = _dataframe_records(profile_rows)
+    try:
+        from business_gateway.metrics.movement import write_body_profiles
+        from business_gateway.post_match import generate_business_interpretation
+
+        body_path = write_body_profiles(run_dir, rows, consent=True)
+        interpretation = generate_business_interpretation(
+            run_dir,
+            body_profiles_path=body_path,
+        )
+        metrics = interpretation["movement_metrics"]
+        report = interpretation["performance_report"] or {"status": "not_requested"}
+    except (OSError, ValueError) as exc:
+        raise gr.Error(f"保存运动数据失败：{exc}") from exc
+    return (
+        metrics.get("metrics_path"),
+        _movement_metric_summary_rows(metrics),
+        metrics,
+        _body_profile_rows_from_metrics(metrics.get("metrics_path")),
+        report.get("report_path"),
+        {
+            "status": "succeeded",
+            "body_profiles": body_path,
+            "movement_metrics": metrics.get("metrics_path"),
+            "performance_report_status": report.get("status"),
+            "performance_report": report.get("report_path"),
+        },
+    )
+
+
+def _dataframe_records(value):
+    if hasattr(value, "to_dict"):
+        value = value.to_dict("records")
+    if not isinstance(value, list):
+        return []
+    records = []
+    for row in value:
+        if isinstance(row, dict):
+            records.append(row)
+        elif isinstance(row, (list, tuple)):
+            records.append({
+                "track_id": row[0] if len(row) > 0 else None,
+                "weight_kg": row[1] if len(row) > 1 else None,
+                "height_cm": row[2] if len(row) > 2 else None,
+            })
+    return records
+
+
 _UI_TEXT = {
     "zh": {
         "title": "# Good Badminton — AI 羽毛球分析系统",
@@ -643,7 +1032,7 @@ _UI_TEXT = {
         "pose_imgsz": "YOLO Pose 输入尺寸",
         "analysis_sample_hz": "统一分析频率",
         "pose_conf": "远端人体置信阈值",
-        "far_player_enhancement": "远端球员增强（全场640 + 远端ROI 640）",
+        "far_player_enhancement": "远端球员增强（全场 + 远端 ROI，使用当前 Pose 尺寸）",
         "far_pose_roi": "远端 ROI（相对姿态区域 x1,y1,x2,y2）",
         "advanced": "高级选项",
         "skeletons": "显示骨架",
@@ -696,7 +1085,7 @@ _UI_TEXT = {
         "pose_imgsz": "YOLO Pose Input Size",
         "analysis_sample_hz": "Unified Analysis Sampling Rate",
         "pose_conf": "Far-player confidence threshold",
-        "far_player_enhancement": "Far-player enhancement (full 640 + far ROI 640)",
+        "far_player_enhancement": "Far-player enhancement (full frame + far ROI at the selected Pose size)",
         "far_pose_roi": "Far ROI (relative pose region x1,y1,x2,y2)",
         "advanced": "Advanced Options",
         "skeletons": "Show Skeletons",
@@ -1714,85 +2103,85 @@ def build_ui():
                     video_input = gr.File(label=t["video"], file_types=["video"])
                     template_input = gr.File(label=t["template"], file_types=["image"])
 
-                    md_settings = gr.Markdown(t["settings"])
-                    pose_family = gr.Dropdown(
-                        choices=["yolo-pose", "rtmpose", "rtmo"],
-                        value="yolo-pose", label=t["pose_family"],
+                    # The analysis service is anonymous and mode-free: it
+                    # keeps every visible person as a track, without asking
+                    # whether this is singles, doubles or an informal game.
+                    # The legacy file pipeline gets its most permissive
+                    # compatible setting internally; teams are post-analysis
+                    # business data, not video-analysis input.
+                    md_settings = gr.Markdown(
+                        "### 开发分析\n"
+                        "不需要选择单打或双打；系统采集匿名轨迹，赛后再由业务侧认领。"
                     )
-                    pose_mode = gr.Dropdown(
-                        choices=["lightweight", "balanced", "performance"],
-                        value="balanced", label=t["pose_mode"],
-                    )
-                    language = gr.Radio(
-                        choices=[("中文", "zh"), ("English", "en")],
-                        value="zh", label=t["language"],
-                    )
-                    audio = gr.Checkbox(value=True, label=t["audio"])
-                    match_mode = gr.Radio(
-                        choices=[
-                            ("Singles (one player per team)", "singles"),
-                            ("Doubles (up to two players per team)", "doubles"),
-                        ],
-                        value="singles",
-                        label="比赛模式 / Match mode",
-                        info="New tracking uses spatial.tracks. Doubles keeps same-side players instead of upper/lower filtering.",
-                    )
-                    gr.Markdown("**标注视频：** 默认不生成，优先保存可分析数据；需要肉眼复核时可在高级选项开启。")
-                    # Preserve the analysis callback contract while preventing
-                    # accidental Skeleton-only output in the normal workflow.
+                    pose_family = gr.State(value="yolo-pose")
+                    pose_mode = gr.State(value="balanced")
+                    language = gr.State(value="zh")
+                    audio = gr.State(value=False)
+                    match_mode = gr.State(value="doubles")
                     output_video_style = gr.State(value="annotated")
                     shuttle_detector = gr.Dropdown(
                         choices=[
                             ("不检测羽毛球（最快，仅人物跑位/姿态）", "none"),
-                            ("YOLO 羽毛球检测（默认）", "yolo"),
+                            ("YOLO 羽毛球检测（采集球点与球速候选）", "yolo"),
                             ("TrackNetV3 羽毛球轨迹增强（较慢）", "tracknet_v3"),
                         ],
                         value="yolo",
-                        label="羽毛球检测来源",
+                        label="羽毛球数据",
                         info=(
-                            "不检测会跳过羽毛球模型、球轨迹、击球候选和回合派生；"
-                            "YOLO 为默认平衡方案；TrackNetV3 会额外执行逐帧时序推理。"
+                            "不检测仅保留人物数据；YOLO 采集球点与球速候选；"
+                            "TrackNetV3 更适合试验球轨迹，但耗时明显更高。"
                         ),
                     )
-                    pose_imgsz = gr.Dropdown(
-                        choices=[640, 960, 1280], value=960, label=t["pose_imgsz"],
+                    with gr.Row():
+                        pose_imgsz = gr.Dropdown(
+                            choices=[640, 960, 1280], value=960,
+                            label="Pose 尺寸", scale=1,
+                        )
+                        analysis_sample_hz = gr.Dropdown(
+                            choices=[10, 15, 30], value=10,
+                            label="分析频率 (Hz)", scale=1,
+                        )
+                    tracker_backend = gr.Dropdown(
+                        choices=[
+                            ("ByteTrack（持续 ID）", "bytetrack"),
+                            ("球场关联（可恢复）", "court_association"),
+                        ],
+                        value="bytetrack",
+                        label="人物追踪方式",
+                        info="只影响同一人跨帧关联；不会要求选择单打或双打。",
                     )
-                    analysis_sample_hz = gr.Dropdown(
-                        choices=[10, 15, 30], value=10,
-                        label=t["analysis_sample_hz"],
-                        info="人物、YOLO 羽毛球、ByteTrack 持续 ID、回合派生和 JSONL 使用同一频率；10Hz 为默认生产模式。",
+                    generate_annotated_video = gr.Checkbox(
+                        value=False,
+                        label="生成标注视频（较慢，可用于肉眼复核）",
                     )
-                    pose_conf = gr.Slider(
-                        minimum=0.10, maximum=0.50, step=0.01, value=0.15,
-                        label=t["pose_conf"],
-                    )
+                    # Keep remaining implementation controls in the callback
+                    # contract, but make them deployment defaults rather than
+                    # routine end-user choices.
+                    movement_rally_settle_seconds = gr.State(value=0.7)
+                    enable_huji_play_state = gr.State(value=False)
+                    pose_conf = gr.State(value=0.15)
                     far_player_enhancement = gr.Checkbox(
-                        value=False, label=t["far_player_enhancement"],
+                        value=False,
+                        label=t["far_player_enhancement"],
+                        info="默认关闭。开启后会额外检测远端球场区域；全场和 ROI 均使用上方选择的 Pose 尺寸。",
                     )
-                    far_pose_roi = gr.Textbox(
-                        value="0.12,0.30,0.86,0.82", label=t["far_pose_roi"],
+                    far_pose_roi = gr.State(value="0.12,0.30,0.86,0.82")
+                    gpu_base_url = gr.Textbox(
+                        label="GPU 服务地址（开发用）",
+                        value=remote_gpu_config()["base_url"],
+                        placeholder="例如 http://xn-g.suanjiayun.com:55606",
+                        info="完整上传与模拟流式分析均使用此地址；API Key 仍只从本机配置读取。生产环境应由业务服务固定配置。",
                     )
-
-                    with gr.Accordion(t["advanced"], open=False) as adv_accordion:
-                        generate_annotated_video = gr.Checkbox(
-                            value=False,
-                            label="生成标注视频（绘制 + 首次 H.264 编码）",
-                            info="关闭时跳过每帧绘制、临时 MP4 写入和首次视频编码；不会影响人物轨迹、速度、距离、Track ID、JSONL 或统计。",
-                        )
-                        browser_video_reencode = gr.Checkbox(
-                            value=False,
-                            label="浏览器兼容重编码（仅生成标注视频时生效）",
-                            info="在已生成标注视频后再执行一次浏览器兼容转码；仅用于网页播放兼容性，默认关闭以节省时间。",
-                        )
-                        show_skeletons = gr.Checkbox(value=True, label=t["skeletons"])
-                        show_player_trajectories = gr.Checkbox(value=True, label=t["player_traj"])
-                        show_court_trajectory = gr.Checkbox(value=True, label=t["court_traj"])
-                        show_shuttlecock_trajectory = gr.Checkbox(value=True, label=t["shuttle_traj"])
-                        show_player_stats = gr.Checkbox(value=True, label=t["player_stats"])
-                        show_pose_roi = gr.Checkbox(value=True, label=t["pose_roi"])
-                        visualize_positions = gr.Checkbox(value=True, label=t["viz_positions"])
-                        yolo_pose_model = gr.Textbox(value="weights/yolo11n-pose.pt", label=t["yolo_pose_path"])
-                        ball_model = gr.Textbox(value="weights/yolo11s-ball.pt", label=t["ball_path"])
+                    browser_video_reencode = gr.State(value=False)
+                    show_skeletons = gr.State(value=True)
+                    show_player_trajectories = gr.State(value=True)
+                    show_court_trajectory = gr.State(value=True)
+                    show_shuttlecock_trajectory = gr.State(value=True)
+                    show_player_stats = gr.State(value=True)
+                    show_pose_roi = gr.State(value=True)
+                    visualize_positions = gr.State(value=True)
+                    yolo_pose_model = gr.State(value="weights/yolo11n-pose.pt")
+                    ball_model = gr.State(value="weights/yolo11s-ball.pt")
 
                 with gr.Column(scale=2):
                     md_step1 = gr.Markdown(t["step1"])
@@ -1804,12 +2193,28 @@ def build_ui():
                     md_step2 = gr.Markdown(t["step2"])
                     with gr.Row():
                         run_btn = gr.Button(t["run_btn"], variant="primary")
+                        stream_replay_btn = gr.Button("模拟流式分析（本地开发）", variant="secondary")
                         interrupt_btn = gr.Button(t["interrupt_btn"], variant="stop")
+                    gr.Markdown(
+                        "`模拟流式分析` 会由本地业务网关把当前文件切成 2 秒片段，再逐段发送到本地 GPU 服务；"
+                        "用于验证流式协议和断点状态，不等同于真实摄像头实时推流。"
+                    )
+                    with gr.Row():
+                        stream_replay_task_id = gr.Textbox(
+                            label="加载已完成流式任务",
+                            placeholder="bstr_xxx（刷新页面后可重新查看数据，不重跑视频）",
+                            scale=5,
+                        )
+                        load_stream_replay_btn = gr.Button("加载流式结果", variant="secondary", scale=1)
 
                     md_results = gr.Markdown(t["results"])
                     output_status = gr.JSON(
                         label=t["out_status"],
                         value={"phase": "idle", "hint": "点击运行分析后显示上传、排队、帧进度与执行来源。"},
+                    )
+                    stream_replay_status = gr.JSON(
+                        label="模拟流式任务状态（业务网关 → GPU）",
+                        value={"status": "idle", "hint": "启动后显示业务任务、GPU session、每段上传和处理状态。"},
                     )
                     output_video = gr.Video(label=t["out_video"])
                     output_gallery = gr.Gallery(label=t["out_gallery"], columns=2, height="auto")
@@ -1817,6 +2222,42 @@ def build_ui():
                     output_detections = gr.File(label=t["out_detections"])
                     output_tracknet_raw = gr.File(label="TrackNetV3 原始球点 CSV（可下载复核）")
                     output_performance_report = gr.File(label="运动表现报告（含大模型状态）")
+                    output_movement_metrics = gr.File(label="运动数据（按视觉 Track ID）")
+                    output_movement_metric_summary = gr.Dataframe(
+                        headers=[
+                            "track_id", "距离(m)", "平均速度(m/s)", "峰值速度(m/s)",
+                            "有效移动(s)", "高强度(s)", "加速事件", "减速事件", "敏捷移动（整场/30秒峰值）",
+                            "可用覆盖率(%)", "运动消耗估算(kcal)", "数据质量",
+                        ],
+                        datatype=["str", "number", "number", "number", "number", "number",
+                                  "number", "number", "str", "number", "str", "str"],
+                        interactive=False,
+                        label="运动员运动数据汇总（仅使用真实高置信检测）",
+                    )
+                    output_movement_metric_detail = gr.JSON(
+                        label="运动员完整分析数据（覆盖率、排除原因、场地区域与能量估算）",
+                        value={"status": "waiting_for_analysis"},
+                    )
+                    output_movement_rally_window_sweep = gr.File(label="无球回合稳定窗口对照（0.5/0.7/1.0 秒）")
+                    analysis_output_dir_state = gr.State(value=None)
+                    gr.Markdown(
+                        "### 赛后运动数据与身体参数\n"
+                        "分析完成后会按每个视觉 `track_id` 生成距离、速度、加减速、变向和场地区域数据。"
+                        "填写体重/身高并确认后，系统只计算**已测移动时段**的能量消耗区间；不会从视频猜测身体数据。"
+                    )
+                    body_profile_table = gr.Dataframe(
+                        headers=["track_id", "weight_kg", "height_cm"],
+                        datatype=["str", "number", "number"],
+                        interactive=True,
+                        label="赛后填写（按 Track ID；单打通常两行）",
+                        max_height=180,
+                    )
+                    body_profile_consent = gr.Checkbox(
+                        value=False,
+                        label="我同意仅将上述身高体重用于本次赛后能量消耗估算",
+                    )
+                    save_body_profile_btn = gr.Button("保存身体参数并刷新运动数据/赛后报告")
+                    body_profile_status = gr.JSON(label="身体参数与运动数据刷新状态", value={"status": "waiting_for_analysis"})
                     output_rally_summary = gr.Markdown("### 回合与拍数\n完成分析后显示候选回合与每回合拍数。")
                     output_rallies = gr.Dataframe(
                         headers=["回合", "开始(s)", "结束(s)", "候选拍数", "可见球候选", "缺球补拍", "结束依据", "置信度"],
@@ -2236,19 +2677,6 @@ def build_ui():
             ],
         )
 
-        lang_outputs = [
-            md_title, md_inputs, video_input, template_input,
-            md_settings, pose_family, pose_mode, audio,
-            pose_imgsz, analysis_sample_hz, pose_conf, far_player_enhancement, far_pose_roi, adv_accordion,
-            show_skeletons, show_player_trajectories, show_court_trajectory,
-            show_shuttlecock_trajectory, show_player_stats, show_pose_roi,
-            visualize_positions, yolo_pose_model, ball_model,
-            md_step1, detect_btn, court_image, corner_status, apply_btn,
-            md_step2, run_btn, interrupt_btn, md_results,
-            output_status, output_video, output_gallery, output_metadata, output_detections,
-        ]
-        language.change(fn=_switch_language, inputs=[language], outputs=lang_outputs)
-
         video_input.change(
             fn=reset_court_selection,
             inputs=[language],
@@ -2298,19 +2726,77 @@ def build_ui():
             fn=run_full_analysis,
             inputs=[
                  analysis_ready_state, video_input, template_path_state, corners_state,
-                 pose_family, pose_mode, language, audio, match_mode, output_video_style, shuttle_detector,
+                 pose_family, pose_mode, language, audio, match_mode, output_video_style, shuttle_detector, tracker_backend,
+                 movement_rally_settle_seconds, enable_huji_play_state,
                  pose_imgsz, analysis_sample_hz, pose_conf, far_player_enhancement, far_pose_roi,
                  generate_annotated_video, browser_video_reencode,
                  show_skeletons, show_player_trajectories,
                 show_court_trajectory, show_shuttlecock_trajectory,
                 show_player_stats, show_pose_roi, visualize_positions,
-                yolo_pose_model, ball_model,
+                yolo_pose_model, ball_model, gpu_base_url,
             ],
             outputs=[
                 output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
                 output_performance_report,
-                output_rally_summary, output_rallies, output_status,
+                output_rally_summary, output_rallies,
+                output_movement_metrics, output_movement_metric_summary, output_movement_metric_detail,
+                output_movement_rally_window_sweep,
+                body_profile_table, analysis_output_dir_state, output_status,
             ],
+        )
+        stream_preflight = stream_replay_btn.click(
+            fn=ensure_court_for_analysis,
+            inputs=[video_input, template_path_state, corners_state, click_corners_state, language],
+            outputs=[
+                court_image, corners_state, click_corners_state,
+                template_path_state, corner_status, analysis_ready_state,
+            ],
+        )
+        stream_preflight.then(
+            fn=run_local_stream_replay,
+            inputs=[
+                analysis_ready_state, video_input, corners_state,
+                shuttle_detector, tracker_backend, pose_imgsz, analysis_sample_hz,
+                generate_annotated_video, far_player_enhancement,
+                gpu_base_url,
+            ],
+            outputs=[
+                output_movement_metrics,
+                output_movement_metric_summary,
+                output_movement_metric_detail,
+                body_profile_table,
+                analysis_output_dir_state,
+                stream_replay_status,
+            ],
+        )
+        load_stream_replay_btn.click(
+            fn=load_local_stream_replay_result,
+            inputs=[stream_replay_task_id],
+            outputs=[
+                output_movement_metrics,
+                output_movement_metric_summary,
+                output_movement_metric_detail,
+                body_profile_table,
+                analysis_output_dir_state,
+                stream_replay_status,
+            ],
+        )
+        save_body_profile_btn.click(
+            fn=save_body_profiles_and_refresh_metrics,
+            inputs=[analysis_output_dir_state, body_profile_table, body_profile_consent],
+            outputs=[
+                output_movement_metrics, output_movement_metric_summary, output_movement_metric_detail,
+                body_profile_table,
+                output_performance_report, body_profile_status,
+            ],
+        )
+        demo.load(
+            fn=_load_latest_movement_display,
+            outputs=[
+                output_movement_metrics, output_movement_metric_summary, output_movement_metric_detail,
+                body_profile_table, analysis_output_dir_state, body_profile_status,
+            ],
+            show_progress="hidden",
         )
         interrupt_btn.click(
             fn=interrupt_active_analysis,

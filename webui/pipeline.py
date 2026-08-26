@@ -24,7 +24,11 @@ from badminton_analysis.system import BadmintonAnalysisSystem, load_runtime_depe
 
 _MAX_WEBUI_OUTPUTS = 10
 _MAX_GENERATED_TEMPLATES = 20
-_MAX_COURT_FRAME_SAMPLES = 24
+# Court geometry is deliberately an initialization step, not a full-video
+# analysis pass. Eight evenly spread frames are sufficient to find a stable
+# fixed camera shot and keep the WebUI responsive; the manual four-corner path
+# remains available when none is suitable.
+_MAX_COURT_FRAME_SAMPLES = 8
 _COURT_DETECTION_SIZE = (1080, 720)
 _SAFE_OUTPUT_STEM_PATTERN = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
@@ -364,7 +368,7 @@ def _fallback_frame_score(frame):
 
 
 def extract_best_court_template(video_path, output_dir=os.path.join("outputs", "court_templates"),
-                                max_samples=_MAX_COURT_FRAME_SAMPLES):
+                                max_samples=_MAX_COURT_FRAME_SAMPLES, progress_cb=None):
     """Extract the most suitable court frame from a video using the native detector.
 
     The saved PNG is the exact video-resolution template used later for mapping;
@@ -387,7 +391,9 @@ def extract_best_court_template(video_path, output_dir=os.path.join("outputs", "
     best_detected = None
     best_fallback = None
     sampled_indices = _sample_frame_indices(total_frames, max_samples=max_samples)
-    for frame_index in sampled_indices:
+    for sample_number, frame_index in enumerate(sampled_indices, start=1):
+        if progress_cb is not None:
+            progress_cb(sample_number, len(sampled_indices), frame_index)
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -442,9 +448,9 @@ def extract_best_court_template(video_path, output_dir=os.path.join("outputs", "
     }
 
 
-def prepare_court_from_video(video_path):
+def prepare_court_from_video(video_path, progress_cb=None):
     """Create a template from a video frame, then reuse the normal court workflow."""
-    selected = extract_best_court_template(video_path)
+    selected = extract_best_court_template(video_path, progress_cb=progress_cb)
     if selected is None:
         return {
             "corners": None,
@@ -688,6 +694,8 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     shuttle_detector = options.get("shuttle_detector", "yolo")
     if shuttle_detector not in {"none", "yolo", "tracknet_v3"}:
         raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
+    movement_rally_settle_seconds = float(options.get("movement_rally_settle_seconds", 0.7))
+    enable_huji_play_state = bool(options.get("enable_huji_play_state", True))
     tracknet_measurements_path = None
     if shuttle_detector == "tracknet_v3":
         tracknet_t0 = time.perf_counter()
@@ -732,6 +740,8 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         roster_stable_frames=roster_stable_frames,
         shuttle_detector=shuttle_detector,
         tracknet_measurements_path=tracknet_measurements_path,
+        movement_rally_settle_seconds=movement_rally_settle_seconds,
+        enable_huji_play_state=enable_huji_play_state,
         generate_annotated_video=generate_annotated_video,
         browser_video_reencode=browser_video_reencode,
     )
@@ -852,6 +862,9 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         "detections": system.detections_path,
         "tracknet_raw_csv": tracknet_measurements_path,
         "performance_report": (getattr(system, "performance_report", None) or {}).get("report_path"),
+        "movement_metrics": (getattr(system, "movement_metrics", None) or {}).get("metrics_path"),
+        "movement_rallies": (getattr(system, "offline_artifacts", None) or {}).get("rallies_path"),
+        "movement_rally_window_sweep": (getattr(system, "offline_artifacts", None) or {}).get("rally_window_sweep_path"),
         "position_evidence_summary": position_evidence_summary,
         "derived": getattr(system, "offline_artifacts", None),
         "execution_metrics": execution_metrics,

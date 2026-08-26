@@ -99,7 +99,7 @@ try {
     foreach ($relativePath in $trackedFiles) {
         # Deployment never transports persisted or generated data.  The server
         # owns these paths under /root/good-badminton-gpu-api-state instead.
-        if ($relativePath -match '^(\.venv|venv|weights|api_data|outputs|__pycache__)/') {
+        if ($relativePath -match '^(\.venv|venv|weights|api_data|outputs|videos|__pycache__)/') {
             continue
         }
         Copy-SourceFile -RelativePath $relativePath
@@ -107,6 +107,32 @@ try {
 
     foreach ($relativePath in $requiredExtraFiles) {
         Copy-SourceFile -RelativePath $relativePath
+    }
+
+    # The GPU package is intentionally created from the working tree: during
+    # a staged multi-agent rollout, a newly added runtime module might not yet
+    # be in Git's index.  Include only untracked *application-source* files
+    # from the explicit service allow-list.  Tests, output artifacts, secrets,
+    # weights and virtual environments remain excluded by construction.
+    $deployableUntrackedPrefixes = @(
+        'api/',
+        'badminton_analysis/',
+        'business_gateway/',
+        'good_badminton_contracts/',
+        'evaluation/performance/'
+    )
+    $untrackedFiles = & git -C $repoRoot ls-files --others --exclude-standard
+    if ($LASTEXITCODE -ne 0) {
+        throw 'git ls-files --others failed; cannot safely include new runtime source.'
+    }
+    foreach ($relativePath in $untrackedFiles) {
+        $normalizedPath = $relativePath.Replace('\\', '/')
+        $isDeployable = $deployableUntrackedPrefixes | Where-Object {
+            $normalizedPath.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        if ($isDeployable -and $normalizedPath -match '\.(py|json|ya?ml)$') {
+            Copy-SourceFile -RelativePath $normalizedPath
+        }
     }
     if ($IncludeTrackNetABTools) {
         foreach ($relativePath in $trackNetABFiles) {

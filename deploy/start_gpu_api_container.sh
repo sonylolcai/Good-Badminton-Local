@@ -3,6 +3,10 @@ set -euo pipefail
 
 # Container-safe API launcher. Configure this exact command as the cloud
 # instance's startup command so a reboot restores the GPU API without systemd.
+# Exit code 75 is reserved for the stream watchdog: it means one third-party
+# CUDA/OpenCV call exceeded its bounded segment deadline after the failed
+# segment was persisted. Restarting creates a fresh process and resumes the
+# next segment from the durable checkpoint rather than leaving the queue stuck.
 APP_DIR="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ENV_FILE="${GOOD_BADMINTON_ENV_FILE:-$APP_DIR/.gpu-api.env}"
 PYTHON_BIN="${GOOD_BADMINTON_PYTHON_BIN:-python3}"
@@ -29,8 +33,30 @@ if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
 fi
 
 cd "$APP_DIR"
-nohup "$PYTHON_BIN" -m uvicorn api.app:app --host 0.0.0.0 --port "$PORT" \
-  > "$LOG_FILE" 2>&1 &
+nohup bash -c '
+  child_pid=""
+  stop_child() {
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+      kill "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+    fi
+    exit 0
+  }
+  trap stop_child INT TERM
+  while true; do
+    "$1" -m uvicorn api.app:app --host 0.0.0.0 --port "$2" &
+    child_pid=$!
+    wait "$child_pid"
+    exit_code=$?
+    child_pid=""
+    if [[ "$exit_code" -eq 75 ]]; then
+      echo "Stream watchdog requested GPU API restart; resuming durable sessions."
+      sleep 1
+      continue
+    fi
+    exit "$exit_code"
+  done
+' _ "$PYTHON_BIN" "$PORT" > "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 
 for _ in {1..10}; do

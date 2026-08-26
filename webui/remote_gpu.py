@@ -28,11 +28,32 @@ class RemoteAnalysisError(RuntimeError):
     """The remote service cannot be used safely for this WebUI run."""
 
 
-def remote_gpu_config():
-    """Read server-side configuration; secrets never enter browser state."""
+def remote_gpu_config(base_url_override=None):
+    """Read server-side configuration; secrets never enter browser state.
+
+    ``base_url_override`` is an operator-only WebUI development convenience.
+    It changes the destination for this one request and is never written into
+    the process environment, so concurrent submissions cannot accidentally
+    redirect one another.  API credentials remain server-side configuration.
+    """
     _load_local_config_file()
+    configured_base_url = (
+        str(base_url_override).strip()
+        if base_url_override is not None and str(base_url_override).strip()
+        else os.environ.get("GOOD_BADMINTON_GPU_API_URL", DEFAULT_GPU_API_URL).strip()
+    )
+    parsed = urlparse(configured_base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RemoteAnalysisError("GPU 服务地址必须是无账号、无查询参数的 http(s) 基础地址")
     return {
-        "base_url": os.environ.get("GOOD_BADMINTON_GPU_API_URL", DEFAULT_GPU_API_URL).rstrip("/"),
+        "base_url": configured_base_url.rstrip("/"),
         "api_key": os.environ.get("GOOD_BADMINTON_GPU_API_KEY", ""),
         "timeout_seconds": float(os.environ.get("GOOD_BADMINTON_GPU_API_TIMEOUT", "30")),
         "poll_seconds": float(os.environ.get("GOOD_BADMINTON_GPU_API_POLL_SECONDS", "2")),
@@ -54,10 +75,10 @@ def _load_local_config_file():
 
 
 def run_remote_analysis(video_path, template_path, corners, options, output_dir, progress_cb=None, status_cb=None,
-                        business_task_id=None, cancel_cb=None):
+                        business_task_id=None, cancel_cb=None, gpu_base_url=None):
     """Submit, wait for, and retrieve one remote job into *output_dir*."""
     raise_if_cancelled(cancel_cb)
-    config = remote_gpu_config()
+    config = remote_gpu_config(gpu_base_url)
     if not config["api_key"]:
         raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured in the WebUI process")
 
@@ -350,6 +371,9 @@ def _download_result(config, job_id, result, output_dir, cancel_cb=None, status_
         "detections": downloaded.get("detections"),
         "tracknet_raw_csv": downloaded.get("tracknet_raw_csv"),
         "performance_report": downloaded.get("performance_report"),
+        "movement_metrics": downloaded.get("movement_metrics"),
+        "movement_rallies": downloaded.get("movement_rallies"),
+        "movement_rally_window_sweep": downloaded.get("movement_rally_window_sweep"),
         "performance_trace": downloaded.get("performance_trace"),
         "position_evidence_summary": downloaded.get("position_evidence_summary"),
         "visualizations": [path for name, path in downloaded.items() if name.startswith("visualization_")],

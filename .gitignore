@@ -17,6 +17,7 @@ outputs/
 api_data/
 .gpu-api.env
 .webui-remote-gpu.env
+business_gateway/fixed_video_catalog.local.json
 *.log
 # Local deployment artifact: upload it to the GPU provider, never commit it.
 deploy/good-badminton-gpu-api-upload.zip
