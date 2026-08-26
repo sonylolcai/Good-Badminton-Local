@@ -138,6 +138,42 @@ class RemoteGpuTests(unittest.TestCase):
                     {}, gpu_base_url="http://user:password@gpu.example:8080"
                 )
 
+    def test_candidate_photo_proxies_a_known_track_from_the_gpu(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = LocalReplayManager(Path(temp_dir))
+            task_id = "bstr_test"
+            task_dir = Path(temp_dir) / task_id
+            task_dir.mkdir()
+            manager._write_task(
+                task_dir,
+                {
+                    "analysis_session_id": "ssn_test",
+                    "result": {
+                        "status": {
+                            "track_candidates": [{"track_id": "track_001"}],
+                        }
+                    },
+                },
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "GPU_ANALYSIS_BASE_URL": "http://gpu.example:8080",
+                    "GPU_ANALYSIS_API_KEY": "test-key",
+                },
+                clear=False,
+            ), patch("business_gateway.dev_api.urlopen") as urlopen:
+                remote = urlopen.return_value.__enter__.return_value
+                remote.headers.get_content_type.return_value = "image/jpeg"
+                remote.read.return_value = b"jpeg-bytes"
+                content, media_type = manager.candidate_photo(task_id, "track_001")
+
+            self.assertEqual((content, media_type), (b"jpeg-bytes", "image/jpeg"))
+            self.assertEqual(
+                urlopen.call_args.args[0].full_url,
+                "http://gpu.example:8080/api/v1/stream-sessions/ssn_test/candidate-photos/track_001",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
