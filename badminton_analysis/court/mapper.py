@@ -38,7 +38,10 @@ class CourtMapper:
         Returns:
             Transformed (x,y) coordinates in court space
         """
-        if not isinstance(point, (list, tuple, np.ndarray)) or not point:
+        if (
+            not isinstance(point, (list, tuple, np.ndarray))
+            or len(np.asarray(point).reshape(-1)) == 0
+        ):
             return []
         point = np.array(point, dtype=np.float32).reshape(-1, 1, 2)
         transformed_points = cv2.perspectiveTransform(point, self.matrix)

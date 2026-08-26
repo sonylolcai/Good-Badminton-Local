@@ -1,4 +1,5 @@
-﻿import os
+import ast
+import os
 import tempfile
 import json
 from tkinter import filedialog
@@ -83,7 +84,8 @@ class BadmintonAnalysisSystem:
                  enable_bytetrack=True, lock_match_roster=True,
                  roster_stable_frames=2, shuttle_detector='yolo',
                  tracknet_measurements_path=None, huji_action_model=None,
-                 huji_sample_hz=6.0, generate_annotated_video=False,
+                 huji_sample_hz=6.0, enable_huji_play_state=True,
+                 movement_rally_settle_seconds=0.7, generate_annotated_video=False,
                  browser_video_reencode=False):
         self.video_path = video_path
         self.show_display = show_display
@@ -94,11 +96,18 @@ class BadmintonAnalysisSystem:
             raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
         self.shuttle_detector = shuttle_detector
         self.tracknet_measurements_path = tracknet_measurements_path
+        self.movement_rally_settle_seconds = float(movement_rally_settle_seconds)
+        if self.movement_rally_settle_seconds not in {0.5, 0.7, 1.0}:
+            raise ValueError("movement_rally_settle_seconds must be 0.5, 0.7, or 1.0")
         # Huji-compatible scene classification is an optional, coarse
         # post-processing prior.  It is intentionally opt-in because the
         # published Huji repository does not bundle a reviewed badminton
         # classifier checkpoint with this project.
         self.huji_action_model = huji_action_model or os.environ.get("GOOD_BADMINTON_HUJI_ACTION_MODEL")
+        # The checkbox expresses a request.  A configured checkpoint is still
+        # required, and the scene model never runs when ball detection was
+        # deliberately disabled.
+        self.enable_huji_play_state = bool(enable_huji_play_state)
         self.huji_sample_hz = float(os.environ.get("GOOD_BADMINTON_HUJI_SAMPLE_HZ", huji_sample_hz))
         if self.huji_sample_hz <= 0:
             raise ValueError("huji_sample_hz must be greater than 0")
@@ -237,6 +246,11 @@ class BadmintonAnalysisSystem:
 
         self.stats_update_interval_frames = 0
         self.cached_movement_stats = {}
+        # At a 10/15 Hz analysis cadence, source-video frames between two
+        # detector measurements still need a stable annotation overlay.  This
+        # cache is display-only: it is never written as a new detection or
+        # passed back into tracking/analytics.
+        self._last_spatial_state = None
 
         self.is_court_view_count = 0
         self.consecutive_non_court_frames = 0
@@ -380,6 +394,8 @@ class BadmintonAnalysisSystem:
             enable_bytetrack=self.enable_bytetrack,
             lock_match_roster=self.lock_match_roster,
             roster_stable_frames=self.roster_stable_frames,
+            shuttle_enabled=self.shuttle_detector != 'none',
+            movement_rally_settle_seconds=self.movement_rally_settle_seconds,
         )
         self._write_metadata(fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height)
         
@@ -462,9 +478,14 @@ class BadmintonAnalysisSystem:
                     ),
                 },
                 "play_state": {
-                    "enabled": bool(self.huji_action_model),
+                    "requested": self.enable_huji_play_state and self.shuttle_detector != 'none',
+                    "enabled": bool(
+                        self.enable_huji_play_state
+                        and self.huji_action_model
+                        and self.shuttle_detector != 'none'
+                    ),
                     "model": self.huji_action_model,
-                    "sample_hz": self.huji_sample_hz if self.huji_action_model else None,
+                    "sample_hz": self.huji_sample_hz if self.enable_huji_play_state and self.huji_action_model else None,
                     "policy": (
                         "optional Huji-compatible scene classification; only a conservative "
                         "conflict prior for direction-reversal-after-gap candidates, never score proof"
@@ -562,7 +583,8 @@ class BadmintonAnalysisSystem:
                     "max_prediction_frames": self.shuttlecock_tracker.max_prediction_frames,
                     "prediction_confidence_decay": self.shuttlecock_tracker.prediction_confidence_decay,
                     "prediction_usage": (
-                        "not_requested; no shuttle, hit, or rally evidence is generated"
+                        "not_requested; no shuttle, hit, shot-count, or score evidence is generated; "
+                        "a separate all-player-stability boundary may be emitted for movement-only review"
                         if self.shuttle_detector == 'none' else
                         "visualization_and_export_only; exclude from hit/error ground truth"
                     ),
@@ -616,6 +638,14 @@ class BadmintonAnalysisSystem:
         if not analysis_was_sampled:
             self.execution_metrics["sampling"]["analysis_skipped_source_frames"] += 1
             output_frame = self._create_output_frame(frame) if self._needs_visual_output() else frame
+            if self._needs_visual_output() and self._last_spatial_state is not None:
+                overlay_t0 = time.perf_counter()
+                self._draw_player_overlay(output_frame, self._last_spatial_state)
+                self._draw_court_trajectory_overlay(output_frame, self._last_spatial_state)
+                self._record_execution_metric(
+                    "annotation_cached_spatial_overlay",
+                    time.perf_counter() - overlay_t0,
+                )
             self._write_output_frame(output_frame, frame_count, out)
             return output_frame, detect_frame_count
 
@@ -665,6 +695,7 @@ class BadmintonAnalysisSystem:
             ),
             has_fresh_observations=True,
         )
+        self._last_spatial_state = spatial_state
         self._record_execution_metric("spatial_tracking", time.perf_counter() - spatial_t0)
         self._emit_tracking_state(state_callback, frame_count, spatial_state)
         player_t0 = time.perf_counter()
@@ -730,24 +761,12 @@ class BadmintonAnalysisSystem:
             shuttle_draw_elapsed = time.time() - shuttle_draw_t0
 
             t0 = time.time()
-            self.player_pose_visualizer.draw_players(
-                frame=output_frame,
-                player_tracker=self.player_tracker,
-                cached_movement_stats=self.cached_movement_stats,
-                stats_visualizer=(
-                    self.stats_visualizer
-                    if self.show_player_stats and self.output_video_style == "annotated"
-                    else None
-                ),
-                rally_count=None if self.shuttle_detector == 'none' else self.rally_count,
-                spatial_tracks=spatial_state.get("tracks", []),
-                unassigned_detections=(spatial_state.get("match_roster") or {}).get("unassigned_observations", []),
-            )
+            self._draw_player_overlay(output_frame, spatial_state)
             players_draw_elapsed = time.time() - t0
 
             if self.show_court_trajectory and self.output_video_style == "annotated":
                 t0 = time.time()
-                output_frame = self.court_trajectory_visualizer.draw_overlay(output_frame, self.player_tracker.court_history)
+                output_frame = self._draw_court_trajectory_overlay(output_frame, spatial_state)
                 court_draw_elapsed = time.time() - t0
 
         if should_log_performance:
@@ -763,6 +782,47 @@ class BadmintonAnalysisSystem:
 
         self._write_output_frame(output_frame, frame_count, out)
         return output_frame, detect_frame_count
+
+    def _draw_player_overlay(self, frame, spatial_state):
+        """Draw the latest measured player evidence on an output-only frame.
+
+        A source frame skipped by the configured analysis cadence has no new
+        pose measurement.  Reusing this overlay solely for rendering keeps the
+        labelled MP4 stable at 30 FPS without pretending that its two adjacent
+        frames are fresh detector outputs.
+        """
+        spatial_state = spatial_state or {}
+        self.player_pose_visualizer.draw_players(
+            frame=frame,
+            player_tracker=self.player_tracker,
+            cached_movement_stats=self.cached_movement_stats,
+            stats_visualizer=(
+                self.stats_visualizer
+                if self.show_player_stats and self.output_video_style == "annotated"
+                else None
+            ),
+            rally_count=None if self.shuttle_detector == 'none' else self.rally_count,
+            spatial_tracks=spatial_state.get("tracks", []),
+            unassigned_detections=(spatial_state.get("match_roster") or {}).get("unassigned_observations", []),
+        )
+
+    def _draw_court_trajectory_overlay(self, frame, spatial_state):
+        """Keep the right-side mini-court in the same spatial-track domain.
+
+        This helper is called both for sampled inference frames and for the
+        30 FPS output frames that reuse the most recent measurement. It avoids
+        a 10/15 Hz flashing mini-court and never falls back to legacy
+        upper/lower slots for a persistent identity display.
+        """
+        if not (
+            getattr(self, "show_court_trajectory", False)
+            and getattr(self, "output_video_style", "annotated") == "annotated"
+        ):
+            return frame
+        return self.court_trajectory_visualizer.draw_overlay(
+            frame,
+            spatial_tracks=(spatial_state or {}).get("tracks", []),
+        )
 
     def _emit_tracking_state(self, callback, frame_count, spatial_state):
         """Publish bounded roster candidates while the main job still runs."""
@@ -1008,9 +1068,9 @@ class BadmintonAnalysisSystem:
 
         if os.path.exists(os.path.join(self.save_dir, 'court_annotations.txt')):
             with open(os.path.join(self.save_dir, 'court_annotations.txt'), 'r') as f:
-                corners = eval(f.readline().split('=')[1])
+                corners = ast.literal_eval(f.readline().split('=', 1)[1])
                 f.readline()
-                mid_height = eval(f.readline().split('=')[1])
+                mid_height = ast.literal_eval(f.readline().split('=', 1)[1])
                 roi_corners = compute_expanded_roi(corners, template_color.shape)
         else:
             auto_preview_path = os.path.join(self.save_dir, 'auto_court_preview.png')
@@ -1048,12 +1108,39 @@ class BadmintonAnalysisSystem:
             self.detection_writer.close()
             self.detection_writer = None
         if self.shuttle_detector == 'none':
-            # Keep raw person evidence usable without fabricating an empty
-            # shot/rally artifact from a run that opted out of ball evidence.
+            # Keep raw person evidence usable without fabricating ball events.
+            # Unlike earlier versions, a person-only task now emits cautious
+            # movement-terminal candidates from the fixed-camera state machine.
+            movement_rallies_path = os.path.join(self.save_dir, "derived", "movement_rallies_v1.json")
+            os.makedirs(os.path.dirname(movement_rallies_path), exist_ok=True)
+            write_json(movement_rallies_path, {
+                "schema_version": "1.0",
+                "kind": "movement_only_rally_candidates",
+                "status": "review_required",
+                "rallies": spatial_summary.get("rallies") or [],
+                "policy": spatial_summary.get("rally_policy"),
+            })
+            from .analysis.movement_rally_evaluation import evaluate_movement_rally_windows
+            movement_window_sweep = evaluate_movement_rally_windows(
+                self.detections_path,
+                os.path.join(self.save_dir, "derived", "movement_rally_window_sweep_v1.json"),
+                fps=getattr(self, "fps", None),
+                match_mode=self.match_mode,
+            )
             self.offline_artifacts = {
-                "status": "not_requested",
+                "status": "movement_only",
                 "reason": "shuttle_detector=none",
-                "policy": "ball trajectories, hit candidates, and rally derivation were not requested",
+                "rallies_path": movement_rallies_path,
+                "rally_count": len(spatial_summary.get("rallies") or []),
+                "rally_window_sweep_path": movement_window_sweep.get("path"),
+                "specialized_visual_temporal_model": {
+                    "status": "not_requested",
+                    "reason": "shuttle_detector=none",
+                },
+                "policy": (
+                    "ball trajectories, hit candidates, shot count, and score evidence were not requested; "
+                    "rally boundaries use only all-player stability and require review"
+                ),
             }
             if os.path.isfile(self.metadata_path):
                 with open(self.metadata_path, "r", encoding="utf-8") as source:
@@ -1069,7 +1156,15 @@ class BadmintonAnalysisSystem:
                 from .analysis.huji_play_state import HUJI_PLAY_STATE_FILENAME, generate_huji_play_state
 
                 play_state_path = None
-                if self.huji_action_model:
+                play_state_status = {
+                    "status": "disabled" if not self.enable_huji_play_state else "not_configured",
+                    "reason": (
+                        "enable_huji_play_state=false"
+                        if not self.enable_huji_play_state
+                        else "GOOD_BADMINTON_HUJI_ACTION_MODEL is not configured"
+                    ),
+                }
+                if self.enable_huji_play_state and self.huji_action_model:
                     play_state_path = os.path.join(self.save_dir, "derived", HUJI_PLAY_STATE_FILENAME)
                     try:
                         if state_callback is not None:
@@ -1085,10 +1180,20 @@ class BadmintonAnalysisSystem:
                             f"{play_state_result['sample_count']} samples at "
                             f"{play_state_result['sample_hz']:.2f}Hz"
                         )
+                        play_state_status = {
+                            "status": "succeeded",
+                            "path": play_state_path,
+                            "sample_count": play_state_result.get("sample_count"),
+                            "sample_hz": play_state_result.get("sample_hz"),
+                        }
                     except Exception as play_state_error:
                         # The core detector output remains valid when an optional
                         # scene model is absent, invalid, or not yet deployed.
                         print(f"Huji-compatible play-state unavailable: {play_state_error}")
+                        play_state_status = {
+                            "status": "failed",
+                            "reason": str(play_state_error),
+                        }
                         play_state_path = None
 
                 self.offline_artifacts = generate_offline_artifacts(
@@ -1096,6 +1201,7 @@ class BadmintonAnalysisSystem:
                     fps=getattr(self, "fps", None),
                     play_state_path=play_state_path,
                 )
+                self.offline_artifacts["specialized_visual_temporal_model"] = play_state_status
                 # ``metadata.json`` is the WebUI's compact result manifest. Keep
                 # derived paths/counts here without changing raw detections.
                 if os.path.isfile(self.metadata_path):
@@ -1123,38 +1229,27 @@ class BadmintonAnalysisSystem:
                     "offline_shot_reconstruction", time.perf_counter() - reconstruction_t0
                 )
 
-        # Start the single bounded report request before the optional audio
-        # remux/export stage. Report generation depends on the finalized
-        # detections and spatial summary, but should not wait behind a costly
-        # browser-video encode at the end of a match.
-        try:
-            performance_report_t0 = time.perf_counter()
-            if state_callback is not None:
-                state_callback({"phase": "post_processing", "stage": "performance_report"})
-            from .analysis.performance_report import generate_performance_report
-
-            self.performance_report = generate_performance_report(
-                output_dir=self.save_dir,
-                metadata_path=self.metadata_path,
-                spatial_summary_path=self.spatial_match_summary_path,
-            )
-            if os.path.isfile(self.metadata_path):
-                with open(self.metadata_path, "r", encoding="utf-8") as source:
-                    metadata = json.load(source)
-                metadata.setdefault("derived", {})["performance_report"] = {
-                    "status": self.performance_report.get("status"),
-                    "report_path": self.performance_report.get("report_path"),
-                    "evidence_path": self.performance_report.get("evidence_path"),
-                }
-                write_json(self.metadata_path, metadata)
-            self._record_execution_metric("performance_report", time.perf_counter() - performance_report_t0)
-        except Exception as exc:
-            self.performance_report = {
-                "status": "failed",
-                "reason": f"Unable to generate performance report: {exc}",
+        # The GPU service owns anonymous measurements only. Movement metrics,
+        # user body profiles, energy estimates, and LLM wording are derived by
+        # ``business_gateway`` after these three public artifacts have been
+        # transferred. Keeping an explicit status avoids making their absence
+        # look like a failed model stage.
+        self.movement_metrics = {"status": "deferred_to_business_service"}
+        self.performance_report = {"status": "deferred_to_business_service"}
+        if os.path.isfile(self.metadata_path):
+            with open(self.metadata_path, "r", encoding="utf-8") as source:
+                metadata = json.load(source)
+            metadata["interpretation_handoff"] = {
+                "owner": "business_gateway",
+                "status": "ready",
+                "required_artifacts": [
+                    "detections.jsonl",
+                    "spatial_match_summary.json",
+                    "metadata.json",
+                ],
+                "gpu_generated_business_outputs": False,
             }
-            print(f"Performance report generation failed: {exc}")
-            self._record_execution_metric("performance_report", time.perf_counter() - performance_report_t0)
+            write_json(self.metadata_path, metadata)
 
         if self.generate_annotated_video:
             video_export_t0 = time.perf_counter()

@@ -72,7 +72,7 @@ class YOLOPoseProcessorTests(unittest.TestCase):
         self.assertEqual(detection["inference"]["roi"], [0, 0, 200, 100])
         self.assertAlmostEqual(detection["confidence"], 0.91)
 
-    def test_fixed_camera_offsets_roi_and_merges_duplicate(self):
+    def test_fixed_camera_offsets_roi_merges_duplicate_and_honors_selected_size(self):
         full_kp, full_scores = make_person((50, 10, 90, 48), ankle_y=46, score=0.70)
         roi_kp, roi_scores = make_person((49, 9, 91, 49), ankle_y=47, score=0.92)
         full_batch = make_batch([(full_kp, full_scores, (50, 10, 90, 48), 0.80)])
@@ -81,12 +81,14 @@ class YOLOPoseProcessorTests(unittest.TestCase):
         processor = YOLOPoseProcessor(model=model, device="cpu", merge_iou=0.45)
 
         detections = processor.process_fixed_camera(
-            np.zeros((100, 200, 3), dtype=np.uint8), far_roi=(0.0, 0.0, 1.0, 0.5)
+            np.zeros((100, 200, 3), dtype=np.uint8),
+            far_roi=(0.0, 0.0, 1.0, 0.5),
+            imgsz=960,
         )
 
         self.assertEqual(len(model.calls), 2)
-        self.assertEqual(model.calls[0]["imgsz"], 640)
-        self.assertEqual(model.calls[1]["imgsz"], 640)
+        self.assertEqual(model.calls[0]["imgsz"], 960)
+        self.assertEqual(model.calls[1]["imgsz"], 960)
         self.assertEqual(model.calls[1]["shape"], (50, 200, 3))
         self.assertEqual(len(detections), 1)
         self.assertEqual(detections[0]["source"], "far_roi")

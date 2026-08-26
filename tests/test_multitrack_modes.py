@@ -91,6 +91,28 @@ class MultiTrackModeTests(unittest.TestCase):
         self.assertEqual(missing["status"], "missing")
         self.assertEqual(missing["confidence"], 0.0)
 
+    def test_track_current_speed_uses_fresh_track_evidence_and_filters_standing_jitter(self):
+        tracker = CourtMultiObjectTracker(CourtSpace(self.CORNERS), fps=10, max_missed_frames=2)
+        tracker.update(1, [self._observation((2.0, 2.0), "pose_a")])
+
+        # Two one-centimetre foot-point changes are below the display dead
+        # zone. A standing player must display 0 rather than a false walk.
+        second = tracker.update(2, [self._observation((2.01, 2.0), "pose_a")])[0]
+        third = tracker.update(3, [self._observation((2.02, 2.0), "pose_a")])[0]
+        self.assertEqual(second["motion"]["status"], "stationary")
+        self.assertEqual(second["motion"]["current_speed_mps"], 0.0)
+        self.assertEqual(third["motion"]["current_speed_mps"], 0.0)
+
+        moving = tracker.update(4, [self._observation((2.22, 2.0), "pose_a")])[0]
+        self.assertEqual(moving["status"], "detected")
+        self.assertEqual(moving["motion"]["status"], "moving")
+        self.assertGreater(moving["motion"]["current_speed_mps"], 0.35)
+
+        predicted = tracker.update(5, [])[0]
+        self.assertEqual(predicted["status"], "predicted")
+        self.assertIsNone(predicted["motion"]["current_speed_mps"])
+        self.assertEqual(predicted["motion"]["status"], "not_currently_measured")
+
     def test_locked_singles_roster_waits_for_two_people_then_rejects_new_tracks(self):
         pipeline = FixedCameraMatchPipeline(
             self.CORNERS,
@@ -219,21 +241,104 @@ class MultiTrackModeTests(unittest.TestCase):
         )
         self.assertEqual(incomplete["match_roster"]["stable_observation_frames"], 0)
 
-    def test_rally_gap_threshold_uses_source_time_when_measurements_are_sampled(self):
-        rallies = RallyStateMachine(fps=30, min_active_frames=4, end_gap_frames=36)
-        tracks = [{"status": "detected"}, {"status": "detected"}]
-        shuttle = {"status": "approximate"}
+    def test_missing_shuttle_falls_back_to_person_stillness_not_a_gap_timer(self):
+        rallies = RallyStateMachine(
+            fps=10,
+            min_active_frames=4,
+            shuttle_enabled=True,
+            expected_player_count=2,
+            settle_window_seconds=0.5,
+        )
 
-        # 10 Hz measurements on a 30 fps source are three source frames apart.
-        rallies.update(1, tracks, shuttle, [])
-        active = rallies.update(4, tracks, shuttle, [])
-        self.assertEqual(active["state"], "active")
+        def tracks(left, right):
+            return [
+                {"track_id": "track_001", "status": "detected", "court_xy_m": left},
+                {"track_id": "track_002", "status": "detected", "court_xy_m": right},
+            ]
 
-        # One 36-source-frame absence is a 1.2 second real gap, not 36
-        # sparse samples (which would incorrectly become 3.6 seconds).
-        ended = rallies.update(40, tracks, {"status": "missing"}, [])
-        self.assertEqual(ended["state"], "idle")
-        self.assertEqual(rallies.completed[-1]["end_reason"], "shuttle_evidence_gap")
+        shuttle = {"status": "approximate", "xyz_m": [3.0, 6.7, 1.0]}
+
+        # A detected shuttle plus two players opens a candidate rally, which
+        # turns active after the minimum active-frame count.
+        rallies.update(1, tracks((1.0, 2.0), (5.0, 11.0)), shuttle, [])
+        self.assertEqual(rallies.update(4, tracks((1.4, 2.0), (5.0, 11.0)), shuttle, [])["state"], "active")
+
+        # A missing-ball gap must not itself end the rally.  Only the two
+        # players settling (fresh detection, low speed) closes it.
+        self.assertEqual(
+            rallies.update(5, tracks((1.4, 2.0), (5.0, 11.0)), {"status": "missing"}, [])["state"],
+            "active",
+        )
+        self.assertEqual(len(rallies.completed), 0)
+
+        # Establish stability, then hold it for the 0.5 s window.
+        rallies.update(6, tracks((1.4, 2.0), (5.0, 11.0)), {"status": "missing"}, [])
+        for frame in range(7, 11):
+            rallies.update(frame, tracks((1.4, 2.0), (5.0, 11.0)), {"status": "missing"}, [])
+
+        self.assertEqual(len(rallies.completed), 1)
+        self.assertEqual(rallies.completed[-1]["end_reason"], "all_players_stable_for_0.5s")
+
+    def test_detected_shuttle_landing_ends_rally(self):
+        rallies = RallyStateMachine(
+            fps=10,
+            min_active_frames=4,
+            shuttle_enabled=True,
+            expected_player_count=2,
+        )
+
+        def tracks():
+            return [
+                {"track_id": "track_001", "status": "detected", "court_xy_m": [1.0, 2.0]},
+                {"track_id": "track_002", "status": "detected", "court_xy_m": [5.0, 11.0]},
+            ]
+
+        def shuttle_at(x, y):
+            return {"status": "approximate", "xyz_m": [x, y, 1.0]}
+
+        # A shuttle that travels, then stops, is a landing.
+        for frame, x in [(1, 1.0), (2, 3.0), (3, 5.0), (4, 6.0), (5, 6.3), (6, 6.5), (7, 6.5)]:
+            rallies.update(frame, tracks(), shuttle_at(x, 6.7), [])
+        for frame in range(8, 14):
+            rallies.update(frame, tracks(), shuttle_at(6.5, 6.7), [])
+
+        self.assertEqual(len(rallies.completed), 1)
+        self.assertEqual(rallies.completed[-1]["end_reason"], "shuttle_landed")
+
+    def test_person_only_rally_requires_all_players_stable_for_selected_window(self):
+        rallies = RallyStateMachine(
+            fps=10,
+            min_active_frames=1,
+            shuttle_enabled=False,
+            expected_player_count=2,
+            settle_window_seconds=0.5,
+        )
+
+        def tracks(left, right):
+            return [
+                {"track_id": "track_001", "status": "detected", "court_xy_m": left},
+                {"track_id": "track_002", "status": "detected", "court_xy_m": right},
+            ]
+
+        # The first observation cannot establish stability. The second is
+        # measured motion, so it opens a person-only candidate rally.
+        rallies.update(1, tracks((1.0, 2.0), (5.0, 11.0)), None, [])
+        self.assertEqual(rallies.update(2, tracks((1.1, 2.0), (5.0, 11.0)), None, [])["state"], "active")
+
+        # Five 10 Hz stable observations satisfy the explicit 0.5 second
+        # window. The end is the beginning of that stable window (frame 3).
+        for frame in range(3, 8):
+            snapshot = rallies.update(frame, tracks((1.1, 2.0), (5.0, 11.0)), None, [])
+        self.assertEqual(snapshot["state"], "awaiting_serve")
+        self.assertEqual(len(rallies.completed), 1)
+        self.assertEqual(rallies.completed[0]["end_frame"], 3)
+        self.assertEqual(rallies.completed[0]["end_reason"], "all_players_stable_for_0.5s")
+        self.assertEqual(rallies.completed[0]["evidence_mode"], "player_stability_only")
+
+        # Missing detector data must not become a terminal or a new rally.
+        after_gap = rallies.update(8, tracks((1.1, 2.0), (5.0, 11.0))[:1], None, [])
+        self.assertEqual(after_gap["state"], "awaiting_serve")
+        self.assertEqual(len(rallies.completed), 1)
 
     def test_locked_roster_reassociates_brief_gap_without_creating_a_new_id(self):
         pipeline = FixedCameraMatchPipeline(

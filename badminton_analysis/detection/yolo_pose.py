@@ -267,20 +267,26 @@ class YOLOPoseProcessor:
         self._last_detections = detections
         return detections
 
-    def process_fixed_camera(self, frame, far_roi=None):
-        """Run full-frame 640 plus an enlarged far-half ROI at 640 and merge people."""
+    def process_fixed_camera(self, frame, far_roi=None, *, imgsz=None):
+        """Run full-frame plus far-half ROI at one explicit input size.
+
+        ``imgsz`` intentionally applies to *both* passes.  A caller that asks
+        for 960 or 1280 must not silently fall back to 640 merely because the
+        fixed-camera far-ROI enhancement is enabled.
+        """
         height, width = int(frame.shape[0]), int(frame.shape[1])
+        selected_imgsz = self.imgsz if imgsz is None else self._validate_imgsz(imgsz)
         resolved_roi = self._resolve_roi(frame.shape, self.far_roi if far_roi is None else far_roi)
         full_detections = self._infer(
             frame,
-            imgsz=640,
+            imgsz=selected_imgsz,
             source="full_frame",
             roi=(0, 0, width, height),
         )
         x1, y1, x2, y2 = resolved_roi
         far_detections = self._infer(
             frame[y1:y2, x1:x2],
-            imgsz=640,
+            imgsz=selected_imgsz,
             source="far_roi",
             roi=resolved_roi,
         )
@@ -292,7 +298,7 @@ class YOLOPoseProcessor:
         """Process one frame while preserving the original tuple return value."""
         use_asymmetric = self.asymmetric if asymmetric is None else bool(asymmetric)
         if use_asymmetric:
-            detections = self.process_fixed_camera(frame, far_roi=far_roi)
+            detections = self.process_fixed_camera(frame, far_roi=far_roi, imgsz=imgsz)
         else:
             detections = self.process_frame_detailed(frame, imgsz=imgsz)
         if not detections:

@@ -155,6 +155,23 @@ class GpuApiTests(unittest.TestCase):
         stored = self.app.state.job_manager.get_job(response.json()["job_id"])
         self.assertEqual(stored["options"]["shuttle_detector"], "none")
 
+    def test_person_only_job_accepts_one_of_the_approved_stability_windows(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-settle-window"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"shuttle_detector":"none","movement_rally_settle_seconds":0.5}',
+            },
+        )
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["options"]["movement_rally_settle_seconds"], 0.5)
+
     def test_operator_can_cancel_a_queued_job_without_deleting_its_record(self):
         response = self.client.post(
             "/api/v1/jobs",

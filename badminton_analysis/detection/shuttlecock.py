@@ -281,8 +281,12 @@ class ShuttlecockTracker:
         if roi_corners is None:
             return True
 
-        x1, y1 = roi_corners[0]
-        x2, y2 = roi_corners[1]
+        # A calibrated court contains four perspective corners. The first two
+        # are commonly the same baseline, so treating them as opposite corners
+        # collapses the ROI to a thin strip and rejects almost every shuttle.
+        corners = np.asarray(roi_corners, dtype=float).reshape((-1, 2))
+        x1, y1 = corners.min(axis=0)
+        x2, y2 = corners.max(axis=0)
         padding = int(max(x2 - x1, y2 - y1) * self.roi_padding_ratio)
         return (x1 - padding) <= point[0] <= (x2 + padding) and (y1 - padding) <= point[1] <= (y2 + padding)
 

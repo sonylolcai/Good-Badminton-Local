@@ -8,9 +8,21 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from .jobs import AnalysisJobManager
+from .stream_errors import StreamSessionError, validation_error
+from .stream_models import MAX_SEGMENT_BYTES, validate_create_request
+from .stream_runtime import StreamProcessorFactory
+from .stream_sessions import (
+    StreamSessionManager,
+    cancel_session_handler,
+    complete_session_handler,
+    create_session_handler,
+    get_session_status_handler,
+    read_events_handler,
+    submit_segment_handler,
+)
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
@@ -19,11 +31,29 @@ JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024
 
 
-def create_app(data_dir=None, start_worker=True):
+def create_app(
+    data_dir=None,
+    start_worker=True,
+    *,
+    stream_processor_factory=None,
+    stream_manager=None,
+):
     data_path = Path(data_dir or os.environ.get("GOOD_BADMINTON_API_DATA_DIR", "api_data")).resolve()
     manager = AnalysisJobManager(data_path, start_worker=start_worker)
+    if stream_manager is None:
+        stream_processor_factory = stream_processor_factory or StreamProcessorFactory(data_path)
+        stream_manager = StreamSessionManager(
+            data_path,
+            processor_factory=stream_processor_factory,
+            start_worker=start_worker,
+        )
     app = FastAPI(title="Good-Badminton GPU API", version="1.0.0")
     app.state.job_manager = manager
+    app.state.stream_manager = stream_manager
+
+    @app.exception_handler(StreamSessionError)
+    async def handle_stream_session_error(_request, exc):
+        return JSONResponse(status_code=exc.status_code, content=exc.to_error_response())
 
     def require_api_key(x_api_key: Optional[str] = Header(default=None)):
         expected = os.environ.get("GOOD_BADMINTON_API_KEY")
@@ -38,8 +68,129 @@ def create_app(data_dir=None, start_worker=True):
             "status": "ok",
             "service": "good-badminton-gpu-api",
             "worker_running": manager.worker_running,
+            "stream_worker_running": stream_manager.worker_running,
             "api_auth_configured": bool(os.environ.get("GOOD_BADMINTON_API_KEY")),
         }
+
+    @app.post(
+        "/api/v1/stream-sessions",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_api_key)],
+    )
+    async def create_stream_session(
+        body: dict,
+        x_idempotency_key: Optional[str] = Header(default=None),
+    ):
+        # Validate once before touching the model runtime so unknown business
+        # fields can never be silently dropped at the GPU boundary.
+        try:
+            normalized = validate_create_request(body)
+        except ValueError as exc:
+            raise validation_error(str(exc))
+        validator = getattr(stream_manager.processor_factory, "validate_session_request", None)
+        if callable(validator):
+            try:
+                validator(normalized)
+            except (FileNotFoundError, ValueError, RuntimeError) as exc:
+                raise validation_error(str(exc))
+        response_status, payload = create_session_handler(
+            stream_manager,
+            body,
+            x_idempotency_key,
+        )
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.post(
+        "/api/v1/stream-sessions/{session_id}/segments/{segment_index}",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def submit_stream_segment(
+        session_id: str,
+        segment_index: int,
+        segment: UploadFile = File(...),
+        metadata: str = Form(...),
+    ):
+        try:
+            metadata_body = json.loads(metadata)
+        except json.JSONDecodeError as exc:
+            raise validation_error(
+                "metadata must be a JSON object",
+                analysis_session_id=session_id,
+            ) from exc
+        # UploadFile is spooled by Starlette; cap the one segment read so the
+        # service never accepts an unbounded request into the engine queue.
+        data_bytes = await segment.read(MAX_SEGMENT_BYTES + 1)
+        response_status, payload = submit_segment_handler(
+            stream_manager,
+            session_id,
+            segment_index,
+            metadata_body,
+            data_bytes,
+        )
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.get(
+        "/api/v1/stream-sessions/{session_id}",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def get_stream_session(session_id: str):
+        response_status, payload = get_session_status_handler(stream_manager, session_id)
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.get(
+        "/api/v1/stream-sessions/{session_id}/events",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def get_stream_events(
+        session_id: str,
+        cursor: Optional[str] = None,
+        limit: int = 100,
+    ):
+        response_status, payload = read_events_handler(
+            stream_manager,
+            session_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.get(
+        "/api/v1/stream-sessions/{session_id}/trace",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def get_stream_trace(session_id: str):
+        # Reuse the status lookup for the same structured not-found behavior.
+        get_session_status_handler(stream_manager, session_id)
+        path = stream_manager.trace_path(session_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Stream trace is not available")
+        return FileResponse(path, media_type="application/json", filename=path.name)
+
+    @app.get(
+        "/api/v1/stream-sessions/{session_id}/candidate-photos/{track_id}",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def get_stream_candidate_photo(session_id: str, track_id: str):
+        path = stream_manager.candidate_photo_path(session_id, track_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="candidate photo is not available")
+        return FileResponse(path, media_type="image/jpeg", filename=f"{track_id}.jpg")
+
+    @app.post(
+        "/api/v1/stream-sessions/{session_id}/complete",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def complete_stream_session(session_id: str, body: dict):
+        response_status, payload = complete_session_handler(stream_manager, session_id, body)
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.delete(
+        "/api/v1/stream-sessions/{session_id}",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def cancel_stream_session(session_id: str):
+        response_status, payload = cancel_session_handler(stream_manager, session_id)
+        return JSONResponse(status_code=response_status, content=payload)
 
     @app.post("/api/v1/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_api_key)])
     async def create_job(
@@ -251,6 +402,12 @@ def _parse_options(value):
         # slower accuracy experiment and must never start from an omitted API
         # option.
         "shuttle_detector": "yolo",
+        # When the caller opts out of ball detection, a cautious all-player
+        # stability window can still provide review-only rally boundaries.
+        "movement_rally_settle_seconds": 0.7,
+        # A scene/action model is post-processing only.  It can run only with
+        # a ball detector and a separately configured, reviewed checkpoint.
+        "enable_huji_play_state": True,
         # Opaque business-session reference only. Participant check IDs remain
         # on the business service and never become visual identity evidence.
         "match_session_ref": None,
@@ -275,7 +432,7 @@ def _parse_options(value):
         raise HTTPException(status_code=422, detail="pose_conf must be in (0, 1]")
     if options["output_video_style"] not in {"annotated", "skeleton"}:
         raise HTTPException(status_code=422, detail="output_video_style must be annotated or skeleton")
-    for key in ("generate_annotated_video", "browser_video_reencode"):
+    for key in ("generate_annotated_video", "browser_video_reencode", "enable_huji_play_state"):
         if not isinstance(options[key], bool):
             raise HTTPException(status_code=422, detail=f"{key} must be a JSON boolean")
     if not options["generate_annotated_video"]:
@@ -295,6 +452,11 @@ def _parse_options(value):
         )
     if options["shuttle_detector"] not in {"none", "yolo", "tracknet_v3"}:
         raise HTTPException(status_code=422, detail="shuttle_detector must be none, yolo, or tracknet_v3")
+    if float(options["movement_rally_settle_seconds"]) not in {0.5, 0.7, 1.0}:
+        raise HTTPException(
+            status_code=422,
+            detail="movement_rally_settle_seconds must be 0.5, 0.7, or 1.0",
+        )
     if int(options["roster_stable_frames"]) < 1 or int(options["roster_stable_frames"]) > 10:
         raise HTTPException(status_code=422, detail="roster_stable_frames must be between 1 and 10")
     if options["match_session_ref"] is not None and not re.fullmatch(
@@ -306,6 +468,8 @@ def _parse_options(value):
     options["roster_stable_frames"] = int(options["roster_stable_frames"])
     options["analysis_sample_hz"] = float(options["analysis_sample_hz"])
     options["pose_sample_hz"] = options["analysis_sample_hz"]
+    options["movement_rally_settle_seconds"] = float(options["movement_rally_settle_seconds"])
+    options["enable_huji_play_state"] = bool(options["enable_huji_play_state"])
     options["match_session_ref"] = (
         str(options["match_session_ref"]) if options["match_session_ref"] is not None else None
     )

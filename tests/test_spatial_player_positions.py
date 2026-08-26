@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from badminton_analysis.visualization.spatial_player_positions import (
+from business_gateway.metrics.detections_reader import (
     collect_track_position_evidence,
 )
 

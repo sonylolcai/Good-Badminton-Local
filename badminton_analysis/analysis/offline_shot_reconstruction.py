@@ -42,8 +42,9 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
     play_state_rows = load_huji_play_state(configured_play_state_path)
     fps = float(fps or infer_fps(rows) or 30.0)
     width, height = video_dimensions(detections_path.parent)
-    track_rows = reconstruct_shuttle_track(rows, fps=fps, width=width, height=height)
-    events = build_shot_events(rows, track_rows, fps=fps)
+    px_scale = _pixel_scale(width, height)
+    track_rows = reconstruct_shuttle_track(rows, fps=fps, width=width, height=height, px_scale=px_scale)
+    events = build_shot_events(rows, track_rows, fps=fps, px_scale=px_scale)
     events = infer_missing_shuttle_events(rows, events)
     events = refresh_event_evidence(events, track_rows)
     court_polygon = _court_polygon_from_metadata(detections_path.parent)
@@ -51,6 +52,7 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
         track_rows,
         raw_rows=rows,
         court_polygon=court_polygon,
+        px_scale=px_scale,
     )
     terminal_candidates = apply_huji_play_state_context(terminal_candidates, play_state_rows)
     # A static visual false-positive is especially harmful here: it turns one
@@ -61,6 +63,9 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
         events,
         court_polygon=court_polygon,
         terminal_candidates=terminal_candidates,
+        rows=rows,
+        fps=fps,
+        px_scale=px_scale,
     )
     track_path = output_dir / SHUTTLE_TRACK_FILENAME
     event_path = output_dir / SHOT_EVENT_FILENAME
@@ -99,8 +104,11 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
     }
 
 
-def reconstruct_shuttle_track(rows, fps=30.0, width=None, height=None, max_gap_sec=0.35, max_speed_px_s=3200.0):
+def reconstruct_shuttle_track(rows, fps=30.0, width=None, height=None, max_gap_sec=0.35, max_speed_px_s=3200.0, px_scale=None):
     """Build one per-analysis-frame shuttle sequence with honest gap labels."""
+    if px_scale is None:
+        px_scale = _pixel_scale(width, height)
+    max_speed_px_s = float(max_speed_px_s) * px_scale
     candidates = [_raw_shuttle_candidate(row) for row in rows]
     rejected_indices = edge_static_artifacts(candidates, width=width, height=height)
     track_rows = []
@@ -198,7 +206,7 @@ def reconstruct_shuttle_track(rows, fps=30.0, width=None, height=None, max_gap_s
     return track_rows
 
 
-def build_shot_events(raw_rows, track_rows, fps=30.0):
+def build_shot_events(raw_rows, track_rows, fps=30.0, px_scale=1.0):
     """Create conservative hit/receiver/shot-type candidates from future context."""
     by_frame = {int(item["frame"]): item for item in track_rows}
     seeds = []
@@ -216,15 +224,15 @@ def build_shot_events(raw_rows, track_rows, fps=30.0):
                     "reason": event.get("reason"),
                 }
             )
-    seeds.extend(_trajectory_turn_seeds(track_rows))
-    seeds.extend(_trajectory_heading_change_near_hand_seeds(raw_rows, track_rows))
-    seeds.extend(_reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows))
+    seeds.extend(_trajectory_turn_seeds(track_rows, px_scale=px_scale))
+    seeds.extend(_trajectory_heading_change_near_hand_seeds(raw_rows, track_rows, px_scale=px_scale))
+    seeds.extend(_reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, px_scale=px_scale))
     seeds = _deduplicate_seeds(seeds)
     events = []
     for index, seed in enumerate(seeds, start=1):
         raw = _row_at_frame(raw_rows, seed["frame"])
         track = by_frame.get(seed["frame"])
-        hitter = _hitter_evidence(raw, track, seed.get("hitter_track_id"))
+        hitter = _hitter_evidence(raw, track, seed.get("hitter_track_id"), px_scale=px_scale)
         event_origin = seed.get("event_origin", "machine_candidate")
         events.append(
             {
@@ -342,22 +350,27 @@ def build_rallies(
     court_polygon=None,
     terminal_candidates=None,
     min_terminal_confidence=0.65,
+    rows=None,
+    fps=None,
+    px_scale=1.0,
 ):
     """Segment a reviewable rally sequence and annotate every shot candidate.
 
-    A long run of slow, continuous shuttle observations is the preferred
-    boundary.  Missing shuttle evidence is not a boundary: it remains unknown
-    until a later terminal observation or a human review is available.
+    A detected shuttle that lands (a short run of slow, continuous observations)
+    is the preferred boundary.  A missing-ball gap is not a boundary by itself;
+    it falls back to person stillness only when the shuttle is unobserved and a
+    rest window between the two shots closes the open rally.
     """
     ordered = sorted(events, key=lambda item: float(item["hit_time_sec"]))
     if not ordered:
         return []
     stationary_windows = _stationary_windows(
         track_rows,
-        speed_limit_px_s=stationary_speed_px_s,
+        speed_limit_px_s=float(stationary_speed_px_s) * px_scale,
         min_duration_sec=stationary_min_duration_sec,
         court_polygon=court_polygon,
     )
+    stillness_windows = _person_stillness_windows(rows, fps)
     accepted_terminals = [
         item for item in terminal_candidates or []
         if float(item.get("confidence") or 0.0) >= float(min_terminal_confidence)
@@ -374,6 +387,7 @@ def build_rallies(
             next_time=float(event["hit_time_sec"]),
             max_unobserved_sec=max_unobserved_between_rallies_sec,
             terminal_candidates=accepted_terminals,
+            stillness_windows=stillness_windows,
         )
         if boundary:
             groups.append(current)
@@ -391,6 +405,8 @@ def build_rallies(
             stationary_windows,
             last_event_time=float(group[-1]["hit_time_sec"]),
             terminal_candidates=accepted_terminals,
+            stillness_windows=stillness_windows,
+            track_rows=track_rows,
         )
         end_time = terminal_boundary["end_time_sec"] if terminal_boundary else video_end
         end_reason = terminal_boundary["reason"] if terminal_boundary else "video_end_without_confirmed_terminal_event"
@@ -498,7 +514,7 @@ def build_rallies_from_manual_terminals(events, terminals, video_start_sec=0.0, 
     return reviewed
 
 
-def detect_rally_terminal_candidates(track_rows, raw_rows=None, court_polygon=None):
+def detect_rally_terminal_candidates(track_rows, raw_rows=None, court_polygon=None, px_scale=1.0):
     """Find explainable terminal *candidates* from fixed-camera shuttle evidence.
 
     A badminton shuttle often disappears at landing or after an out call before
@@ -528,10 +544,13 @@ def detect_rally_terminal_candidates(track_rows, raw_rows=None, court_polygon=No
         current_time = float(current["time_sec"])
         gap_sec = current_time - previous_time
         before_gap_sec = previous_time - float(before["time_sec"])
-        if ground_edge is not None and _distance_to_segment(previous["image_xy"], *ground_edge) <= 85.0:
+        ground_edge_margin = 85.0 * px_scale
+        slow_transition = 1600.0 * px_scale
+        fast_transition = 3200.0 * px_scale
+        if ground_edge is not None and _distance_to_segment(previous["image_xy"], *ground_edge) <= ground_edge_margin:
             strict_current_inside = _point_in_or_near_polygon(current["image_xy"], court_polygon, margin=0.0)
             transition_speed = _distance(previous["image_xy"], current["image_xy"]) / gap_sec
-            if not strict_current_inside and gap_sec <= 0.12 and transition_speed <= 1600.0:
+            if not strict_current_inside and gap_sec <= 0.12 and transition_speed <= slow_transition:
                 candidates.append(
                     _terminal_candidate(
                         previous_time,
@@ -541,7 +560,7 @@ def detect_rally_terminal_candidates(track_rows, raw_rows=None, court_polygon=No
                         transition_speed_px_s=transition_speed,
                     )
                 )
-            elif not strict_current_inside and gap_sec <= 0.50 and transition_speed > 3200.0:
+            elif not strict_current_inside and gap_sec <= 0.50 and transition_speed > fast_transition:
                 candidates.append(
                     _terminal_candidate(
                         previous_time,
@@ -562,12 +581,15 @@ def detect_rally_terminal_candidates(track_rows, raw_rows=None, court_polygon=No
         inside_current = _point_in_or_near_polygon(current["image_xy"], court_polygon)
         hand_distance = _nearest_hand_distance(raw_rows, previous_time, previous["image_xy"])
 
+        inbound_min = 100.0 * px_scale
+        inbound_max = 1500.0 * px_scale
+        hand_gate = 30.0 * px_scale
         if (
             inside_previous
             and inside_current
-            and 100.0 <= inbound_speed <= 1500.0
+            and inbound_min <= inbound_speed <= inbound_max
             and direction_cosine <= -0.50
-            and not (hand_distance is not None and hand_distance <= 30.0)
+            and not (hand_distance is not None and hand_distance <= hand_gate)
         ):
             confidence = 0.48
             if gap_sec >= 0.40:
@@ -590,7 +612,7 @@ def detect_rally_terminal_candidates(track_rows, raw_rows=None, court_polygon=No
 
     for window in _stationary_windows(
         track_rows,
-        speed_limit_px_s=60.0,
+        speed_limit_px_s=60.0 * px_scale,
         min_duration_sec=0.14,
         max_point_gap_sec=0.12,
         court_polygon=court_polygon,
@@ -857,7 +879,7 @@ def _assign_trajectory_ids(track_rows):
             active = False
 
 
-def _trajectory_turn_seeds(track_rows):
+def _trajectory_turn_seeds(track_rows, px_scale=1.0):
     observed = [item for item in track_rows if item["status"] in {"detected", "reconstructed"}]
     seeds = []
     for before, current, after in zip(observed, observed[1:], observed[2:]):
@@ -871,7 +893,7 @@ def _trajectory_turn_seeds(track_rows):
         outgoing = _velocity(current["image_xy"], after["image_xy"], dt_after)
         speed = min(math.hypot(*incoming), math.hypot(*outgoing))
         cosine = _cosine(incoming, outgoing)
-        if speed < 120.0 or cosine > -0.50:
+        if speed < 120.0 * px_scale or cosine > -0.50:
             continue
         confidence = min(0.42, 0.08 + 0.34 * min(current["confidence"], 1.0))
         seeds.append(
@@ -887,7 +909,7 @@ def _trajectory_turn_seeds(track_rows):
     return seeds
 
 
-def _trajectory_heading_change_near_hand_seeds(raw_rows, track_rows):
+def _trajectory_heading_change_near_hand_seeds(raw_rows, track_rows, px_scale=1.0):
     """Find a contact-shaped 2D turn only when a detected hand supports it.
 
     A return seen by a fixed camera often changes from a fast vertical descent
@@ -917,12 +939,13 @@ def _trajectory_heading_change_near_hand_seeds(raw_rows, track_rows):
         # ``cosine <= 0.45`` is an approximately 63-degree turn.  The speed
         # and hand gates below make this stricter than a generic trajectory
         # curvature test while retaining down-to-side returns.
-        if min(incoming_speed, outgoing_speed) < 400.0 or cosine > 0.45:
+        hand_radius_px = 140.0 * px_scale
+        if min(incoming_speed, outgoing_speed) < 400.0 * px_scale or cosine > 0.45:
             continue
-        hitter = _hitter_evidence(raw_by_frame.get(int(current["frame"])), current, None)
-        if hitter.get("source") != "visible_hand_proximity" or float(hitter.get("distance_px") or math.inf) > 140.0:
+        hitter = _hitter_evidence(raw_by_frame.get(int(current["frame"])), current, None, px_scale=px_scale)
+        if hitter.get("source") != "visible_hand_proximity" or float(hitter.get("distance_px") or math.inf) > hand_radius_px:
             continue
-        hand_support = max(0.0, 1.0 - float(hitter["distance_px"]) / 140.0)
+        hand_support = max(0.0, 1.0 - float(hitter["distance_px"]) / hand_radius_px)
         turn_strength = max(0.0, min(1.0, (0.45 - cosine) / 1.45))
         confidence = min(0.42, 0.16 + 0.14 * hand_support + 0.12 * turn_strength)
         seeds.append(
@@ -942,7 +965,7 @@ def _trajectory_heading_change_near_hand_seeds(raw_rows, track_rows):
     return seeds
 
 
-def _reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, max_hand_distance_px=100.0):
+def _reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, max_hand_distance_px=100.0, px_scale=1.0):
     """Turn a short TrackNet gap near a hand into an explicitly inferred cue.
 
     The shuttle coordinate within a reconstructed gap is not a detector
@@ -951,6 +974,7 @@ def _reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, max_hand_dista
     per interpolation gap; it is marked ``motion_constraint_candidate`` so it
     cannot contribute a fabricated observed speed or a confirmed shot count.
     """
+    max_hand_distance_px = float(max_hand_distance_px) * px_scale
     raw_by_frame = {int(item.get("frame", 0)): item for item in raw_rows}
     grouped = {}
     for current in track_rows:
@@ -959,9 +983,9 @@ def _reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, max_hand_dista
         provenance = current.get("provenance") or {}
         if provenance.get("kind") != "bidirectional_linear_interpolation" or int(provenance.get("gap_frames") or 0) < 2:
             continue
-        hitter = _hitter_evidence(raw_by_frame.get(int(current["frame"])), current, None)
+        hitter = _hitter_evidence(raw_by_frame.get(int(current["frame"])), current, None, px_scale=px_scale)
         distance = float(hitter.get("distance_px") or math.inf)
-        if hitter.get("source") != "visible_hand_proximity" or distance > float(max_hand_distance_px):
+        if hitter.get("source") != "visible_hand_proximity" or distance > max_hand_distance_px:
             continue
         key = (
             provenance.get("before_frame"),
@@ -975,7 +999,7 @@ def _reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, max_hand_dista
     seeds = []
     for item in grouped.values():
         current = item["track"]
-        support = max(0.0, 1.0 - item["distance"] / float(max_hand_distance_px))
+        support = max(0.0, 1.0 - item["distance"] / max_hand_distance_px)
         seeds.append(
             {
                 "frame": int(current["frame"]),
@@ -1024,7 +1048,7 @@ def _deduplicate_seeds(seeds, min_gap_sec=0.35):
     return grouped
 
 
-def _hitter_evidence(raw, track_row, preferred_track_id):
+def _hitter_evidence(raw, track_row, preferred_track_id, px_scale=1.0):
     tracks = ((raw or {}).get("spatial") or {}).get("tracks") or []
     if preferred_track_id:
         matching = next((item for item in tracks if item.get("track_id") == preferred_track_id), None)
@@ -1050,11 +1074,12 @@ def _hitter_evidence(raw, track_row, preferred_track_id):
                 distance = _distance(shuttle_point, hand)
                 if distance < best[2]:
                     best = (track, hand, distance)
-    if best[0] is None or best[2] > 150.0:
+    hand_radius_px = 150.0 * px_scale
+    if best[0] is None or best[2] > hand_radius_px:
         return {"track_id": None, "confidence": 0.0, "source": "no_near_visible_hand"}
     return {
         "track_id": best[0].get("track_id"),
-        "confidence": round(max(0.0, min(0.42, (1.0 - best[2] / 150.0) * float(best[0].get("confidence") or 0.0))), 4),
+        "confidence": round(max(0.0, min(0.42, (1.0 - best[2] / hand_radius_px) * float(best[0].get("confidence") or 0.0))), 4),
         "source": "visible_hand_proximity",
         "distance_px": round(best[2], 2),
         "measurement_status": "detected",
@@ -1230,6 +1255,82 @@ def _stationary_windows(
     return windows
 
 
+def _person_stillness_windows(rows, fps, settle_window_seconds=0.7, stable_speed_mps=0.35):
+    """Return rest windows where every expected player is freshly detected and slow.
+
+    This is the fallback boundary used only when the shuttle is unobserved.  A
+    window is invalidated by a roster-count mismatch, a changed track set, a
+    malformed coordinate, or any measured player exceeding ``stable_speed_mps``.
+    """
+    rows = rows or []
+    if not rows:
+        return []
+    mode = _match_mode(rows)
+    expected = 2 if mode == "singles" else 4
+    if mode is None:
+        return []
+    fps = max(1.0, float(fps or infer_fps(rows) or 30.0))
+    windows = []
+    previous = {}
+    run_start = None
+    last_stable = None
+    for row in rows:
+        frame = row.get("frame")
+        if not isinstance(frame, int):
+            continue
+        time_sec = float(row.get("time_sec", 0.0))
+        tracks = ((row.get("spatial") or {}).get("tracks")) or []
+        detected = [track for track in tracks if track.get("status") == "detected"]
+        current = {}
+        valid = len(detected) == expected
+        if valid:
+            for track in detected:
+                track_id = str(track.get("track_id") or "")
+                point = track.get("court_xy_m")
+                if not track_id or not isinstance(point, (list, tuple)) or len(point) < 2:
+                    valid = False
+                    break
+                try:
+                    current[track_id] = (float(point[0]), float(point[1]))
+                except (TypeError, ValueError):
+                    valid = False
+                    break
+        stable = False
+        if valid and set(current) == set(previous):
+            stable = True
+            for track_id, (px, py) in current.items():
+                prev_frame, ox, oy = previous[track_id]
+                delta = int(frame) - int(prev_frame)
+                if delta <= 0:
+                    stable = False
+                    break
+                if math.hypot(px - ox, py - oy) / (delta / fps) > stable_speed_mps:
+                    stable = False
+                    break
+        if stable:
+            if run_start is None:
+                run_start = time_sec
+            last_stable = time_sec
+        else:
+            if run_start is not None and last_stable is not None and (last_stable - run_start) >= settle_window_seconds:
+                windows.append({"start_time_sec": round(run_start, 6), "end_time_sec": round(last_stable, 6)})
+            run_start = None
+            last_stable = None
+        previous = current if valid else {}
+    if run_start is not None and last_stable is not None and (last_stable - run_start) >= settle_window_seconds:
+        windows.append({"start_time_sec": round(run_start, 6), "end_time_sec": round(last_stable, 6)})
+    return windows
+
+
+def _ball_detected_in_interval(track_rows, start_time_sec, end_time_sec):
+    """Return True if any shuttle observation falls strictly inside the interval."""
+    for row in track_rows or []:
+        time_sec = float(row.get("time_sec", 0.0))
+        if start_time_sec < time_sec < end_time_sec and row.get("status") in {"detected", "reconstructed"}:
+            return True
+    return False
+
+
 def _boundary_between_events(
     track_rows,
     stationary_windows,
@@ -1237,6 +1338,7 @@ def _boundary_between_events(
     next_time,
     max_unobserved_sec,
     terminal_candidates=None,
+    stillness_windows=None,
 ):
     for candidate in terminal_candidates or []:
         if previous_time < float(candidate["time_sec"]) < next_time:
@@ -1251,13 +1353,21 @@ def _boundary_between_events(
                 "reason": "shuttle_stationary_or_slow",
                 "end_time_sec": window["start_time_sec"],
             }
-    # A gap is unknown, not evidence that one rally ended and another began.
-    # Keep this parameter for callers on the previous public signature.
-    _ = (track_rows, max_unobserved_sec)
+    # A missing-ball gap is unknown by itself.  Only when the shuttle is not
+    # observed at all in this interval do we fall back to person stillness: a
+    # rest window between the two shots closes the open rally.
+    if stillness_windows and not _ball_detected_in_interval(track_rows, previous_time, next_time):
+        for window in stillness_windows:
+            if previous_time < window["start_time_sec"] < next_time:
+                return {
+                    "reason": "players_stationary_between_rallies",
+                    "end_time_sec": window["start_time_sec"],
+                }
+    _ = max_unobserved_sec
     return None
 
 
-def _terminal_boundary_after_event(stationary_windows, last_event_time, terminal_candidates=None):
+def _terminal_boundary_after_event(stationary_windows, last_event_time, terminal_candidates=None, stillness_windows=None, track_rows=None):
     for candidate in terminal_candidates or []:
         if float(candidate["time_sec"]) > last_event_time:
             return {
@@ -1269,6 +1379,14 @@ def _terminal_boundary_after_event(stationary_windows, last_event_time, terminal
         if window["start_time_sec"] > last_event_time:
             return {
                 "reason": "shuttle_stationary_or_slow",
+                "end_time_sec": window["start_time_sec"],
+            }
+    for window in stillness_windows or []:
+        if window["start_time_sec"] > last_event_time and not _ball_detected_in_interval(
+            track_rows, last_event_time, window["start_time_sec"]
+        ):
+            return {
+                "reason": "players_stationary_between_rallies",
                 "end_time_sec": window["start_time_sec"],
             }
     return None
@@ -1383,6 +1501,25 @@ def _valid_point(point):
 
 def _distance(left, right):
     return math.hypot(float(left[0]) - float(right[0]), float(left[1]) - float(right[1]))
+
+
+def _pixel_scale(width, height, reference_height=1080.0):
+    """Scale pixel-space thresholds to the analysed frame height.
+
+    Every speed (px/s), distance (px) and hand-gap (px) threshold in the offline
+    segmentation was tuned against ~1080p footage.  Scaling linearly by frame
+    height keeps those thresholds meaningful at other resolutions; the clamp
+    avoids pathological values for tiny crops or extremely large frames.
+    """
+    if not height:
+        return 1.0
+    try:
+        value = float(height)
+    except (TypeError, ValueError):
+        return 1.0
+    if value <= 0:
+        return 1.0
+    return max(0.5, min(2.0, value / float(reference_height)))
 
 
 def _velocity(left, right, seconds):

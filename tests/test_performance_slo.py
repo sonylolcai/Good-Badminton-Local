@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from badminton_analysis.analysis.fixed_camera_match import CourtMultiObjectTracker, CourtSpace
-from badminton_analysis.analysis.performance_report import generate_performance_report
+from business_gateway.report.performance import generate_performance_report
 from badminton_analysis.system import BadmintonAnalysisSystem
 
 

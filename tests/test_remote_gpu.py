@@ -12,7 +12,9 @@ from webui.remote_gpu import (
     _multipart_length,
     _remote_options,
     _submit_multipart,
+    remote_gpu_config,
 )
+from business_gateway.dev_api import LocalReplayManager
 
 
 class RemoteGpuTests(unittest.TestCase):
@@ -108,6 +110,33 @@ class RemoteGpuTests(unittest.TestCase):
                 _load_local_config_file()
                 import os
                 self.assertEqual(os.environ["GOOD_BADMINTON_GPU_API_KEY"], "explicit-key")
+
+    def test_operator_can_override_one_remote_gpu_destination(self):
+        with patch.dict(
+            "os.environ",
+            {"GOOD_BADMINTON_GPU_API_URL": "http://configured.example:8080"},
+            clear=False,
+        ):
+            config = remote_gpu_config("http://xn-g.suanjiayun.com:55606")
+        self.assertEqual(config["base_url"], "http://xn-g.suanjiayun.com:55606")
+
+    def test_stream_replay_endpoint_override_is_task_scoped_and_validated(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "GPU_ANALYSIS_BASE_URL": "http://configured.example:8080",
+                "GPU_ANALYSIS_API_KEY": "development-key",
+            },
+            clear=False,
+        ):
+            config = LocalReplayManager._stream_config_for_task(
+                {}, gpu_base_url="http://xn-g.suanjiayun.com:55606"
+            )
+            self.assertEqual(config.base_url, "http://xn-g.suanjiayun.com:55606")
+            with self.assertRaisesRegex(ValueError, "base URL"):
+                LocalReplayManager._stream_config_for_task(
+                    {}, gpu_base_url="http://user:password@gpu.example:8080"
+                )
 
 
 if __name__ == "__main__":

@@ -306,7 +306,14 @@ class PlayerPoseVisualizer:
 
         if stats_visualizer is not None:
             t0 = time.time()
-            stats_visualizer.draw_player_stats(frame, cached_movement_stats, rally_count)
+            if spatial_tracks is not None:
+                # ``upper/lower`` has no durable identity meaning in doubles
+                # and can disagree with the green spatial-track boxes. The
+                # active analysis supplies spatial tracks, so the on-video
+                # statistics now share exactly the same evidence source.
+                stats_visualizer.draw_spatial_track_stats(frame, spatial_tracks, rally_count)
+            else:
+                stats_visualizer.draw_player_stats(frame, cached_movement_stats, rally_count)
             if self.show_performance_stats:
                 print(f"Drawing player stats took {time.time() - t0:.2f} sec")
 
@@ -367,16 +374,26 @@ class PlayerPoseVisualizer:
                 # The box is real, but the long-occlusion association is not
                 # strong enough for individual statistics until it stabilizes.
                 label = f"{label} (recovered {identity_confidence:.0%})"
-            cv2.putText(
-                frame,
-                label,
-                (position[0] + 8, max(16, position[1] - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
+            # The court is green and detection colours are bright, so a
+            # colour-matched label is easy to lose. Keep the durable ID at the
+            # player foot point in black, with a light outline for dark shoes
+            # or a dark background behind the court.
+            PlayerPoseVisualizer._draw_foot_label(frame, label, position)
+
+    @staticmethod
+    def _draw_foot_label(frame, label, position):
+        """Draw a high-contrast black track label just below a foot point."""
+        frame_height, frame_width = frame.shape[:2]
+        text = str(label)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.45
+        thickness = 1
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
+        x = min(max(2, int(position[0]) + 7), max(2, frame_width - text_width - 2))
+        y = min(max(text_height + 2, int(position[1]) + text_height + 8), max(text_height + 2, frame_height - baseline - 2))
+        origin = (x, y)
+        cv2.putText(frame, text, origin, font, scale, (235, 235, 235), 3, cv2.LINE_AA)
+        cv2.putText(frame, text, origin, font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
 
     @staticmethod
     def _draw_unassigned_detections(frame, detections):

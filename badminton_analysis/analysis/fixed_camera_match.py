@@ -7,6 +7,7 @@ by enough evidence.  That makes it safe to test with several camera views and
 keeps future doubles rules outside the visual tracking layer.
 """
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from math import hypot
 from typing import Optional, Tuple
@@ -17,6 +18,17 @@ from ..tracking.bytetrack_adapter import ByteTrackAdapter
 
 
 SCHEMA_VERSION = "2.3"
+TRACKER_STATE_VERSION = "court-multi-object-tracker.v1"
+
+# The current-speed label is an operator-facing display value, not a raw
+# detector output.  It must be derived from the same current ``track_id``
+# evidence drawn on screen, and it must not turn small foot-point jitter into
+# apparent movement.  These limits deliberately affect display only; raw
+# per-frame positions remain available in detections.jsonl for audit.
+DISPLAY_SPEED_WINDOW_SECONDS = 0.5
+DISPLAY_SPEED_MAX_OBSERVATION_GAP_SECONDS = 0.15
+DISPLAY_SPEED_STEP_DEAD_ZONE_M = 0.05
+DISPLAY_SPEED_DEAD_ZONE_MPS = 0.35
 
 # Ultralytics YOLO Pose emits the standard 17-point COCO skeleton.  The raw
 # order is declared once in metadata rather than repeated beside every frame,
@@ -95,6 +107,11 @@ class _Track:
     # a crisp pose can still be an uncertain identity after a long occlusion.
     association_identity_confidence: float = 0.85
     image_history: list = field(default_factory=list)
+    # A short window of *measured* court positions used only for stable
+    # annotation rendering. Predicted positions deliberately never enter this
+    # history, so the mini-court does not invent a path through an occlusion.
+    court_history: list = field(default_factory=list)
+    court_observation_history: list = field(default_factory=list)
 
 
 class CourtMultiObjectTracker:
@@ -118,11 +135,13 @@ class CourtMultiObjectTracker:
         lock_match_roster=False,
         expected_roster_count=None,
         roster_stable_frames=2,
+        max_roster_count=4,
+        roster_discovery_seconds=8.0,
         roster_reacquire_seconds=1.0,
         require_association_keys=False,
     ):
-        if match_mode not in {"singles", "doubles"}:
-            raise ValueError("match_mode must be 'singles' or 'doubles'")
+        if match_mode not in {"singles", "doubles", "person_only"}:
+            raise ValueError("match_mode must be 'singles', 'doubles', or 'person_only'")
         self.court_space = court_space
         self.fps = float(fps)
         self.max_missed_frames = int(max_missed_frames)
@@ -131,14 +150,35 @@ class CourtMultiObjectTracker:
         )
         self.max_speed_mps = float(max_speed_mps)
         self.match_mode = match_mode
-        self.max_players_per_team = 1 if match_mode == "singles" else 2
-        self.lock_match_roster = bool(lock_match_roster)
-        self.expected_roster_count = int(
-            expected_roster_count or (2 if match_mode == "singles" else 4)
+        self.max_players_per_team = (
+            1 if match_mode == "singles" else 2 if match_mode == "doubles" else None
         )
-        if self.expected_roster_count <= 0:
+        self.lock_match_roster = bool(lock_match_roster)
+        default_roster_count = 2 if match_mode == "singles" else 4
+        # Anonymous streaming cannot ask the user whether a game is singles,
+        # doubles, or an informal uneven game.  When roster locking is enabled
+        # in ``person_only`` mode, a stable on-court count becomes the roster
+        # size during bootstrap.  It is still anonymous: this is a continuity
+        # constraint, never a player/team/side identity claim.
+        self.expected_roster_count = (
+            None
+            if match_mode == "person_only" and expected_roster_count is None
+            else int(expected_roster_count or default_roster_count)
+        )
+        if self.expected_roster_count is not None and self.expected_roster_count <= 0:
             raise ValueError("expected_roster_count must be positive")
         self.roster_stable_frames = max(1, int(roster_stable_frames))
+        self.max_roster_count = max(1, int(max_roster_count))
+        if (
+            self.expected_roster_count is not None
+            and self.expected_roster_count > self.max_roster_count
+        ):
+            raise ValueError("expected_roster_count cannot exceed max_roster_count")
+        self.roster_discovery_seconds = max(0.0, float(roster_discovery_seconds))
+        self.roster_discovery_frames = max(
+            1,
+            int(round(self.roster_discovery_seconds * self.fps)),
+        )
         # A production ByteTrack roster must be built from confirmed tracker
         # keys.  Otherwise the roster can lock during ByteTrack's tentative
         # warm-up period and lose the durable association it was meant to
@@ -163,6 +203,8 @@ class CourtMultiObjectTracker:
         self.roster_track_ids = []
         self._roster_stable_observation_frames = 0
         self._last_roster_candidate_count = 0
+        self._roster_discovery_started_frame = None
+        self._roster_observed_max_candidate_count = 0
         self._last_roster_reason = "awaiting_stable_on_court_detections" if self.lock_match_roster else "disabled"
         self._last_unassigned_observation_count = 0
         self._last_unassigned_observations = []
@@ -189,20 +231,97 @@ class CourtMultiObjectTracker:
         return self._update_locked_or_open_tracks(frame_index, observations)
 
     def _bootstrap_roster(self, frame_index, observations):
-        """Lock the match roster only after a stable, complete on-court sample.
+        """Start at two real people, then expand to at most four before lock.
 
-        A camera may initially see only one singles player or briefly include a
-        referee.  Locking that frame would permanently encode a bad roster, so
-        the tracker waits for the configured count on consecutive frames.
+        The visual service cannot know whether a game is singles, doubles, or
+        informal. It starts only after at least two on-court people have stable
+        evidence. Until the discovery deadline, newly confirmed detections may
+        expand that anonymous roster to three or four; missing people are never
+        created merely to fill capacity.
         """
+        previous_candidate_count = self._last_roster_candidate_count
         self._last_roster_candidate_count = len(observations)
         self._last_unassigned_observation_count = 0
         self._last_unassigned_observations = []
-        if len(observations) != self.expected_roster_count:
+        candidate_count = len(observations)
+        if self.expected_roster_count is None:
+            if self._roster_discovery_started_frame is None:
+                self._roster_discovery_started_frame = int(frame_index)
+            if candidate_count > self.max_roster_count:
+                self._roster_stable_observation_frames = 0
+                self._last_roster_reason = (
+                    "waiting_for_on_court_count_within_max"
+                    f" (observed={candidate_count}, max={self.max_roster_count})"
+                )
+                return self.snapshot(frame_index)
+            if self.require_association_keys and any(
+                not observation.get("association_key") for observation in observations
+            ):
+                self._roster_stable_observation_frames = 0
+                self._last_roster_reason = "awaiting_bytetrack_confirmation"
+                return self.snapshot(frame_index)
+            self._roster_observed_max_candidate_count = max(
+                self._roster_observed_max_candidate_count,
+                candidate_count,
+            )
+            if not self.tracks:
+                if candidate_count < 2:
+                    self._roster_stable_observation_frames = 0
+                    self._last_roster_reason = "waiting_for_at_least_two_on_court_people"
+                    return self.snapshot(frame_index)
+                if previous_candidate_count != candidate_count:
+                    self._roster_stable_observation_frames = 1
+                else:
+                    self._roster_stable_observation_frames += 1
+                if self._roster_stable_observation_frames < self.roster_stable_frames:
+                    self._last_roster_reason = "awaiting_second_stable_roster_observation"
+                    return self.snapshot(frame_index)
+
+                ordered = sorted(
+                    observations,
+                    key=lambda item: (float(item["court_xy"][1]), float(item["court_xy"][0])),
+                )
+                for observation in ordered:
+                    self._create_track(
+                        frame_index,
+                        observation,
+                        association_source="roster_discovery_bootstrap",
+                    )
+                self.roster_track_ids = sorted(self.tracks)
+                self.roster_status = "discovering"
+                self._last_roster_reason = "at_least_two_people_confirmed_discovery_open"
+                if len(self.roster_track_ids) >= self.max_roster_count:
+                    return self._lock_discovered_roster(frame_index, "discovery_observed_max_roster_count")
+                return self.snapshot(frame_index)
+
+            # The initial two-or-more people have valid IDs. While discovery is
+            # open, use normal association but permit newly confirmed on-court
+            # observations to add the third/fourth anonymous ID.
+            tracks = self._update_discovering_roster(frame_index, observations)
+            self.roster_track_ids = sorted(self.tracks)
+            discovery_elapsed = int(frame_index) - int(self._roster_discovery_started_frame)
+            if len(self.roster_track_ids) >= self.max_roster_count:
+                return self._lock_discovered_roster(frame_index, "discovery_observed_max_roster_count")
+            if discovery_elapsed >= self.roster_discovery_frames:
+                return self._lock_discovered_roster(
+                    frame_index,
+                    "discovery_deadline_observed_roster_count",
+                )
+            self.roster_status = "discovering"
+            self._last_roster_reason = (
+                "roster_discovery_in_progress"
+                f" (elapsed_frames={discovery_elapsed}, "
+                f"required_frames={self.roster_discovery_frames}, "
+                f"observed_max={self._roster_observed_max_candidate_count}, "
+                f"current_tracks={len(self.roster_track_ids)}, max={self.max_roster_count})"
+            )
+            return tracks
+
+        if candidate_count != self.expected_roster_count:
             self._roster_stable_observation_frames = 0
             self._last_roster_reason = (
                 "waiting_for_expected_on_court_count"
-                f" (observed={len(observations)}, expected={self.expected_roster_count})"
+                f" (observed={candidate_count}, expected={self.expected_roster_count})"
             )
             return self.snapshot(frame_index)
 
@@ -231,6 +350,23 @@ class CourtMultiObjectTracker:
         self.roster_status = "locked"
         self.roster_locked_frame = int(frame_index)
         self._last_roster_reason = "stable_expected_on_court_count"
+        return self.snapshot(frame_index)
+
+    def _update_discovering_roster(self, frame_index, observations):
+        """Associate provisional tracks while allowing evidence-based expansion."""
+        original_lock = self.lock_match_roster
+        self.lock_match_roster = False
+        try:
+            return self._update_locked_or_open_tracks(frame_index, observations)
+        finally:
+            self.lock_match_roster = original_lock
+
+    def _lock_discovered_roster(self, frame_index, reason):
+        """Seal only the real IDs accumulated during the discovery window."""
+        self.expected_roster_count = len(self.roster_track_ids)
+        self.roster_status = "locked"
+        self.roster_locked_frame = int(frame_index)
+        self._last_roster_reason = reason
         return self.snapshot(frame_index)
 
     def _update_locked_or_open_tracks(self, frame_index, observations):
@@ -401,7 +537,8 @@ class CourtMultiObjectTracker:
             location_evidence.pop("keypoint_scores", None)
             location_evidence["measurement_frame"] = int(track.last_observation_frame)
             location_evidence["is_current_measurement"] = not predicted and not missing
-            pose = self._pose_record(track, is_current_measurement=not predicted and not missing)
+            is_current_measurement = not predicted and not missing
+            pose = self._pose_record(track, is_current_measurement=is_current_measurement)
             records.append(
                 {
                     "track_id": track.track_id,
@@ -414,6 +551,11 @@ class CourtMultiObjectTracker:
                     "status": "missing" if missing else "predicted" if predicted else "detected",
                     "confidence": 0.0 if missing else round(track.confidence * (0.72 ** track.missed_frames), 4),
                     "missed_frames": track.missed_frames,
+                    "motion": self._motion_evidence(
+                        track,
+                        frame_index,
+                        is_current_measurement=is_current_measurement,
+                    ),
                     "association": {
                         "key": track.association_key,
                         "source": track.association_source,
@@ -425,6 +567,7 @@ class CourtMultiObjectTracker:
                     # mistaking a retained location record for a fresh skeleton.
                     "pose": pose,
                     "trajectory_image": [self._as_list(point) for point in track.image_history],
+                    "trajectory_court_m": [self._as_list(point) for point in track.court_history],
                 }
             )
         return records
@@ -435,6 +578,11 @@ class CourtMultiObjectTracker:
             "enabled": self.lock_match_roster,
             "status": self.roster_status,
             "expected_player_count": self.expected_roster_count if self.lock_match_roster else None,
+            "minimum_player_count": 2 if self.match_mode == "person_only" and self.lock_match_roster else None,
+            "maximum_player_count": self.max_roster_count if self.lock_match_roster else None,
+            "discovery_seconds": self.roster_discovery_seconds if self.lock_match_roster else None,
+            "discovery_started_frame": self._roster_discovery_started_frame,
+            "observed_max_candidate_count": self._roster_observed_max_candidate_count,
             "observed_on_court_candidate_count": self._last_roster_candidate_count,
             "stable_observation_frames": self._roster_stable_observation_frames,
             "stable_frames_required": self.roster_stable_frames if self.lock_match_roster else None,
@@ -450,10 +598,184 @@ class CourtMultiObjectTracker:
             ),
         }
 
+    def snapshot_state(self):
+        """Return JSON-safe association state for segment checkpointing.
+
+        This captures only court-space tracking state.  An external ByteTrack
+        runtime owns additional Kalman/filter state and must either provide its
+        own checkpoint or fail closed during restore; callers may not silently
+        claim that a newly created ByteTrack instance preserves old IDs.
+        """
+        return {
+            "state_version": TRACKER_STATE_VERSION,
+            "match_mode": self.match_mode,
+            "fps": self.fps,
+            "max_missed_frames": self.max_missed_frames,
+            "max_retained_missing_frames": self.max_retained_missing_frames,
+            "max_speed_mps": self.max_speed_mps,
+            "lock_match_roster": self.lock_match_roster,
+            "expected_roster_count": self.expected_roster_count,
+            "max_roster_count": self.max_roster_count,
+            "roster_discovery_seconds": self.roster_discovery_seconds,
+            "next_id": self._next_id,
+            "tracks": {
+                track_id: {
+                    "track_id": track.track_id,
+                    "court_xy": list(track.court_xy),
+                    "image_xy": list(track.image_xy) if track.image_xy is not None else None,
+                    "confidence": track.confidence,
+                    "last_frame": track.last_frame,
+                    "last_observation_frame": track.last_observation_frame,
+                    "velocity_mps": list(track.velocity_mps),
+                    "missed_frames": track.missed_frames,
+                    "observations": track.observations,
+                    "last_evidence": deepcopy(track.last_evidence),
+                    "association_key": track.association_key,
+                    "association_source": track.association_source,
+                    "association_identity_confidence": track.association_identity_confidence,
+                    "image_history": [list(point) for point in track.image_history],
+                    "court_history": [list(point) for point in track.court_history],
+                    "court_observation_history": [
+                        [int(frame), list(point)]
+                        for frame, point in track.court_observation_history
+                    ],
+                }
+                for track_id, track in sorted(self.tracks.items())
+            },
+            "association_keys": dict(self._association_keys),
+            "track_metrics": deepcopy(self.track_metrics),
+            "identity_claims": dict(self.identity_claims),
+            "team_claims": dict(self.team_claims),
+            "roster": {
+                "status": self.roster_status,
+                "locked_frame": self.roster_locked_frame,
+                "track_ids": list(self.roster_track_ids),
+                "stable_observation_frames": self._roster_stable_observation_frames,
+                "last_candidate_count": self._last_roster_candidate_count,
+                "discovery_started_frame": self._roster_discovery_started_frame,
+                "observed_max_candidate_count": self._roster_observed_max_candidate_count,
+                "last_reason": self._last_roster_reason,
+                "last_unassigned_observation_count": self._last_unassigned_observation_count,
+                "last_unassigned_observations": deepcopy(self._last_unassigned_observations),
+            },
+        }
+
+    def restore_state(self, state):
+        """Restore a state created by :meth:`snapshot_state`, failing closed."""
+        if not isinstance(state, dict) or state.get("state_version") != TRACKER_STATE_VERSION:
+            raise ValueError("unsupported court tracker checkpoint")
+        if state.get("match_mode") != self.match_mode:
+            raise ValueError("court tracker checkpoint match_mode does not match")
+        if abs(float(state.get("fps", 0.0)) - self.fps) > 1e-6:
+            raise ValueError("court tracker checkpoint fps does not match")
+        # A person-only session may infer its anonymous roster size only after
+        # a stable opening sample.  A fresh processor starts with ``None``;
+        # carry the persisted inferred size forward before verifying the
+        # remaining checkpoint configuration.
+        persisted_roster_count = state.get("expected_roster_count")
+        if (
+            self.match_mode == "person_only"
+            and self.lock_match_roster
+            and self.expected_roster_count is None
+            and persisted_roster_count is not None
+        ):
+            self.expected_roster_count = int(persisted_roster_count)
+        expected_configuration = {
+            "max_missed_frames": self.max_missed_frames,
+            "max_retained_missing_frames": self.max_retained_missing_frames,
+            "max_speed_mps": self.max_speed_mps,
+            "lock_match_roster": self.lock_match_roster,
+            "expected_roster_count": self.expected_roster_count,
+            "max_roster_count": self.max_roster_count,
+            "roster_discovery_seconds": self.roster_discovery_seconds,
+        }
+        restored_configuration = {
+            "max_missed_frames": int(state.get("max_missed_frames", -1)),
+            "max_retained_missing_frames": int(
+                state.get("max_retained_missing_frames", -1)
+            ),
+            "max_speed_mps": float(state.get("max_speed_mps", -1.0)),
+            "lock_match_roster": bool(state.get("lock_match_roster", False)),
+            "expected_roster_count": state.get("expected_roster_count"),
+            "max_roster_count": int(state.get("max_roster_count", self.max_roster_count)),
+            "roster_discovery_seconds": float(
+                state.get("roster_discovery_seconds", self.roster_discovery_seconds)
+            ),
+        }
+        if restored_configuration != expected_configuration:
+            raise ValueError("court tracker checkpoint configuration does not match")
+
+        restored_tracks = {}
+        for track_id, record in dict(state.get("tracks") or {}).items():
+            restored_tracks[str(track_id)] = _Track(
+                track_id=str(record["track_id"]),
+                court_xy=tuple(float(value) for value in record["court_xy"][:2]),
+                image_xy=self._tuple_or_none(record.get("image_xy")),
+                confidence=float(record.get("confidence", 0.0)),
+                last_frame=int(record["last_frame"]),
+                last_observation_frame=int(record["last_observation_frame"]),
+                velocity_mps=tuple(float(value) for value in record.get("velocity_mps", [0.0, 0.0])[:2]),
+                missed_frames=int(record.get("missed_frames", 0)),
+                observations=int(record.get("observations", 0)),
+                last_evidence=deepcopy(record.get("last_evidence") or {}),
+                association_key=record.get("association_key"),
+                association_source=str(record.get("association_source") or "court_association"),
+                association_identity_confidence=float(
+                    record.get("association_identity_confidence", 0.0)
+                ),
+                image_history=[
+                    tuple(float(value) for value in point[:2])
+                    for point in record.get("image_history", [])
+                ],
+                court_history=[
+                    tuple(float(value) for value in point[:2])
+                    for point in record.get("court_history", [])
+                ],
+                court_observation_history=[
+                    (int(item[0]), tuple(float(value) for value in item[1][:2]))
+                    for item in record.get("court_observation_history", [])
+                ],
+            )
+        self.tracks = restored_tracks
+        self._next_id = int(state.get("next_id", 1))
+        self._association_keys = {
+            str(key): str(value)
+            for key, value in dict(state.get("association_keys") or {}).items()
+        }
+        self.track_metrics = deepcopy(state.get("track_metrics") or {})
+        self.identity_claims = {
+            str(key): str(value)
+            for key, value in dict(state.get("identity_claims") or {}).items()
+        }
+        self.team_claims = {
+            str(key): str(value)
+            for key, value in dict(state.get("team_claims") or {}).items()
+        }
+        roster = dict(state.get("roster") or {})
+        self.roster_status = str(roster.get("status") or self.roster_status)
+        self.roster_locked_frame = roster.get("locked_frame")
+        self.roster_track_ids = [str(value) for value in roster.get("track_ids", [])]
+        self._roster_stable_observation_frames = int(
+            roster.get("stable_observation_frames", 0)
+        )
+        self._last_roster_candidate_count = int(roster.get("last_candidate_count", 0))
+        self._roster_discovery_started_frame = roster.get("discovery_started_frame")
+        self._roster_observed_max_candidate_count = int(
+            roster.get("observed_max_candidate_count", 0)
+        )
+        self._last_roster_reason = str(roster.get("last_reason") or self._last_roster_reason)
+        self._last_unassigned_observation_count = int(
+            roster.get("last_unassigned_observation_count", 0)
+        )
+        self._last_unassigned_observations = deepcopy(
+            roster.get("last_unassigned_observations") or []
+        )
+
     def _create_track(self, frame_index, observation, association_source="court_association"):
         track_id = f"track_{self._next_id:03d}"
         self._next_id += 1
         image_xy = self._tuple_or_none(observation.get("image_xy"))
+        court_xy = tuple(float(value) for value in observation["court_xy"])
         if (
             association_source == "court_association"
             and str(observation.get("association_key") or "").startswith("bytetrack_")
@@ -461,7 +783,7 @@ class CourtMultiObjectTracker:
             association_source = "bytetrack"
         self.tracks[track_id] = _Track(
             track_id=track_id,
-            court_xy=tuple(float(value) for value in observation["court_xy"]),
+            court_xy=court_xy,
             image_xy=image_xy,
             confidence=float(observation.get("confidence", 0.0)),
             last_frame=int(frame_index),
@@ -471,6 +793,10 @@ class CourtMultiObjectTracker:
             association_source=association_source,
             association_identity_confidence=self._identity_confidence_for_source(association_source),
             image_history=[image_xy] if image_xy is not None else [],
+            court_history=[court_xy],
+            court_observation_history=[
+                (int(frame_index), court_xy)
+            ],
         )
         if observation.get("association_key"):
             self._association_keys[observation["association_key"]] = track_id
@@ -485,6 +811,20 @@ class CourtMultiObjectTracker:
 
     def _apply_observation(self, track, frame_index, observation, association_source="court_association"):
         new_xy = tuple(float(value) for value in observation["court_xy"])
+        observation_gap_seconds = max(
+            0.0,
+            (int(frame_index) - int(track.last_observation_frame)) / self.fps,
+        )
+        # Never calculate a current speed across a detector gap.  A returning
+        # pose is real evidence, but its movement during the unseen interval
+        # is unknown and must not be reconstructed for a screen statistic.
+        if observation_gap_seconds > DISPLAY_SPEED_MAX_OBSERVATION_GAP_SECONDS:
+            track.court_observation_history = []
+        track.court_observation_history.append((int(frame_index), new_xy))
+        earliest_frame = int(frame_index - self.fps * DISPLAY_SPEED_WINDOW_SECONDS)
+        track.court_observation_history = [
+            item for item in track.court_observation_history if item[0] >= earliest_frame
+        ]
         distance = self._distance(track.court_xy, new_xy)
         elapsed = max(1, int(frame_index) - track.last_frame) / self.fps
         velocity = ((new_xy[0] - track.court_xy[0]) / elapsed, (new_xy[1] - track.court_xy[1]) / elapsed)
@@ -496,6 +836,8 @@ class CourtMultiObjectTracker:
         if track.image_xy is not None:
             track.image_history.append(track.image_xy)
             track.image_history = track.image_history[-30:]
+        track.court_history.append(new_xy)
+        track.court_history = track.court_history[-30:]
         track.confidence = float(observation.get("confidence", 0.0))
         track.last_frame = int(frame_index)
         track.last_observation_frame = int(frame_index)
@@ -520,6 +862,55 @@ class CourtMultiObjectTracker:
             metrics["distance_m"] += distance
         zone = self.court_space.zone_for(new_xy)
         metrics["zone_frames"][zone] = metrics["zone_frames"].get(zone, 0) + 1
+
+    def _motion_evidence(self, track, frame_index, *, is_current_measurement):
+        """Return a non-fabricated speed label for the current spatial track.
+
+        ``predicted`` and ``missing`` track records deliberately return no
+        speed.  For a current detection, only a short uninterrupted sequence
+        of real court observations is used.  Individual steps within five
+        centimetres are treated as localisation noise; a remaining speed below
+        0.35 m/s is shown as stationary rather than as a false slow walk.
+        """
+        base = {
+            "current_speed_mps": None,
+            "status": "not_currently_measured",
+            "window_seconds": DISPLAY_SPEED_WINDOW_SECONDS,
+            "dead_zone_mps": DISPLAY_SPEED_DEAD_ZONE_MPS,
+            "measurement_count": 0,
+            "source": "fresh_spatial_track_measurements_only",
+        }
+        if not is_current_measurement:
+            return base
+        history = list(track.court_observation_history)
+        base["measurement_count"] = len(history)
+        if len(history) < 2:
+            base["status"] = "not_enough_fresh_measurements"
+            return base
+        start_frame, _start_xy = history[0]
+        end_frame, _end_xy = history[-1]
+        elapsed_seconds = (int(end_frame) - int(start_frame)) / self.fps
+        if elapsed_seconds <= 0:
+            base["status"] = "not_enough_fresh_measurements"
+            return base
+        distance_m = 0.0
+        for (left_frame, left_xy), (right_frame, right_xy) in zip(history, history[1:]):
+            step_seconds = (int(right_frame) - int(left_frame)) / self.fps
+            if step_seconds <= 0 or step_seconds > DISPLAY_SPEED_MAX_OBSERVATION_GAP_SECONDS:
+                base["status"] = "not_enough_fresh_measurements"
+                return base
+            step_distance = self._distance(left_xy, right_xy)
+            if step_distance >= DISPLAY_SPEED_STEP_DEAD_ZONE_M:
+                distance_m += step_distance
+        raw_speed_mps = distance_m / elapsed_seconds
+        speed_mps = 0.0 if raw_speed_mps < DISPLAY_SPEED_DEAD_ZONE_MPS else raw_speed_mps
+        base.update({
+            "current_speed_mps": round(speed_mps, 3),
+            "status": "stationary" if speed_mps == 0.0 else "moving",
+            "measured_distance_m": round(distance_m, 4),
+            "measured_elapsed_seconds": round(elapsed_seconds, 4),
+        })
+        return base
 
     def _predict_position(self, track, frame_index):
         elapsed = max(0, int(frame_index) - track.last_frame) / self.fps
@@ -761,15 +1152,60 @@ class MonocularShuttleReconstructor:
 
 
 class RallyStateMachine:
-    """Conservative rally segmentation with rejectable score conclusions."""
+    """Conservative rally segmentation with rejectable score conclusions.
 
-    def __init__(self, fps, min_active_frames=4, end_gap_frames=None):
+    When shuttle measurement is explicitly disabled, a missing shuttle must
+    never be treated as a terminal event.  The fallback mode below is a
+    deliberately weaker *movement-only* boundary signal: a rally may finish
+    only after every expected player has a fresh, low-speed court measurement
+    throughout a configured window.  It is useful for person-only workload
+    analysis, but is not ball, score, or hit evidence.
+    """
+
+    MOVEMENT_SETTLE_WINDOWS_SECONDS = (0.5, 0.7, 1.0)
+
+    # A rally may end on a *detected* shuttle that is nearly stationary for a
+    # short window (landed, or only small residual movement).  The landed signal
+    # never fires until the shuttle has first travelled far enough that a stop
+    # can be distinguished from a shuttle held in one place before a serve.
+    SHUTTLE_LANDED_WINDOW_SECONDS = 0.4
+    SHUTTLE_LANDED_MAX_MOVE_M = 0.5
+    SHUTTLE_LANDED_MIN_SPAN_SECONDS = 0.2
+    SHUTTLE_LANDED_MIN_PRIOR_MOVE_M = 1.0
+
+    def __init__(
+        self,
+        fps,
+        min_active_frames=4,
+        end_gap_frames=None,
+        *,
+        shuttle_enabled=True,
+        expected_player_count=2,
+        settle_window_seconds=0.7,
+        stable_speed_mps=0.35,
+    ):
         self.fps = float(fps)
         self.min_active_frames = int(min_active_frames)
         self.end_gap_frames = int(end_gap_frames or max(10, round(self.fps * 1.2)))
+        self.shuttle_enabled = bool(shuttle_enabled)
+        self.expected_player_count = max(1, int(expected_player_count))
+        self.settle_window_seconds = float(settle_window_seconds)
+        if self.settle_window_seconds not in self.MOVEMENT_SETTLE_WINDOWS_SECONDS:
+            raise ValueError(
+                "settle_window_seconds must be one of "
+                f"{self.MOVEMENT_SETTLE_WINDOWS_SECONDS}"
+            )
+        self.stable_speed_mps = float(stable_speed_mps)
+        if self.stable_speed_mps <= 0:
+            raise ValueError("stable_speed_mps must be greater than 0")
         self.state = "idle"
         self._active_frames = 0
         self._missing_frames = 0
+        self._settled_frames = 0
+        self._settled_start_frame = None
+        self._last_player_positions = {}
+        self._shuttle_positions = []
+        self._shuttle_max_move_m = 0.0
         self._rally_id = 0
         self._current = None
         self.completed = []
@@ -782,28 +1218,171 @@ class RallyStateMachine:
             else max(1, frame_index - self._last_update_frame)
         )
         self._last_update_frame = frame_index
+        if not self.shuttle_enabled:
+            return self._update_from_player_settle(
+                frame_index,
+                tracks,
+                elapsed_source_frames,
+            )
         has_players = len([track for track in tracks if track["status"] == "detected"]) >= 2
         has_shuttle = shuttle is not None and shuttle.get("status") == "approximate"
-        if self.state == "idle" and has_players and has_shuttle:
-            self.state = "candidate"
-            self._active_frames = elapsed_source_frames
-        elif self.state == "candidate":
-            self._active_frames = self._active_frames + elapsed_source_frames if has_shuttle else 0
-            if self._active_frames >= self.min_active_frames:
-                self._start(frame_index - self._active_frames + 1)
-        elif self.state == "active":
-            self._missing_frames = 0 if has_shuttle else self._missing_frames + elapsed_source_frames
-            if hit_events:
-                self._current["hit_events"].extend(hit_events)
-            if self._missing_frames >= self.end_gap_frames:
-                self._finish(frame_index, reason="shuttle_evidence_gap")
-        return self.snapshot()
+        if has_shuttle:
+            self._record_shuttle_position(frame_index, shuttle)
+            if self.state == "idle" and has_players:
+                self.state = "candidate"
+                self._active_frames = elapsed_source_frames
+            elif self.state == "candidate":
+                self._active_frames = self._active_frames + elapsed_source_frames if has_players else 0
+                if self._active_frames >= self.min_active_frames:
+                    self._start(frame_index - self._active_frames + 1)
+            elif self.state == "active":
+                if hit_events:
+                    self._current["hit_events"].extend(hit_events)
+                if self._shuttle_landed():
+                    self._finish(frame_index, reason="shuttle_landed")
+            return self.snapshot()
+
+        # The shuttle is not detected on this frame.  A missing-ball gap is not
+        # itself terminal: person stillness marks the rest between two rallies.
+        # If an old rally is still open it is closed there, and player motion
+        # after that rest opens the next candidate rally.
+        if self.state == "active" and hit_events:
+            self._current["hit_events"].extend(hit_events)
+        return self._update_from_player_settle(frame_index, tracks, elapsed_source_frames)
+
+    def _record_shuttle_position(self, frame_index, shuttle):
+        """Keep a bounded window of detected court positions for a landed check."""
+        xyz = shuttle.get("xyz_m")
+        if not xyz or len(xyz) < 2:
+            return
+        point = (int(frame_index), float(xyz[0]), float(xyz[1]))
+        if self._shuttle_positions:
+            previous = self._shuttle_positions[-1]
+            self._shuttle_max_move_m = max(
+                self._shuttle_max_move_m,
+                hypot(point[1] - previous[1], point[2] - previous[2]),
+            )
+        self._shuttle_positions.append(point)
+        cutoff = int(frame_index) - int(round(self.fps * self.SHUTTLE_LANDED_WINDOW_SECONDS))
+        self._shuttle_positions = [
+            item for item in self._shuttle_positions if item[0] >= cutoff
+        ]
+
+    def _shuttle_landed(self):
+        """Return True only when a travelled shuttle has just stopped moving."""
+        if self._shuttle_max_move_m < self.SHUTTLE_LANDED_MIN_PRIOR_MOVE_M:
+            return False
+        positions = self._shuttle_positions
+        if len(positions) < 2:
+            return False
+        span_seconds = (positions[-1][0] - positions[0][0]) / self.fps
+        if span_seconds < self.SHUTTLE_LANDED_MIN_SPAN_SECONDS:
+            return False
+        max_move = max(
+            hypot(positions[i][1] - positions[j][1], positions[i][2] - positions[j][2])
+            for i in range(len(positions))
+            for j in range(i + 1, len(positions))
+        )
+        return max_move <= self.SHUTTLE_LANDED_MAX_MOVE_M
+
+    def _update_from_player_settle(self, frame_index, tracks, elapsed_source_frames):
+        """Use fresh multi-player court measurements to locate rest windows.
+
+        A stable window is invalidated by any missing/predicted player, a
+        roster-count mismatch, a malformed court coordinate, or one measured
+        player exceeding ``stable_speed_mps``.  This keeps detector gaps from
+        being silently mistaken for a rally ending.
+        """
+        stable, reason = self._all_players_stable(tracks, elapsed_source_frames)
+        if stable:
+            if self._settled_start_frame is None:
+                self._settled_start_frame = int(frame_index - elapsed_source_frames + 1)
+            self._settled_frames += elapsed_source_frames
+            if (
+                self.state == "active"
+                and self._settled_frames / self.fps >= self.settle_window_seconds
+            ):
+                # The terminal time is the start of the verified stable window,
+                # not the later frame at which it merely became long enough.
+                self._finish(
+                    self._settled_start_frame,
+                    reason=f"all_players_stable_for_{self.settle_window_seconds:.1f}s",
+                )
+            elif self.state in {"idle", "candidate"}:
+                self.state = "awaiting_serve"
+                self._active_frames = 0
+        else:
+            self._settled_frames = 0
+            self._settled_start_frame = None
+            if self.state in {"idle", "awaiting_serve", "candidate"}:
+                # A detector gap, a new/recovered ID, or partial roster must
+                # not manufacture a new rally.  Only measured motion after a
+                # complete roster can leave the stable/awaiting state.
+                self._active_frames = (
+                    self._active_frames + elapsed_source_frames
+                    if reason == "player_motion_above_threshold"
+                    else 0
+                )
+                if self._active_frames >= self.min_active_frames:
+                    self._start(
+                        frame_index - self._active_frames + 1,
+                        start_reason="player_motion_after_settle"
+                        if self.state == "awaiting_serve"
+                        else "player_motion_video_start",
+                    )
+            elif self.state == "active":
+                self._active_frames = 0
+        snapshot = self.snapshot()
+        snapshot.update(
+            {
+                "movement_terminal_signal": {
+                    "all_players_stable": bool(stable),
+                    "reason": reason,
+                    "window_seconds": self.settle_window_seconds,
+                    "stable_speed_mps": self.stable_speed_mps,
+                }
+            }
+        )
+        return snapshot
+
+    def _all_players_stable(self, tracks, elapsed_source_frames):
+        detected = [track for track in tracks if track.get("status") == "detected"]
+        if len(detected) != self.expected_player_count:
+            self._last_player_positions = {}
+            return False, "expected_players_not_all_fresh_detected"
+        elapsed_seconds = max(1, int(elapsed_source_frames)) / self.fps
+        current = {}
+        for track in detected:
+            track_id = str(track.get("track_id") or "")
+            point = track.get("court_xy_m")
+            if not track_id or not isinstance(point, (list, tuple)) or len(point) < 2:
+                self._last_player_positions = {}
+                return False, "missing_track_or_court_position"
+            try:
+                current[track_id] = (float(point[0]), float(point[1]))
+            except (TypeError, ValueError):
+                self._last_player_positions = {}
+                return False, "invalid_court_position"
+        if set(current) != set(self._last_player_positions):
+            self._last_player_positions = current
+            return False, "insufficient_contiguous_measurements"
+        speeds = [
+            hypot(current[track_id][0] - previous[0], current[track_id][1] - previous[1]) / elapsed_seconds
+            for track_id, previous in self._last_player_positions.items()
+        ]
+        self._last_player_positions = current
+        if any(speed > self.stable_speed_mps for speed in speeds):
+            return False, "player_motion_above_threshold"
+        return True, "all_expected_players_stable"
 
     def finalize(self, frame_index=None):
-        if self.state == "candidate":
-            self._start(0)
         if self.state == "active":
-            self._finish(frame_index, reason="video_end")
+            self._finish(
+                frame_index,
+                reason="video_end_without_movement_terminal"
+                if not self.shuttle_enabled
+                else "video_end",
+            )
         return list(self.completed)
 
     def snapshot(self):
@@ -811,9 +1390,10 @@ class RallyStateMachine:
             "state": self.state,
             "rally_id": self._current["rally_id"] if self._current else None,
             "score_status": self._current["score"]["status"] if self._current else "unknown",
+            "evidence_mode": "shuttle_measurement" if self.shuttle_enabled else "player_stability_only",
         }
 
-    def _start(self, start_frame):
+    def _start(self, start_frame, start_reason=None):
         self._rally_id += 1
         self.state = "active"
         self._current = {
@@ -821,6 +1401,8 @@ class RallyStateMachine:
             "start_frame": int(start_frame),
             "end_frame": None,
             "hit_events": [],
+            "start_reason": start_reason or "shuttle_measurement",
+            "evidence_mode": "shuttle_measurement" if self.shuttle_enabled else "player_stability_only",
             "confidence": 0.0,
             "score": {
                 "status": "unknown",
@@ -833,12 +1415,20 @@ class RallyStateMachine:
     def _finish(self, frame_index, reason):
         self._current["end_frame"] = int(frame_index) if frame_index is not None else None
         self._current["end_reason"] = reason
-        self._current["confidence"] = round(min(0.7, 0.3 + 0.05 * len(self._current["hit_events"])), 3)
+        self._current["confidence"] = (
+            round(min(0.7, 0.3 + 0.05 * len(self._current["hit_events"])), 3)
+            if self.shuttle_enabled
+            else 0.35
+        )
         self.completed.append(self._current)
         self._current = None
-        self.state = "idle"
+        self.state = "idle" if self.shuttle_enabled else "awaiting_serve"
         self._active_frames = 0
         self._missing_frames = 0
+        self._settled_frames = 0
+        self._settled_start_frame = None
+        self._shuttle_positions = []
+        self._shuttle_max_move_m = 0.0
 
 
 class FixedCameraMatchPipeline:
@@ -855,7 +1445,14 @@ class FixedCameraMatchPipeline:
         byte_tracker_factory=None,
         lock_match_roster=False,
         roster_stable_frames=2,
+        shuttle_enabled=True,
+        movement_rally_settle_seconds=0.7,
     ):
+        if match_mode not in {"singles", "doubles"}:
+            raise ValueError(
+                "FixedCameraMatchPipeline handles singles/doubles rules; "
+                "use PersonOnlyTracker/PersonOnlyFrameProcessor for analysis_mode=person_only"
+            )
         if tracker_backend not in {"court_association", "bytetrack"}:
             raise ValueError("tracker_backend must be 'court_association' or 'bytetrack'")
         if tracker_backend == "bytetrack" and not enable_bytetrack:
@@ -884,8 +1481,17 @@ class FixedCameraMatchPipeline:
             require_association_keys=tracker_backend == "bytetrack",
         )
         self.shuttle = MonocularShuttleReconstructor()
-        self.rallies = RallyStateMachine(fps=fps)
+        self.rallies = RallyStateMachine(
+            fps=fps,
+            shuttle_enabled=shuttle_enabled,
+            expected_player_count=2 if match_mode == "singles" else 4,
+            settle_window_seconds=movement_rally_settle_seconds,
+        )
         self._last_frame = 0
+        # Contact hysteresis: a single swing keeps the shuttle within the hit
+        # radius for many frames, so one approach must emit at most one hit
+        # candidate until the shuttle leaves the larger release radius.
+        self._hit_contact_frames = {}
 
     def update(self, frame_index, observations, shuttlecock, has_fresh_observations=True):
         self._last_frame = int(frame_index)
@@ -900,7 +1506,7 @@ class FixedCameraMatchPipeline:
             has_fresh_observations=has_fresh_observations,
         )
         shuttle = self._shuttle_record(frame_index, shuttlecock)
-        hit_events = self._detect_hit_events(tracks, shuttle)
+        hit_events = self._detect_hit_events(tracks, shuttle, frame_index)
         rally = self.rallies.update(frame_index, tracks, shuttle, hit_events)
         return {
             "schema_version": SCHEMA_VERSION,
@@ -936,6 +1542,17 @@ class FixedCameraMatchPipeline:
                 "backend": self.tracker_backend,
                 "bytetrack_evaluation_gate": self.tracker_backend == "bytetrack",
             },
+            "rally_policy": {
+                "evidence_mode": "shuttle_measurement" if self.rallies.shuttle_enabled else "player_stability_only",
+                "movement_terminal_rule": (
+                    None if self.rallies.shuttle_enabled else {
+                        "all_expected_players_must_be_fresh_detected": True,
+                        "settle_window_seconds": self.rallies.settle_window_seconds,
+                        "stable_speed_mps": self.rallies.stable_speed_mps,
+                        "score_policy": "movement-only boundaries never produce score or hit evidence",
+                    }
+                ),
+            },
             "match_roster": self.tracker.roster_summary(),
             "player_style_inputs": self.tracker.summaries(),
             "rallies": self.rallies.finalize(self._last_frame),
@@ -964,18 +1581,41 @@ class FixedCameraMatchPipeline:
             bool(shuttlecock.get("detected", False)),
         )
 
-    @staticmethod
-    def _detect_hit_events(tracks, shuttle):
+    HIT_CONTACT_DISTANCE_M = 1.35
+    HIT_RELEASE_DISTANCE_M = 1.75
+    HIT_CONTACT_STALE_FRAMES = 10 * 60
+
+    def _detect_hit_events(self, tracks, shuttle, frame_index):
+        """Emit one candidate per shuttle-approach, not one per sampled frame.
+
+        A fixed camera sees the shuttle inside the hit radius for several
+        consecutive samples during one swing.  Contact hysteresis keeps a single
+        approach as a single candidate: once a track enters the contact radius it
+        is not re-reported until the shuttle leaves the wider release radius.
+        """
+        frame_index = int(frame_index)
+        self._hit_contact_frames = {
+            track_id: last_frame
+            for track_id, last_frame in self._hit_contact_frames.items()
+            if frame_index - int(last_frame) <= self.HIT_CONTACT_STALE_FRAMES
+        }
         if shuttle.get("status") != "approximate" or not tracks:
             return []
         shuttle_xy = shuttle["xyz_m"][:2]
         nearest = min(tracks, key=lambda track: hypot(track["court_xy_m"][0] - shuttle_xy[0], track["court_xy_m"][1] - shuttle_xy[1]))
         distance = hypot(nearest["court_xy_m"][0] - shuttle_xy[0], nearest["court_xy_m"][1] - shuttle_xy[1])
-        if nearest["status"] != "detected" or distance > 1.35:
+        if nearest["status"] != "detected":
             return []
+        track_id = nearest["track_id"]
+        if distance > self.HIT_RELEASE_DISTANCE_M:
+            self._hit_contact_frames.pop(track_id, None)
+            return []
+        if track_id in self._hit_contact_frames or distance > self.HIT_CONTACT_DISTANCE_M:
+            return []
+        self._hit_contact_frames[track_id] = frame_index
         return [{
             "status": "candidate",
-            "hitter_track_id": nearest["track_id"],
+            "hitter_track_id": track_id,
             "confidence": round(min(0.45, shuttle["confidence"] * nearest["confidence"]), 4),
             "reason": "spatial_proximity_only; not score evidence",
         }]

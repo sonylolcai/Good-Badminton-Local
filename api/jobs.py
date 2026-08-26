@@ -464,6 +464,9 @@ class AnalysisJobManager:
             "detections": result.get("detections"),
             "tracknet_raw_csv": result.get("tracknet_raw_csv"),
             "performance_report": result.get("performance_report"),
+            "movement_metrics": result.get("movement_metrics"),
+            "movement_rallies": result.get("movement_rallies"),
+            "movement_rally_window_sweep": result.get("movement_rally_window_sweep"),
             "position_evidence_summary": result.get("position_evidence_summary"),
         }
         trace_path = output_path / "performance_trace.json"

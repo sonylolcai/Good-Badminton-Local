@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -125,6 +126,50 @@ class PlayerGroundPointTests(unittest.TestCase):
         # red last-known point/label, never a human-shaped rectangle.
         np.testing.assert_array_equal(frame[20, 10], np.asarray([0, 255, 0], dtype=np.uint8))
         np.testing.assert_array_equal(frame[20, 70], np.asarray([0, 0, 0], dtype=np.uint8))
+
+    def test_spatial_track_id_is_black_at_the_foot_label(self):
+        frame = np.full((100, 160, 3), (0, 180, 0), dtype=np.uint8)
+        tracks = [{
+            "track_id": "track_001",
+            "image_xy": [30, 60],
+            "status": "detected",
+            "trajectory_image": [],
+            "location_evidence": {"bbox_xyxy": [10, 20, 50, 80]},
+        }]
+
+        PlayerPoseVisualizer._draw_spatial_tracks(frame, tracks)
+
+        # The label is below the foot point, not green like the box.  The
+        # white outline is allowed, but the glyph itself must contain black.
+        foot_label_region = frame[63:82, 35:130]
+        self.assertGreater(np.count_nonzero(np.all(foot_label_region == 0, axis=2)), 0)
+
+    def test_spatial_track_stats_are_used_instead_of_legacy_upper_lower_stats(self):
+        frame = np.zeros((100, 120, 3), dtype=np.uint8)
+        visualizer = PlayerPoseVisualizer(
+            rtmpose_processor=FakePoseProcessor(None, None, []),
+            show_skeletons=False,
+        )
+        stats_visualizer = Mock()
+        tracks = [{
+            "track_id": "track_001",
+            "status": "missing",
+            "image_xy": [30, 60],
+            "location_evidence": {},
+            "motion": {"current_speed_mps": None},
+        }]
+
+        visualizer.draw_players(
+            frame,
+            player_tracker=Mock(),
+            cached_movement_stats={"upper": {"current_speed": 99.0}},
+            stats_visualizer=stats_visualizer,
+            rally_count=None,
+            spatial_tracks=tracks,
+        )
+
+        stats_visualizer.draw_spatial_track_stats.assert_called_once_with(frame, tracks, None)
+        stats_visualizer.draw_player_stats.assert_not_called()
 
 
 if __name__ == "__main__":
