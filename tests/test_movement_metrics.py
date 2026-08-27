@@ -95,13 +95,26 @@ class MovementMetricsTests(unittest.TestCase):
         self.assertNotIn("estimated_kcal_range", energy)
         self.assertEqual(energy["confidence"], "high")
 
-    def test_contiguous_acceleration_samples_are_one_event_per_direction(self):
-        accelerations = [1.6, 2.1, 1.7, 0.2, -1.8, -2.0, -1.6]
+    def test_acceleration_requires_two_metres_inside_half_a_second(self):
+        confirmed_sprint = [
+            {"series_id": 0, "seconds": 0.5, "distance_m": 0.3, "speed_mps": 1.0},
+            {"series_id": 0, "seconds": 0.5, "distance_m": 0.4, "speed_mps": 1.9},
+            {"series_id": 0, "seconds": 0.5, "distance_m": 2.0, "speed_mps": 2.8},
+            {"series_id": 0, "seconds": 0.5, "distance_m": 0.3, "speed_mps": 2.8},
+            {"series_id": 0, "seconds": 0.5, "distance_m": 0.4, "speed_mps": 1.8},
+        ]
+        short_burst = [
+            {"series_id": 0, "seconds": 0.5, "distance_m": 0.2, "speed_mps": 1.0},
+            {"series_id": 0, "seconds": 0.5, "distance_m": 0.2, "speed_mps": 1.9},
+            {"series_id": 0, "seconds": 0.5, "distance_m": 1.9, "speed_mps": 2.8},
+            {"series_id": 0, "seconds": 0.5, "distance_m": 0.2, "speed_mps": 2.8},
+        ]
 
-        acceleration_count, deceleration_count = _acceleration_event_counts(accelerations)
+        acceleration_count, deceleration_count = _acceleration_event_counts(confirmed_sprint)
 
         self.assertEqual(acceleration_count, 1)
         self.assertEqual(deceleration_count, 1)
+        self.assertEqual(_acceleration_event_counts(short_burst)[0], 0)
 
     def test_speed_statistics_use_net_motion_in_half_second_windows(self):
         # The alternating raw steps imitate short localisation jitter.  They
@@ -126,16 +139,13 @@ class MovementMetricsTests(unittest.TestCase):
 
     def test_direction_change_requires_one_metre_on_both_legs_and_has_peak_window(self):
         confirmed_turn_segments = [
-            {"seconds": 0.3, "distance_m": 0.6, "speed_mps": 2.0, "vector": (0.6, 0.0), "end_time_sec": 0.3},
-            {"seconds": 0.3, "distance_m": 0.6, "speed_mps": 2.0, "vector": (0.6, 0.0), "end_time_sec": 0.6},
-            {"seconds": 0.2, "distance_m": 0.4, "speed_mps": 2.0, "vector": (0.0, 0.4), "end_time_sec": 0.8},
-            {"seconds": 0.3, "distance_m": 0.6, "speed_mps": 2.0, "vector": (0.0, 0.6), "end_time_sec": 1.1},
+            {"seconds": 0.5, "distance_m": 1.0, "speed_mps": 2.0, "vector": (1.0, 0.0), "end_time_sec": 0.5},
+            {"seconds": 0.5, "distance_m": 1.0, "speed_mps": 2.0, "vector": (0.0, 1.0), "end_time_sec": 1.0},
         ]
         jitter_only_segments = [
-            {"seconds": 0.3, "distance_m": 0.6, "speed_mps": 2.0, "vector": (0.6, 0.0), "end_time_sec": 0.3},
-            {"seconds": 0.3, "distance_m": 0.6, "speed_mps": 2.0, "vector": (0.6, 0.0), "end_time_sec": 0.6},
-            {"seconds": 0.15, "distance_m": 0.3, "speed_mps": 2.0, "vector": (0.0, 0.3), "end_time_sec": 0.75},
-            {"seconds": 0.15, "distance_m": 0.3, "speed_mps": 2.0, "vector": (0.6, 0.0), "end_time_sec": 0.9},
+            {"seconds": 0.5, "distance_m": 0.9, "speed_mps": 2.0, "vector": (0.9, 0.0), "end_time_sec": 0.5},
+            {"seconds": 0.5, "distance_m": 1.0, "speed_mps": 2.0, "vector": (0.0, 1.0), "end_time_sec": 1.0},
+            {"seconds": 0.6, "distance_m": 1.2, "speed_mps": 2.0, "vector": (1.2, 0.0), "end_time_sec": 1.6},
         ]
 
         events = _direction_change_events(confirmed_turn_segments)

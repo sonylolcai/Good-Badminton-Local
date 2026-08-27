@@ -24,9 +24,12 @@ MAX_PLAUSIBLE_SPEED_MPS = 10.0
 MOVING_SPEED_MPS = 0.25
 HIGH_INTENSITY_SPEED_MPS = 2.0
 ACCELERATION_EVENT_MPS2 = 1.5
+ACCELERATION_SPRINT_MIN_DISTANCE_M = 2.0
+ACCELERATION_SPRINT_WINDOW_SECONDS = 0.5
 SPEED_ACCELERATION_STATISTICS_INTERVAL_SECONDS = 0.5
 TURN_ANGLE_DEGREES = 90.0
 DIRECTION_CHANGE_MIN_LEG_DISTANCE_M = 1.0
+DIRECTION_CHANGE_MAX_LEG_SECONDS = 0.5
 DIRECTION_CHANGE_PEAK_WINDOW_SECONDS = 30.0
 # 2024 Adult Compendium reference values for badminton: social/general 5.5,
 # competitive 7.0, and competitive match play 9.0 MET.  Video-only movement
@@ -35,6 +38,9 @@ DIRECTION_CHANGE_PEAK_WINDOW_SECONDS = 30.0
 BADMINTON_SOCIAL_MET = 5.5
 BADMINTON_COMPETITIVE_MET = 7.0
 BADMINTON_MATCH_PLAY_MET = 9.0
+ABILITY_SCORE_VERSION = "movement-ability-score.v1"
+COURT_WIDTH_M = 6.1
+COURT_LENGTH_M = 13.4
 
 
 def generate_movement_metrics(
@@ -91,10 +97,13 @@ def generate_movement_metrics(
             "moving_speed_mps": MOVING_SPEED_MPS,
             "high_intensity_speed_mps": HIGH_INTENSITY_SPEED_MPS,
             "acceleration_event_mps2": ACCELERATION_EVENT_MPS2,
+            "minimum_acceleration_sprint_distance_m": ACCELERATION_SPRINT_MIN_DISTANCE_M,
+            "acceleration_sprint_window_seconds": ACCELERATION_SPRINT_WINDOW_SECONDS,
             "speed_and_acceleration_statistics_interval_seconds": (
                 SPEED_ACCELERATION_STATISTICS_INTERVAL_SECONDS
             ),
             "turn_angle_degrees": TURN_ANGLE_DEGREES,
+            "direction_change_max_leg_seconds": DIRECTION_CHANGE_MAX_LEG_SECONDS,
             "missing_and_predicted_policy": "excluded from all movement and calorie calculations",
         },
         "match": {
@@ -173,8 +182,7 @@ def _build_player_metrics(track_id, entry, *, fps, source_frames, style, profile
     active_seconds = sum(segment["seconds"] for segment in moving)
     high_intensity_seconds = sum(segment["seconds"] for segment in high)
     mean_speed_mps = _mean(speeds) or 0.0
-    accelerations = _accelerations(statistic_segments)
-    acceleration_event_count, deceleration_event_count = _acceleration_event_counts(accelerations)
+    acceleration_event_count, deceleration_event_count = _acceleration_event_counts(statistic_segments)
     direction_change_events = _direction_change_events(statistic_segments)
     direction_change_count = len(direction_change_events)
     peak_direction_changes_30s = _peak_direction_changes_in_window(
@@ -190,6 +198,19 @@ def _build_player_metrics(track_id, entry, *, fps, source_frames, style, profile
         coverage_ratio=coverage_ratio,
         mean_speed_mps=mean_speed_mps,
         direction_change_count=direction_change_count,
+    )
+    duration_sec = float(source_frames) / float(fps) if fps else 0.0
+    ability_scores = _ability_scores(
+        points=points,
+        statistic_segments=statistic_segments,
+        fps=fps,
+        duration_sec=duration_sec,
+        moving_time_sec=active_seconds,
+        high_intensity_time_sec=high_intensity_seconds,
+        mean_speed_mps=mean_speed_mps,
+        peak_speed_mps=max(speeds) if speeds else 0.0,
+        direction_change_count=direction_change_count,
+        zone_measurements=dict(style.get("zone_frames") or {}),
     )
     return {
         "track_id": track_id,
@@ -213,6 +234,8 @@ def _build_player_metrics(track_id, entry, *, fps, source_frames, style, profile
             "high_intensity_movement_time_sec": round(sum(segment["seconds"] for segment in high), 3),
             "acceleration_event_count": acceleration_event_count,
             "deceleration_event_count": deceleration_event_count,
+            "minimum_acceleration_sprint_distance_m": ACCELERATION_SPRINT_MIN_DISTANCE_M,
+            "acceleration_sprint_window_seconds": ACCELERATION_SPRINT_WINDOW_SECONDS,
             "direction_change_count": direction_change_count,
             "peak_direction_changes_30s": peak_direction_changes_30s,
             "agility_movement": {
@@ -221,6 +244,7 @@ def _build_player_metrics(track_id, entry, *, fps, source_frames, style, profile
                 "peak_window_confirmed_direction_changes": peak_direction_changes_30s,
                 "turn_angle_degrees": TURN_ANGLE_DEGREES,
                 "minimum_distance_each_leg_m": DIRECTION_CHANGE_MIN_LEG_DISTANCE_M,
+                "maximum_seconds_each_leg": DIRECTION_CHANGE_MAX_LEG_SECONDS,
                 "speed_and_acceleration_statistics_interval_seconds": (
                     SPEED_ACCELERATION_STATISTICS_INTERVAL_SECONDS
                 ),
@@ -228,12 +252,199 @@ def _build_player_metrics(track_id, entry, *, fps, source_frames, style, profile
             },
             "zone_measurements": dict(style.get("zone_frames") or {}),
         },
+        "ability_scores": ability_scores,
+        "match_load": _match_load(
+            duration_sec=duration_sec,
+            moving_time_sec=active_seconds,
+            high_intensity_time_sec=high_intensity_seconds,
+            mean_speed_mps=mean_speed_mps,
+            direction_change_count=direction_change_count,
+        ),
         "energy_estimate": energy,
         "quality": {
             "status": "reviewable" if points else "insufficient_measurements",
             "policy": "Only fresh high-confidence detected positions are used; no predicted position or missing gap is converted into movement.",
         },
     }
+
+
+def _ability_scores(
+    *,
+    points,
+    statistic_segments,
+    fps,
+    duration_sec,
+    moving_time_sec,
+    high_intensity_time_sec,
+    mean_speed_mps,
+    peak_speed_mps,
+    direction_change_count,
+    zone_measurements,
+):
+    """Calculate reviewable MVP ability scores from measured movement only."""
+
+    duration = max(0.0, float(duration_sec))
+    active = max(0.0, float(moving_time_sec))
+    high = min(active, max(0.0, float(high_intensity_time_sec)))
+    effective_ratio = active / duration if duration else 0.0
+    coverage_count = len([zone for zone, count in (zone_measurements or {}).items() if count])
+    return {
+        "schema_version": ABILITY_SCORE_VERSION,
+        "endurance": _endurance_score(statistic_segments, duration),
+        "agility": _agility_score(
+            peak_speed_mps=peak_speed_mps,
+            direction_change_count=direction_change_count,
+            moving_time_sec=active,
+        ),
+        "coverage": {
+            "status": "measured",
+            "score": _score(coverage_count / 9.0),
+            "covered_zone_count": coverage_count,
+            "total_zone_count": 9,
+            "formula": "covered_zones / 9",
+        },
+        "returning": _returning_score(points, fps=fps),
+        "effective_running": {
+            "status": "measured" if duration > 0 else "insufficient_measurements",
+            "score": _score(effective_ratio) if duration > 0 else None,
+            "moving_time_sec": round(active, 3),
+            "match_duration_sec": round(duration, 3),
+            "formula": "measured_moving_time_sec / parsed_match_duration_sec",
+        },
+        "evidence": {
+            "mean_speed_mps": _round_or_none(mean_speed_mps),
+            "high_intensity_movement_time_sec": round(high, 3),
+            "direction_change_count": int(direction_change_count),
+        },
+    }
+
+
+def _endurance_score(statistic_segments, duration_sec):
+    duration = max(0.0, float(duration_sec))
+    if duration <= 0:
+        return {"status": "insufficient_measurements", "score": None}
+    first_cutoff = duration / 3.0
+    final_cutoff = duration * 2.0 / 3.0
+    early = [segment["speed_mps"] for segment in statistic_segments if float(segment["end_time_sec"]) <= first_cutoff]
+    late = [segment["speed_mps"] for segment in statistic_segments if float(segment["start_time_sec"]) >= final_cutoff]
+    if len(early) < 3 or len(late) < 3:
+        return {
+            "status": "insufficient_measurements",
+            "score": None,
+            "early_sample_count": len(early),
+            "late_sample_count": len(late),
+            "formula": "first_third_vs_final_third_mean_speed_decline",
+        }
+    early_mean = _mean(early) or 0.0
+    late_mean = _mean(late) or 0.0
+    decline_ratio = max(0.0, (early_mean - late_mean) / early_mean) if early_mean else 0.0
+    return {
+        "status": "measured",
+        "score": max(0, min(100, int(round(100 - decline_ratio * 200)))),
+        "early_mean_speed_mps": _round_or_none(early_mean),
+        "late_mean_speed_mps": _round_or_none(late_mean),
+        "speed_decline_ratio": round(decline_ratio, 4),
+        "formula": "score = clamp(100 - 200 * max(0, early_speed - late_speed) / early_speed)",
+    }
+
+
+def _agility_score(*, peak_speed_mps, direction_change_count, moving_time_sec):
+    active_minutes = max(float(moving_time_sec) / 60.0, 0.25)
+    turns_per_minute = max(0.0, float(direction_change_count)) / active_minutes
+    speed_component = min(1.0, max(0.0, float(peak_speed_mps) / 6.0))
+    turn_component = min(1.0, turns_per_minute / 12.0)
+    return {
+        "status": "measured" if moving_time_sec > 0 else "insufficient_measurements",
+        "score": _score(0.6 * speed_component + 0.4 * turn_component) if moving_time_sec > 0 else None,
+        "peak_speed_mps": _round_or_none(peak_speed_mps),
+        "direction_changes_per_min": round(turns_per_minute, 3),
+        "formula": "0.60 * clamp(peak_speed_mps / 6) + 0.40 * clamp(direction_changes_per_min / 12)",
+    }
+
+
+def _returning_score(points, *, fps):
+    ordered = [point for point in points if point.get("frame") is not None and point.get("court_xy_m")]
+    if len(ordered) < 3:
+        return {"status": "insufficient_measurements", "score": None, "formula": "return_to_midcourt_waiting_zone"}
+    ys = sorted(float(point["court_xy_m"][1]) for point in ordered)
+    median_y = ys[len(ys) // 2]
+    is_lower_half = median_y >= COURT_LENGTH_M / 2.0
+
+    def in_waiting_zone(point):
+        x, y = (float(value) for value in point["court_xy_m"])
+        in_center_width = abs(x - COURT_WIDTH_M / 2.0) <= 1.2
+        if is_lower_half:
+            return in_center_width and COURT_LENGTH_M * 0.57 <= y <= COURT_LENGTH_M * 0.86
+        return in_center_width and COURT_LENGTH_M * 0.14 <= y <= COURT_LENGTH_M * 0.43
+
+    episodes = []
+    was_home = in_waiting_zone(ordered[0])
+    departure_time = None
+    for point in ordered[1:]:
+        time_sec = float(point["frame"])
+        home = in_waiting_zone(point)
+        if was_home and not home:
+            departure_time = time_sec
+        elif departure_time is not None and home:
+            # ``frame`` timestamps are converted below by their observed
+            # sampling period; the caller supplies no synthetic positions.
+            episodes.append((departure_time, time_sec))
+            departure_time = None
+        was_home = home
+    # ``frame`` is the materialized analysis-sample frame index. Its rate is
+    # the configured analysis frequency (10 Hz for the current MVP), not the
+    # original camera frame rate.
+    seconds_per_frame = 1.0 / max(float(fps or 0.0), 1.0)
+    return_times = [
+        (end - start) * seconds_per_frame
+        for start, end in episodes
+        if 0 < (end - start) * seconds_per_frame <= 8.0
+    ]
+    if len(return_times) < 2:
+        return {
+            "status": "insufficient_measurements",
+            "score": None,
+            "return_event_count": len(return_times),
+            "formula": "time_from_leaving_own_midcourt_waiting_zone_to_returning_to_it",
+        }
+    mean_return = _mean(return_times) or 0.0
+    return {
+        "status": "measured",
+        "score": _score((5.0 - mean_return) / 4.0),
+        "mean_return_time_sec": round(mean_return, 3),
+        "return_event_count": len(return_times),
+        "waiting_zone": "own_half_center_band",
+        "formula": "score = clamp((5 - mean_return_time_sec) / 4)",
+    }
+
+
+def _match_load(*, duration_sec, moving_time_sec, high_intensity_time_sec, mean_speed_mps, direction_change_count):
+    duration = max(0.0, float(duration_sec))
+    active = min(duration, max(0.0, float(moving_time_sec)))
+    high = min(active, max(0.0, float(high_intensity_time_sec)))
+    active_ratio = active / duration if duration else 0.0
+    high_ratio = high / duration if duration else 0.0
+    speed_component = min(1.0, max(0.0, float(mean_speed_mps) / 3.0))
+    active_minutes = max(active / 60.0, 0.25)
+    turn_component = min(1.0, max(0.0, float(direction_change_count)) / active_minutes / 12.0)
+    duration_factor = min(1.0, duration / 1800.0)
+    intensity = 0.35 * active_ratio + 0.25 * high_ratio + 0.25 * speed_component + 0.15 * turn_component
+    return {
+        "status": "measured" if duration else "insufficient_measurements",
+        "score": _score(duration_factor * intensity) if duration else None,
+        "duration_factor": round(duration_factor, 4),
+        "components": {
+            "effective_running_ratio": round(active_ratio, 4),
+            "high_intensity_ratio": round(high_ratio, 4),
+            "mean_speed_component": round(speed_component, 4),
+            "direction_change_component": round(turn_component, 4),
+        },
+        "formula": "duration_factor(min(duration/1800,1)) * (0.35*effective_running + 0.25*high_intensity + 0.25*mean_speed + 0.15*direction_change)",
+    }
+
+
+def _score(value):
+    return max(0, min(100, int(round(max(0.0, min(1.0, float(value))) * 100))))
 
 
 def _valid_segments(points, fps):
@@ -347,90 +558,95 @@ def _accelerations(segments):
     return values
 
 
-def _acceleration_event_counts(accelerations):
-    """Merge contiguous threshold samples into one acceleration/deceleration event.
+def _acceleration_event_counts(segments):
+    """Count acceleration runs with a two-metre burst inside a half-second.
 
-    The former implementation counted every adjacent pair above the threshold,
-    which could turn one sustained run-up or braking action into several user
-    visible "events".  A new event starts only after the signal has returned
-    inside the neutral band or crossed into the opposite direction.
+    A high acceleration sample alone is often a pose/court-localisation wobble.
+    The player must sustain the acceleration signal and have at least one
+    qualifying speed window that covers two metres in no more than 0.5 seconds.
+    Deceleration remains in the raw payload for compatibility, but it is not a
+    player-facing card; the UI displays the already confirmed turn count.
     """
     acceleration_count = 0
     deceleration_count = 0
     active_direction = 0
-    for value in accelerations:
+    has_qualifying_sprint_window = False
+    previous = None
+
+    def finish_active():
+        nonlocal acceleration_count, has_qualifying_sprint_window
+        if (
+            active_direction == 1
+            and has_qualifying_sprint_window
+        ):
+            acceleration_count += 1
+        has_qualifying_sprint_window = False
+
+    for current in segments:
+        if previous is None or current.get("series_id") != previous.get("series_id"):
+            finish_active()
+            active_direction = 0
+            previous = current
+            continue
+        seconds = max((float(previous["seconds"]) + float(current["seconds"])) / 2.0, 1e-6)
+        value = (float(current["speed_mps"]) - float(previous["speed_mps"])) / seconds
         if value >= ACCELERATION_EVENT_MPS2:
             direction = 1
         elif value <= -ACCELERATION_EVENT_MPS2:
             direction = -1
         else:
             direction = 0
-        if direction and direction != active_direction:
-            if direction > 0:
-                acceleration_count += 1
-            else:
+        if direction != active_direction:
+            finish_active()
+            if direction < 0:
                 deceleration_count += 1
+            has_qualifying_sprint_window = direction == 1 and _is_qualifying_burst_window(current)
+        elif direction == 1:
+            has_qualifying_sprint_window = (
+                has_qualifying_sprint_window or _is_qualifying_burst_window(current)
+            )
         active_direction = direction
+        previous = current
+    finish_active()
     return acceleration_count, deceleration_count
 
 
 def _direction_change_events(segments):
-    """Confirm substantial direction changes without counting body sway.
-
-    A turn is emitted only after the player has moved at least one metre in
-    the original leg, changed direction by at least 90 degrees, and then
-    travelled one metre in the new leg.  The latter confirmation prevents a
-    short corrective step from becoming a movement-agility event.
-    """
+    """Confirm a sharp turn with one metre on each side within 0.5 seconds."""
     confirmed = []
-    established_leg = None
-    candidate_leg = None
-    current_series_id = object()
-    for segment in segments:
-        if segment.get("series_id") != current_series_id:
-            established_leg = None
-            candidate_leg = None
-            current_series_id = segment.get("series_id")
-        if float(segment.get("speed_mps") or 0.0) < MOVING_SPEED_MPS:
+    for previous, current in zip(segments, segments[1:]):
+        if previous.get("series_id") != current.get("series_id"):
             continue
-        leg = _motion_leg(segment)
-        if leg is None:
+        if not _is_qualifying_turn_leg(previous) or not _is_qualifying_turn_leg(current):
             continue
-        if established_leg is None:
-            established_leg = leg
+        if _angle_degrees(previous["vector"], current["vector"]) < TURN_ANGLE_DEGREES:
             continue
-
-        if candidate_leg is not None:
-            if _angle_degrees(candidate_leg["vector"], leg["vector"]) < TURN_ANGLE_DEGREES:
-                _extend_motion_leg(candidate_leg, leg)
-                if candidate_leg["distance_m"] >= DIRECTION_CHANGE_MIN_LEG_DISTANCE_M:
-                    confirmed.append({
-                        "time_sec": candidate_leg["end_time_sec"],
-                        "from_distance_m": established_leg["distance_m"],
-                        "to_distance_m": candidate_leg["distance_m"],
-                    })
-                    established_leg = candidate_leg
-                    candidate_leg = None
-                continue
-
-            # The new segment did not sustain the candidate direction. If it
-            # aligns with the established path it was a brief sway; otherwise
-            # begin a fresh candidate leg from this new direction.
-            if _angle_degrees(established_leg["vector"], leg["vector"]) < TURN_ANGLE_DEGREES:
-                _extend_motion_leg(established_leg, leg)
-                candidate_leg = None
-            else:
-                candidate_leg = leg
-            continue
-
-        if (
-            established_leg["distance_m"] >= DIRECTION_CHANGE_MIN_LEG_DISTANCE_M
-            and _angle_degrees(established_leg["vector"], leg["vector"]) >= TURN_ANGLE_DEGREES
-        ):
-            candidate_leg = leg
-        else:
-            _extend_motion_leg(established_leg, leg)
+        confirmed.append({
+            "time_sec": float(current.get("end_time_sec") or 0.0),
+            "from_distance_m": float(previous["distance_m"]),
+            "to_distance_m": float(current["distance_m"]),
+            "from_seconds": float(previous["seconds"]),
+            "to_seconds": float(current["seconds"]),
+        })
     return confirmed
+
+
+def _is_qualifying_burst_window(segment):
+    return (
+        float(segment.get("seconds") or 0.0) <= ACCELERATION_SPRINT_WINDOW_SECONDS
+        and float(segment.get("distance_m") or 0.0) >= ACCELERATION_SPRINT_MIN_DISTANCE_M
+    )
+
+
+def _is_qualifying_turn_leg(segment):
+    vector = tuple(float(value) for value in (segment.get("vector") or ()))
+    return (
+        float(segment.get("speed_mps") or 0.0) >= MOVING_SPEED_MPS
+        and float(segment.get("seconds") or 0.0) <= DIRECTION_CHANGE_MAX_LEG_SECONDS
+        and float(segment.get("distance_m") or 0.0) >= DIRECTION_CHANGE_MIN_LEG_DISTANCE_M
+        and len(vector) >= 2
+        and math.hypot(*vector) > 1e-9
+    )
 
 
 def _motion_leg(segment):

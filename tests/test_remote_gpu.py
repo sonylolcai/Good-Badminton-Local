@@ -174,6 +174,58 @@ class RemoteGpuTests(unittest.TestCase):
                 "http://gpu.example:8080/api/v1/stream-sessions/ssn_test/candidate-photos/track_001",
             )
 
+    def test_claimed_track_summary_uses_business_side_body_profile_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = LocalReplayManager(root)
+            task_id = "bstr_test"
+            task_dir = root / task_id
+            task_dir.mkdir()
+            manager._write_task(
+                task_dir,
+                {
+                    "business_task_id": task_id,
+                    "analysis_session_id": "ssn_test",
+                    "result": {
+                        "status": {
+                            "status": "finalized",
+                            "progress": {"processed_source_time_sec": 120},
+                            "track_candidates": [{"track_id": "track_001"}],
+                        },
+                        "business_derivation": {
+                            "materialized_detections_path": "detections.jsonl",
+                            "spatial_summary_path": "spatial.json",
+                            "metadata_path": "metadata.json",
+                            "metrics": {},
+                        },
+                    },
+                },
+            )
+            derived_metrics = {
+                "players": [
+                    {
+                        "track_id": "track_001",
+                        "measurement_coverage": {"usable_measurement_ratio": 0.9},
+                        "movement": {"distance_m": 120.0},
+                        "energy_estimate": {"status": "estimated", "estimated_kcal_rounded": 88},
+                        "quality": {"status": "reviewable"},
+                    }
+                ]
+            }
+            with patch("business_gateway.dev_api.write_body_profiles", return_value="profiles.json") as write_profiles, patch(
+                "business_gateway.dev_api.generate_movement_metrics", return_value=derived_metrics
+            ) as generate_metrics:
+                summary = manager.claim_track(
+                    task_id,
+                    "track_001",
+                    {"heightCm": 175, "weightKg": 70},
+                )
+
+            self.assertEqual(summary["energy_estimate"]["estimated_kcal_rounded"], 88)
+            self.assertEqual(summary["movement"]["distance_m"], 120.0)
+            self.assertEqual(write_profiles.call_args.kwargs["consent"], True)
+            self.assertEqual(Path(generate_metrics.call_args.kwargs["output_dir"]).resolve(), task_dir.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

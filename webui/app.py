@@ -8,7 +8,12 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 
+from runtime_config import load_runtime_environment, webui_listener
+
+load_runtime_environment()
+
 from webui.log_capture import get_backend_logs, install_backend_log_capture
+from webui.operator_backoffice import OPERATOR_BACKOFFICE_CSS, render_backoffice_tabs
 
 install_backend_log_capture()
 
@@ -644,7 +649,7 @@ def run_local_stream_replay(
                 "mode": "local_business_to_gpu_segment_replay",
                 "status": "failed",
                 "error": str(exc),
-                "action": "确认本地业务网关 127.0.0.1:8081 和 GPU API 127.0.0.1:8080 都已启动。",
+                "action": "确认业务网关和 GPU API 已按当前环境变量启动；开发默认业务网关为 127.0.0.1:8080。",
             },
         )
 
@@ -2092,9 +2097,12 @@ def build_ui():
         analysis_ready_state = gr.State(value=False)
 
         with gr.Tabs():
-            analysis_tab = gr.Tab("视频分析")
-            review_tab = gr.Tab("球路复核")
-            history_tab = gr.Tab("分析任务历史")
+            render_backoffice_tabs(_ANALYSIS_TASKS)
+            with gr.Tab("分析工作台"):
+                with gr.Tabs():
+                    analysis_tab = gr.Tab("视频分析")
+                    review_tab = gr.Tab("球路复核")
+                    history_tab = gr.Tab("分析任务历史")
 
         with analysis_tab:
             with gr.Row():
@@ -2812,9 +2820,10 @@ def build_ui():
 if __name__ == "__main__":
     _start_task_reconciliation_worker()
     demo = build_ui()
+    host, port = webui_listener()
     demo.queue(default_concurrency_limit=1).launch(
-        server_name="127.0.0.1",
-        server_port=7861,
+        server_name=host,
+        server_port=port,
         theme=gr.themes.Soft(),
-        css=_APP_CSS,
+        css=_APP_CSS + OPERATOR_BACKOFFICE_CSS,
     )

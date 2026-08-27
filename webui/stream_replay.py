@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from webui.remote_gpu import _load_local_config_file
+from runtime_config import business_api_base_url, load_runtime_environment
 
 
 class StreamReplayError(RuntimeError):
@@ -28,9 +29,10 @@ class StreamReplayError(RuntimeError):
 
 
 def business_stream_config() -> dict[str, Any]:
+    load_runtime_environment()
     _load_local_config_file()
     return {
-        "base_url": os.environ.get("GOOD_BADMINTON_BUSINESS_STREAM_URL", "http://127.0.0.1:8081").rstrip("/"),
+        "base_url": business_api_base_url(),
         "timeout_seconds": float(os.environ.get("GOOD_BADMINTON_BUSINESS_STREAM_TIMEOUT", "30")),
         "poll_seconds": float(os.environ.get("GOOD_BADMINTON_BUSINESS_STREAM_POLL_SECONDS", "1")),
     }

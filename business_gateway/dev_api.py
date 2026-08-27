@@ -30,7 +30,11 @@ from urllib.request import Request, urlopen
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from runtime_config import business_service_listener, load_runtime_environment
+
+from .court_match import CourtMatchManager
 from .fixed_video_catalog import get_fixed_video, list_public_fixed_videos
+from .metrics.movement import generate_movement_metrics, write_body_profiles
 from .streaming.client import StreamSessionClient
 from .streaming.models import DeliveryLedger, StreamClientConfig
 from .streaming.replay import replay_video
@@ -350,6 +354,155 @@ class LocalReplayManager:
         except (URLError, TimeoutError, OSError) as exc:
             raise RuntimeError("GPU candidate photo request failed") from exc
 
+    def claim_track(self, task_id: str, track_id: str, profile: dict[str, Any]) -> dict[str, Any]:
+        """Bind one anonymous track to the local user's body profile.
+
+        This development endpoint is deliberately business-side only. It never
+        forwards age, gender, height, weight, score, or a user identifier to
+        the GPU; it only recomputes the locally derived energy estimate for the
+        claimed anonymous track.
+        """
+
+        task_dir = self.root / task_id
+        task = self._read_task(task_dir)
+        if task is None:
+            raise KeyError(task_id)
+        self._require_known_track(task, track_id)
+        normalized_profile = self._normalize_profile(profile)
+        derivation = ((task.get("result") or {}).get("business_derivation") or {})
+        profiles_path = write_body_profiles(
+            task_dir,
+            [{"track_id": track_id, **normalized_profile}],
+            consent=True,
+        )
+        derivation["body_profiles_path"] = profiles_path
+        task.setdefault("result", {})["business_derivation"] = derivation
+        # This reference is not sent to GPU and lets the dev gateway retain the
+        # latest local claim without persisting a name or WeChat identity.
+        task["claimed_track_id"] = track_id
+        self._write_task(task_dir, task)
+        self._refresh_movement_metrics(task_dir, task)
+        return self.personal_summary(task_id, track_id)
+
+    def personal_summary(self, task_id: str, track_id: str) -> dict[str, Any]:
+        """Return only the real, claimed-track movement evidence for Summary."""
+
+        task_dir = self.root / task_id
+        task = self._read_task(task_dir)
+        if task is None:
+            raise KeyError(task_id)
+        self._require_known_track(task, track_id)
+        derivation = ((task.get("result") or {}).get("business_derivation") or {})
+        metrics = derivation.get("metrics") or {}
+        player = next(
+            (
+                item
+                for item in (metrics.get("players") or [])
+                if isinstance(item, dict) and str(item.get("track_id")) == track_id
+            ),
+            None,
+        )
+        # Completed sessions created before a new business-side metric schema
+        # are refreshed on demand.  This keeps historic demo sessions useful
+        # without asking the GPU to rerun or sending it any profile data.
+        if player is not None and (
+            not isinstance(player.get("ability_scores"), dict)
+            or not isinstance(player.get("match_load"), dict)
+            or float(
+                ((player.get("movement") or {}).get("minimum_acceleration_sprint_distance_m"))
+                or 0.0
+            ) != 2.0
+            or float(
+                ((player.get("movement") or {}).get("acceleration_sprint_window_seconds"))
+                or 0.0
+            ) != 0.5
+            or float(
+                (((player.get("movement") or {}).get("agility_movement") or {}).get(
+                    "maximum_seconds_each_leg"
+                ))
+                or 0.0
+            ) != 0.5
+        ):
+            metrics = self._refresh_movement_metrics(task_dir, task)
+            player = next(
+                (
+                    item
+                    for item in (metrics.get("players") or [])
+                    if isinstance(item, dict) and str(item.get("track_id")) == track_id
+                ),
+                None,
+            )
+        if player is None:
+            raise ValueError("personal summary is not ready; claimed-track metrics are unavailable")
+        terminal = ((task.get("result") or {}).get("status") or {})
+        duration_sec = float(
+            ((terminal.get("progress") or {}).get("processed_source_time_sec")) or 0.0
+        )
+        return {
+            "schema_version": "business-personal-summary.v1",
+            "business_task_id": task_id,
+            "analysis_session_id": task.get("analysis_session_id"),
+            "track_id": track_id,
+            "match": {
+                "duration_sec": round(duration_sec, 3),
+                "analysis_status": terminal.get("status"),
+            },
+            "measurement_coverage": player.get("measurement_coverage") or {},
+            "movement": player.get("movement") or {},
+            "ability_scores": player.get("ability_scores") or {},
+            "match_load": player.get("match_load") or {},
+            "energy_estimate": player.get("energy_estimate") or {},
+            "quality": player.get("quality") or {},
+        }
+
+    def _refresh_movement_metrics(self, task_dir: Path, task: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild business-only metrics from materialized anonymous tracks."""
+
+        derivation = ((task.get("result") or {}).get("business_derivation") or {})
+        required_paths = {
+            key: derivation.get(key)
+            for key in ("materialized_detections_path", "spatial_summary_path", "metadata_path")
+        }
+        if not all(required_paths.values()):
+            raise ValueError("personal summary is not ready; movement derivation is unavailable")
+        metrics = generate_movement_metrics(
+            output_dir=task_dir,
+            detections_path=required_paths["materialized_detections_path"],
+            spatial_summary_path=required_paths["spatial_summary_path"],
+            metadata_path=required_paths["metadata_path"],
+            body_profiles_path=derivation.get("body_profiles_path") or None,
+        )
+        derivation["metrics"] = metrics
+        task.setdefault("result", {})["business_derivation"] = derivation
+        self._write_task(task_dir, task)
+        return metrics
+
+    @staticmethod
+    def _require_known_track(task: dict[str, Any], track_id: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(track_id)):
+            raise ValueError("invalid track_id")
+        terminal = ((task.get("result") or {}).get("status") or task.get("gpu_status") or {})
+        known_tracks = {
+            str(candidate.get("track_id"))
+            for candidate in (terminal.get("track_candidates") or [])
+            if isinstance(candidate, dict) and candidate.get("track_id")
+        }
+        if track_id not in known_tracks:
+            raise ValueError("claimed track is not available for this task")
+
+    @staticmethod
+    def _normalize_profile(profile: dict[str, Any]) -> dict[str, float]:
+        if not isinstance(profile, dict):
+            raise ValueError("profile is required for the energy estimate")
+        try:
+            height_cm = float(profile.get("height_cm", profile.get("heightCm")))
+            weight_kg = float(profile.get("weight_kg", profile.get("weightKg")))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("height_cm and weight_kg are required for the energy estimate") from exc
+        if not 80.0 <= height_cm <= 260.0 or not 20.0 <= weight_kg <= 300.0:
+            raise ValueError("height_cm or weight_kg is outside the supported range")
+        return {"height_cm": height_cm, "weight_kg": weight_kg}
+
     def _run(self, task_id: str) -> None:
         task_dir = self.root / task_id
         task = self._read_task(task_dir)
@@ -484,8 +637,10 @@ class LocalReplayManager:
 def create_app(root: Path | None = None) -> FastAPI:
     root = Path(root or os.environ.get("GOOD_BADMINTON_BUSINESS_DATA_DIR", "outputs/business_stream_replays"))
     manager = LocalReplayManager(root)
+    court_matches = CourtMatchManager(manager)
     app = FastAPI(title="Good-Badminton Local Business Stream Gateway", version="0.1.0")
     app.state.replay_manager = manager
+    app.state.court_match_manager = court_matches
 
     @app.get("/api/v1/health")
     def health():
@@ -501,6 +656,73 @@ def create_app(root: Path | None = None) -> FastAPI:
             return {"items": list_public_fixed_videos()}
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=503, detail=f"fixed video catalogue unavailable: {exc}") from exc
+
+    @app.get("/api/v1/development/courts/{court_id}/active-match")
+    def active_court_match(court_id: str, viewer_id: str = ""):
+        """Read the only waiting/playing match for one court, if present."""
+        return {"match": court_matches.active(court_id, viewer_id)}
+
+    @app.post("/api/v1/development/courts/{court_id}/queue/join")
+    def join_court_match(court_id: str, body: dict = Body(...)):
+        try:
+            return {
+                "match": court_matches.join(
+                    court_id,
+                    str(body.get("actor_id") or ""),
+                    str(body.get("slot_id") or ""),
+                )
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/development/court-matches/{match_id}")
+    def court_match_status(match_id: str, viewer_id: str = ""):
+        try:
+            return {"match": court_matches.status(match_id, viewer_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="court match not found") from exc
+
+    @app.post("/api/v1/development/court-matches/{match_id}/leave")
+    def leave_court_match(match_id: str, body: dict = Body(...)):
+        try:
+            return {"match": court_matches.leave(match_id, str(body.get("actor_id") or ""))}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="court match not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/development/court-matches/{match_id}/start", status_code=202)
+    def start_court_match(match_id: str, body: dict = Body(...)):
+        try:
+            return {
+                "match": court_matches.start(
+                    match_id,
+                    str(body.get("actor_id") or ""),
+                    str(body.get("fixed_video_id") or ""),
+                )
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="court match not found") from exc
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/development/court-matches/{match_id}/end")
+    def end_court_match(match_id: str, body: dict = Body(...)):
+        try:
+            return {"match": court_matches.end(match_id, str(body.get("actor_id") or ""))}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="court match not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/development/court-matches/{match_id}/delivery-window")
+    def begin_match_delivery(match_id: str, body: dict = Body(...)):
+        try:
+            return {"match": court_matches.begin_delivery(match_id, str(body.get("actor_id") or ""))}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="court match not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/development/stream-replays", status_code=202)
     def submit_replay(
@@ -566,6 +788,28 @@ def create_app(root: Path | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="stream replay task not found") from exc
 
+    @app.post("/api/v1/development/stream-replays/{task_id}/claims")
+    def claim_replay_track(task_id: str, body: dict = Body(...)):
+        try:
+            return manager.claim_track(
+                task_id,
+                str(body.get("track_id") or ""),
+                body.get("profile") if isinstance(body.get("profile"), dict) else {},
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="stream replay task not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/development/stream-replays/{task_id}/personal-summary/{track_id}")
+    def replay_personal_summary(task_id: str, track_id: str):
+        try:
+            return manager.personal_summary(task_id, track_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="stream replay task not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/v1/development/stream-replays/{task_id}/candidate-photos/{track_id}")
     def replay_candidate_photo(task_id: str, track_id: str):
         try:
@@ -587,6 +831,7 @@ def create_app(root: Path | None = None) -> FastAPI:
     return app
 
 
+load_runtime_environment()
 _load_local_gpu_env()
 app = create_app()
 
@@ -594,4 +839,5 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("GOOD_BADMINTON_BUSINESS_PORT", "8081")))
+    host, port = business_service_listener()
+    uvicorn.run(app, host=host, port=port)
