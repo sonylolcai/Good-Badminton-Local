@@ -539,6 +539,9 @@ class StreamSessionManager:
                         candidate["candidate_photo"] = {
                             "source_time_sec": float(photo.get("source_time_sec") or source_time),
                             "capture_quality": float(photo.get("capture_quality") or 0.0),
+                            "frontal_score": float(photo.get("frontal_score") or 0.0),
+                            "view_label": str(photo.get("view_label") or "not_assessed"),
+                            "selection_policy": str(photo.get("selection_policy") or "quality_only_v1"),
                             "media_type": "image/jpeg",
                             "fetch_path": (
                                 f"/api/v1/stream-sessions/{session_id}/candidate-photos/{track_id}"
