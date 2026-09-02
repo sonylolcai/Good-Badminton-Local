@@ -27,15 +27,25 @@ def copy_shared_files(target: Path) -> None:
     shutil.copy2(SHARED_CONTRACT, contract_directory / "edge_contract.py")
 
 
-def archive_directory(source: Path, destination: Path) -> None:
+def archive_directory(
+    source: Path,
+    destination: Path,
+    *,
+    archive_root: str | None = None,
+    excluded_top_level: set[str] | None = None,
+) -> None:
     """Atomically replace an archive, preventing stale files from surviving."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
+    excluded_top_level = excluded_top_level or set()
     with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for item in sorted(source.rglob("*")):
+            relative_path = item.relative_to(source)
+            if relative_path.parts and relative_path.parts[0] in excluded_top_level:
+                continue
             if item.is_file():
-                archive.write(item, item.relative_to(source.parent))
+                archive.write(item, Path(archive_root or source.name) / relative_path)
     temporary.replace(destination)
 
 
@@ -48,7 +58,14 @@ def build_linux_package() -> None:
 def build_windows_package() -> None:
     # Windows has platform-specific PowerShell launchers, but uses the same
     # Python relay and signing contract as every other platform.
-    copy_shared_files(REPOSITORY_ROOT / "deploy" / "venue-gateway-windows")
+    distribution = REPOSITORY_ROOT / "deploy" / "venue-gateway-windows"
+    copy_shared_files(distribution)
+    archive_directory(
+        distribution,
+        distribution / "dist" / "good-badminton-venue-gateway-windows.zip",
+        archive_root="good-badminton-venue-gateway-windows",
+        excluded_top_level={"dist", "__pycache__"},
+    )
 
 
 def build_macos_package() -> None:

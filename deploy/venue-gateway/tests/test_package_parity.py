@@ -25,6 +25,13 @@ class PackageParityTests(unittest.TestCase):
         )
         self.assertEqual(
             canonical,
+            archive_member(
+                REPOSITORY_ROOT / "deploy" / "venue-gateway-windows" / "dist" / "good-badminton-venue-gateway-windows.zip",
+                "good-badminton-venue-gateway-windows/agent.py",
+            ),
+        )
+        self.assertEqual(
+            canonical,
             (PACKAGE_ROOT / "dist" / "good-badminton-venue-gateway" / "agent.py").read_bytes(),
         )
         self.assertEqual(
@@ -47,6 +54,13 @@ class PackageParityTests(unittest.TestCase):
         self.assertEqual(
             canonical,
             (REPOSITORY_ROOT / "deploy" / "venue-gateway-windows" / "business_gateway" / "edge_contract.py").read_bytes(),
+        )
+        self.assertEqual(
+            canonical,
+            archive_member(
+                REPOSITORY_ROOT / "deploy" / "venue-gateway-windows" / "dist" / "good-badminton-venue-gateway-windows.zip",
+                "good-badminton-venue-gateway-windows/business_gateway/edge_contract.py",
+            ),
         )
         self.assertEqual(
             canonical,
