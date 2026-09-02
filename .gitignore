@@ -39,6 +39,10 @@ weights/*
 *.pth
 *.onnx
 
+# Local, potentially large training datasets are reproduced from their
+# separately retained source annotations rather than checked into Git.
+datasets/
+
 # OS and editor files
 .DS_Store
 Thumbs.db

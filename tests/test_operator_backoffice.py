@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from webui.operator_backoffice import BackofficeError, BusinessDatabase, OperatorBackoffice, _validate_base_url
-from webui.task_ledger import BusinessTaskLedger
+from operator_api.services.operator_backoffice import BackofficeError, BusinessDatabase, OperatorBackoffice, _validate_base_url
+from operator_api.services.task_ledger import BusinessTaskLedger
 
 
 class _Controller:
@@ -80,7 +80,7 @@ class OperatorBackofficeTests(unittest.TestCase):
             task_id = ledger.start_task(output_dir=temporary, remote_base_url="http://127.0.0.1:9")
             ledger.record_remote_event(task_id, {"phase": "accepted", "job_id": "gpu-job"})
             service = OperatorBackoffice(_Controller(), operations_path=Path(temporary) / "operations.jsonl")
-            with patch("webui.operator_backoffice._json_request", side_effect=BackofficeError("offline")):
+            with patch("operator_api.services.operator_backoffice._json_request", side_effect=BackofficeError("offline")):
                 result = service.cancel_remote_task(task_id)
             self.assertEqual(result["status"], "interrupted_unconfirmed")
             self.assertEqual(BusinessTaskLedger().get(task_id)["status"], "interrupted_unconfirmed")
