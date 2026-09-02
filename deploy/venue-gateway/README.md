@@ -32,3 +32,14 @@ sudo journalctl -u good-badminton-venue-gateway -f
 ```
 
 首次安装前，业务服务器必须把这组真实角点保存并标记为 `validated`；可复制 `deploy/business-server/good_yushi_calibration.sql.template`，替换四组实际像素坐标后导入。程序不会用示例的 `[[0,0],[1,0],[1,1],[0,1]]` 伪造标定。未完成标定时，业务服务器会拒绝开始解析会话，这属于预期保护。
+
+## 维护发布包
+
+`deploy/venue-gateway/agent.py` 和 `business_gateway/edge_contract.py` 是 Linux、Windows 和 macOS 网关唯一的共享运行时源码。修改它们后，在仓库根目录执行：
+
+```bash
+python3 deploy/venue-gateway/build_packages.py
+python3 -m unittest discover -s deploy/venue-gateway/tests -p 'test_package_parity.py'
+```
+
+构建脚本会重新生成 Linux、Windows 和 macOS 的嵌入式代理文件及 ZIP 包；一致性测试会验证三个平台的代理和签名协议字节级相同。平台专属的安装脚本、服务定义和操作说明仍保留在各自目录中。
