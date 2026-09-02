@@ -188,7 +188,7 @@ class EdgeClient:
     ) -> dict[str, Any]:
         path = f"/api/v1/edge/devices/{self.settings.device_id}/heartbeats"
         values: dict[str, Any] = {
-            "agent_version": "venue-gateway/0.2.3",
+            "agent_version": "venue-gateway/0.2.3-windows.6",
             "disk_free_bytes": shutil.disk_usage(self.settings.spool_dir).free,
             "capture_state": capture_state,
             "active_session_id": active_session_id,
