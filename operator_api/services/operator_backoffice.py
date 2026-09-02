@@ -21,6 +21,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 
 from runtime_config import RuntimeConfigurationError, business_api_base_url, load_runtime_environment
@@ -43,6 +44,26 @@ _POST_TYPES = {"official", "match_card", "member_share"}
 _POST_STATUSES = {"published", "hidden"}
 _CLAIM_STATUSES = {"pending", "confirmed", "rejected", "corrected"}
 _DELIVERY_STATUSES = {"pending", "processing", "ready", "failed", "withheld"}
+_CHINA_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _format_china_time(value: Any) -> str:
+    """Format a stored timestamp for a human-facing operator table.
+
+    PostgreSQL ``timestamptz`` values and service contracts remain UTC.  This
+    function is intentionally used only at the Gradio display boundary, so a
+    browser or deployment host in another timezone cannot change what a China
+    venue operator reads.
+    """
+    if value is None or value == "":
+        return ""
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(_CHINA_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _as_text(value: Any) -> str | None:
@@ -449,7 +470,7 @@ class BusinessDatabase:
         for row in rows:
             court_id, court_name, court_code, court_status = row[2:6]
             device_status, camera_status, calibration_status, analysis_status = row[8], row[12], row[14], row[15]
-            heartbeat = row[13] or row[9] or "尚未收到心跳"
+            heartbeat = _format_china_time(row[13] or row[9]) or "尚未收到心跳"
             if court_status != "active":
                 action = "场地不可用：先恢复为可用状态"
             elif device_status != "online" or camera_status != "active":
@@ -607,6 +628,7 @@ class BusinessDatabase:
                    from business.courts c
                    where s.court_id=c.id and c.venue_id=%s and s.court_id=%s
                      and s.status in ('requested', 'receiving', 'relaying', 'processing')
+                     and s.calibration_id is not null
                      and s.id=(select id from business.edge_ingest_sessions
                                where court_id=%s order by updated_at desc limit 1)
                    returning s.id::text as case_id, s.status, s.gpu_analysis_session_id, s.gpu_status,
@@ -617,6 +639,15 @@ class BusinessDatabase:
             )
             row = cursor.fetchone()
         if not row:
+            pending_calibration = self._dict_rows(
+                """select 1 from business.edge_ingest_sessions s join business.courts c on c.id=s.court_id
+                   where s.court_id=%s and c.venue_id=%s
+                     and s.status in ('requested', 'receiving', 'relaying', 'processing')
+                     and s.calibration_id is null limit 1""",
+                (court_id, venue_id),
+            )
+            if pending_calibration:
+                raise BackofficeError("当前是未标定的预览会话。请先根据预览保存并验证四角，再停止预览并重新开始采集。")
             raise BackofficeError("该场地没有可控制的实时 case；请先等待终端创建视频会话。")
         return dict(row)
 
@@ -982,7 +1013,10 @@ class BusinessDatabase:
     def _rows(self, query: str, params: tuple[Any, ...] = ()) -> list[list[str]]:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(query, params)
-            return [["" if value is None else str(value) for value in row.values()] for row in cursor.fetchall()]
+            # `_rows` feeds Gradio tables and JSON detail panels only.  Keep
+            # machine-facing endpoints on `_dict_rows` in UTC, while ensuring
+            # every displayed PostgreSQL datetime is China Standard Time.
+            return [["" if value is None else _format_china_time(value) for value in row.values()] for row in cursor.fetchall()]
 
     def _dict_rows(self, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self._connect() as connection, connection.cursor() as cursor:

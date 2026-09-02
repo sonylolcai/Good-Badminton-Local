@@ -1,9 +1,11 @@
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from operator_api.main import _edge_gateway_base_url, _edge_gateway_internal_url, app
+from operator_api.services.operator_backoffice import _format_china_time
 
 
 class FakeDatabase:
@@ -115,6 +117,11 @@ class OperatorApiTests(unittest.TestCase):
         }, clear=False):
             self.assertEqual(_edge_gateway_base_url(), "https://api.example.com")
             self.assertEqual(_edge_gateway_internal_url(), "http://127.0.0.1:18080")
+
+    def test_operator_display_time_is_china_standard_time_while_storage_stays_utc(self):
+        stored_utc = datetime(2026, 9, 1, 16, 30, 45, tzinfo=timezone.utc)
+        self.assertEqual(_format_china_time(stored_utc), "2026-09-02 00:30:45")
+        self.assertEqual(_format_china_time("2026-09-01 16:30:45+00"), "2026-09-02 00:30:45")
 
 
 if __name__ == "__main__":

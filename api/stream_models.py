@@ -158,7 +158,7 @@ def validate_create_request(body):
     client_reference = body.get("client_reference")
     if client_reference is not None:
         client_reference = _opaque_id(client_reference, "client_reference")
-    configuration = _validate_configuration(body.get("configuration"))
+    configuration = validate_configuration(body.get("configuration"))
     return {
         "schema_version": SCHEMA_VERSION,
         "camera_id": camera_id,
@@ -170,7 +170,13 @@ def validate_create_request(body):
     }
 
 
-def _validate_configuration(configuration):
+def validate_configuration(configuration):
+    """Validate terminal analysis settings independently from calibration.
+
+    A signed terminal may use these settings while requesting a short preview
+    before an operator has saved the court corners.  That preview is never an
+    anonymous or GPU-analysis request.
+    """
     if not isinstance(configuration, dict):
         raise ValueError("configuration must be a JSON object")
     required = {"analysis_sample_hz", "pose_imgsz", "shuttle_detector", "generate_annotated_video"}

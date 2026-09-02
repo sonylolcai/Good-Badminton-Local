@@ -19,7 +19,7 @@ from typing import Any, Protocol
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from api.stream_models import validate_create_request, validate_segment_metadata
+from api.stream_models import validate_configuration, validate_create_request, validate_segment_metadata
 from business_gateway.edge_contract import (
     EDGE_NONCE_HEADER,
     EDGE_PAYLOAD_SHA256_HEADER,
@@ -188,8 +188,6 @@ class PostgresEdgeRepository:
         }
 
     def create_session(self, binding: dict[str, Any], configuration: dict[str, Any]) -> dict[str, Any]:
-        if not binding.get("calibration_id"):
-            raise ValueError("camera has no validated calibration")
         session_id = str(uuid.uuid4())
         with self._connect() as connection, connection.cursor() as cursor:
             try:
@@ -218,7 +216,7 @@ class PostgresEdgeRepository:
                       s.gpu_forwarding_enabled, s.preview_available, s.last_preview_at, s.gpu_event_cursor,
                       cal.court_corners
                from business.edge_ingest_sessions s
-               join business.camera_calibrations cal on cal.id=s.calibration_id
+               left join business.camera_calibrations cal on cal.id=s.calibration_id
                where s.id=%s""",
             (session_id,),
         )
@@ -470,26 +468,37 @@ def create_edge_app(
             binding = authenticate(method="POST", path=f"/api/v1/edge/devices/{device_id}/sessions", device_id=device_id,
                 camera_id=payload["camera_id"], payload=payload, timestamp=x_edge_timestamp, nonce=x_edge_nonce,
                 digest=x_edge_payload_sha256, signature=x_edge_signature)
-            if repository.capture_control(binding).get("mode") == "idle":
+            capture_mode = repository.capture_control(binding).get("mode")
+            if capture_mode == "idle":
                 raise ValueError("business server has not enabled capture for this court")
-            # Validate the exact anonymous GPU configuration before creating a
-            # durable business session.  This avoids accepting a terminal that
-            # would only fail later when its first video segment arrives.
-            normalized_configuration = validate_create_request({
-                "schema_version": "stream-session.v1",
-                "camera_id": binding["camera_id"],
-                "calibration_id": binding["calibration_id"],
-                "court_corners": binding["court_corners"],
-                "analysis_mode": "person_only",
-                "client_reference": f"edge-config-{device_id}",
-                "configuration": payload["configuration"],
-            })["configuration"]
+            if binding.get("calibration_id"):
+                # Validate the exact anonymous GPU configuration before
+                # creating an analysis-ready business session.
+                normalized_configuration = validate_create_request({
+                    "schema_version": "stream-session.v1",
+                    "camera_id": binding["camera_id"],
+                    "calibration_id": binding["calibration_id"],
+                    "court_corners": binding["court_corners"],
+                    "analysis_mode": "person_only",
+                    "client_reference": f"edge-config-{device_id}",
+                    "configuration": payload["configuration"],
+                })["configuration"]
+                ingest_mode = "analysis_ready"
+            else:
+                # A signed terminal can establish a short preview so the
+                # operator can mark the four real image corners. It remains
+                # impossible to relay this session to GPU.
+                if capture_mode != "preview":
+                    raise ValueError("camera has no validated calibration; start preview, save four corners, then start record")
+                normalized_configuration = validate_configuration(payload["configuration"])
+                ingest_mode = "preview_only"
             session = repository.create_session(binding, normalized_configuration)
         except EdgeContractError as exc:
             raise _http_error(422, str(exc)) from exc
         except ValueError as exc:
             raise _http_error(409, str(exc)) from exc
-        return {"status": "accepted", "edge_ingest_session_id": session["id"], "court_id": session["court_id"], "delivery_mode": "business_to_gpu_direct"}
+        return {"status": "accepted", "edge_ingest_session_id": session["id"], "court_id": session["court_id"], "ingest_mode": ingest_mode,
+                "delivery_mode": "preview_only" if ingest_mode == "preview_only" else "business_to_gpu_direct"}
 
     @app.post("/api/v1/edge/sessions/{session_id}/segments/{segment_index}", status_code=202)
     async def upload_segment(
@@ -517,7 +526,7 @@ def create_edge_app(
             segment_metadata = validate_segment_metadata(envelope["segment"])
             if hashlib.sha256(video).hexdigest() != segment_metadata["sha256"] or len(video) != segment_metadata["content_length_bytes"]:
                 raise EdgeContractError("segment bytes do not match metadata")
-            if segment_metadata["court_corners"] != stored["court_corners"]:
+            if stored.get("calibration_id") and segment_metadata["court_corners"] != stored["court_corners"]:
                 raise EdgeContractError("terminal court_corners do not match the server-validated calibration")
             record = repository.receive_segment(stored, segment_metadata)
             if record["status"] == "forwarded":
@@ -529,6 +538,14 @@ def create_edge_app(
             # GPU delivery is controlled per case by an operator.  Video keeps
             # arriving at the business gateway for the live preview while this
             # flag is off; only future segments are forwarded after it is on.
+            if not stored.get("calibration_id"):
+                return {
+                    "status": "preview_available",
+                    "reused": bool(record["reused"]),
+                    "edge_ingest_session_id": session_id,
+                    "gpu_forwarding": "blocked_pending_calibration",
+                    "message": "视频预览已更新；请先在业务后台保存并验证球场四角，才可开启 GPU 推送。",
+                }
             if not bool(stored.get("gpu_forwarding_enabled", True)):
                 return {
                     "status": "preview_available",

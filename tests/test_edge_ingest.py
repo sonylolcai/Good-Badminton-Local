@@ -33,6 +33,7 @@ class FakeRepository:
         self.forwarded = []
         self.heartbeats = []
         self.capture_mode = "preview"
+        self.calibration_id = "804ff390-87e9-497c-aae9-e0a56942e7cf"
 
     def binding(self, device_id, camera_id):
         if device_id != DEVICE_ID or camera_id != CAMERA_ID:
@@ -45,8 +46,8 @@ class FakeRepository:
             "credential_version": "v1",
             "device_status": "offline",
             "camera_status": "offline",
-            "calibration_id": "804ff390-87e9-497c-aae9-e0a56942e7cf",
-            "court_corners": [[0, 0], [1, 0], [1, 1], [0, 1]],
+            "calibration_id": self.calibration_id,
+            "court_corners": [[0, 0], [1, 0], [1, 1], [0, 1]] if self.calibration_id else None,
         }
 
     def claim_nonce(self, device_id, nonce, expires_at):
@@ -239,6 +240,67 @@ class EdgeIngestApiTests(unittest.TestCase):
             preview = self.client.get(f"/api/v1/edge/sessions/{session['id']}/preview/latest.mp4")
             self.assertEqual(preview.status_code, 200, preview.text)
             self.assertEqual(preview.content, video)
+
+    def test_unconfigured_camera_can_preview_but_never_relays_to_gpu(self):
+        self.repository.calibration_id = None
+        with tempfile.TemporaryDirectory() as directory:
+            self.client = TestClient(create_edge_app(
+                self.repository, self.relay, edge_master_key=MASTER_KEY,
+                preview_store=RollingPreviewStore(Path(directory)),
+            ))
+            start_path = f"/api/v1/edge/devices/{DEVICE_ID}/sessions"
+            start = {
+                "schema_version": EDGE_SCHEMA_VERSION, "device_id": DEVICE_ID, "camera_id": CAMERA_ID,
+                "timestamp": "", "nonce": "", "configuration": {
+                    "analysis_sample_hz": 10, "pose_imgsz": 960,
+                    "shuttle_detector": "yolo", "generate_annotated_video": False,
+                },
+            }
+            started = self.client.post(start_path, json=start, headers=self._headers(
+                "POST", start_path, start, "preview_start_nonce_01",
+            ))
+            self.assertEqual(started.status_code, 202, started.text)
+            self.assertEqual(started.json()["ingest_mode"], "preview_only")
+            session_id = started.json()["edge_ingest_session_id"]
+            video = b"uncalibrated-preview-segment"
+            segment = {
+                "schema_version": "stream-session.v1", "segment_index": 0, "source_start_time_sec": 0,
+                "duration_sec": 2, "sha256": hashlib.sha256(video).hexdigest(),
+                "idempotency_key": "preview-only-segment-0001", "content_type": "video/mp4",
+                "content_length_bytes": len(video), "court_corners": [[0, 0], [1, 0], [1, 1], [0, 1]],
+            }
+            envelope = {
+                "schema_version": EDGE_SCHEMA_VERSION, "device_id": DEVICE_ID, "camera_id": CAMERA_ID,
+                "timestamp": "", "nonce": "", "segment": segment,
+            }
+            path = f"/api/v1/edge/sessions/{session_id}/segments/0"
+            headers = self._headers("POST", path, envelope, "preview_segment_nonce01", video)
+            response = self.client.post(
+                path, data={"metadata": __import__("json").dumps(envelope)},
+                files={"segment": ("00000000.mp4", video, "video/mp4")},
+                headers=headers,
+            )
+            self.assertEqual(response.status_code, 202, response.text)
+            self.assertEqual(response.json()["gpu_forwarding"], "blocked_pending_calibration")
+            self.assertEqual(len(self.relay.calls), 0)
+            self.assertEqual(self.client.get(f"/api/v1/edge/sessions/{session_id}/preview/latest.mp4").content, video)
+
+    def test_unconfigured_camera_cannot_start_recording(self):
+        self.repository.calibration_id = None
+        self.repository.capture_mode = "record"
+        path = f"/api/v1/edge/devices/{DEVICE_ID}/sessions"
+        body = {
+            "schema_version": EDGE_SCHEMA_VERSION, "device_id": DEVICE_ID, "camera_id": CAMERA_ID,
+            "timestamp": "", "nonce": "", "configuration": {
+                "analysis_sample_hz": 10, "pose_imgsz": 960,
+                "shuttle_detector": "yolo", "generate_annotated_video": False,
+            },
+        }
+        response = self.client.post(path, json=body, headers=self._headers(
+            "POST", path, body, "record_without_calibration_01",
+        ))
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("no validated calibration", response.json()["detail"]["message"])
 
     def test_signed_completion_records_terminal_gpu_state(self):
         session = self.repository.create_session(self.repository.binding(DEVICE_ID, CAMERA_ID), {"analysis_sample_hz": 10})
