@@ -43,7 +43,9 @@ $requiredExtraFiles = @(
     # `git ls-files` does not list untracked files.
     'badminton_analysis/cancellation.py',
     'badminton_analysis/visualization/spatial_player_positions.py',
-    'webui/task_control.py',
+    # The asynchronous GPU job worker imports this pipeline directly. Keep it
+    # explicit so a healthy API cannot be packaged without its analysis entry.
+    'webui/pipeline.py',
     'evaluation/shuttle_tracknet_ab/fast_predict_tracknet_v3.py',
     'evaluation/shuttle_tracknet_ab/run_tracknet_v3.py',
     # The performance gate is intentionally dependency-free and is run after
@@ -51,7 +53,11 @@ $requiredExtraFiles = @(
     'evaluation/performance/__init__.py',
     'evaluation/performance/performance_gate.py',
     'evaluation/performance/rtx_3090_production_v1.json',
-    'evaluation/performance/README.md'
+    'evaluation/performance/README.md',
+    # Local continuity-test instructions are intentionally shipped with the
+    # source archive so the GPU and business operators use one session/order
+    # contract when validating a new deployment.
+    'docs/STREAM_CONTINUITY_TEST.md'
 )
 
 $trackNetABFiles = @(
@@ -119,6 +125,7 @@ try {
         'badminton_analysis/',
         'business_gateway/',
         'good_badminton_contracts/',
+        'webui/',
         'evaluation/performance/'
     )
     $untrackedFiles = & git -C $repoRoot ls-files --others --exclude-standard
@@ -142,8 +149,9 @@ try {
 
     $apiEntry = Join-Path $packageRoot 'api/app.py'
     $launcher = Join-Path $packageRoot 'deploy/start_gpu_api_container.sh'
-    if (-not (Test-Path -LiteralPath $apiEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
-        throw 'Package validation failed: api/app.py or the API launcher is missing.'
+    $analysisPipeline = Join-Path $packageRoot 'webui/pipeline.py'
+    if (-not (Test-Path -LiteralPath $apiEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or -not (Test-Path -LiteralPath $analysisPipeline -PathType Leaf)) {
+        throw 'Package validation failed: api/app.py, the API launcher, or webui/pipeline.py is missing.'
     }
 
     $absoluteOutputPath = [System.IO.Path]::GetFullPath($OutputPath)
