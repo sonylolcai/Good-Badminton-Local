@@ -153,11 +153,82 @@ class PersonOnlyTracker:
         )
         self._last_frame_index = frame_index
         self._last_source_time_sec = source_time_sec
-        return self._public_snapshot(
+        snapshot = self._public_snapshot(
             tracks,
             update_quality=True,
             source_time_sec=source_time_sec,
         )
+        snapshot["roster_review_candidates"] = self._roster_review_candidates(
+            normalized,
+            snapshot,
+        )
+        return snapshot
+
+    def _roster_review_candidates(self, observations, snapshot):
+        """Expose real pre-lock poses without treating them as players.
+
+        A direct four-person stream may correctly refuse an unstable roster.
+        Returning an empty result hid the evidence needed to diagnose that
+        decision.  These records deliberately use a separate event type and
+        are excluded from movement analytics and person identity claims.
+        """
+        roster = (snapshot.get("tracking") or {}).get("roster") or {}
+        if (
+            not self.lock_match_roster
+            or roster.get("status") == "locked"
+            or not roster.get("expected_player_count")
+        ):
+            return []
+        output = []
+        for index, observation in enumerate(observations):
+            court_xy = observation.get("court_xy")
+            if court_xy is None or not self.court_space.contains(court_xy, margin_m=0.35):
+                continue
+            association_key = str(observation.get("association_key") or "")
+            safe_key = "".join(
+                character if character.isalnum() or character in "_-" else "_"
+                for character in association_key
+            )
+            candidate_id = (
+                f"candidate_{safe_key}"
+                if safe_key
+                else f"candidate_frame_{self._last_frame_index}_{index + 1}"
+            )
+            keypoints = deepcopy(observation.get("keypoints_image"))
+            keypoint_scores = deepcopy(observation.get("keypoint_scores"))
+            output.append(
+                {
+                    "track_id": candidate_id,
+                    "status": "detected",
+                    "confidence": max(0.0, min(1.0, float(observation.get("confidence") or 0.0))),
+                    "court_xy_m": [float(court_xy[0]), float(court_xy[1])],
+                    "image_xy": deepcopy(observation.get("image_xy")),
+                    "lifecycle_state": "unconfirmed_roster",
+                    "identity_status": "unconfirmed_roster",
+                    "analytics_eligible": False,
+                    "association": {
+                        "key": association_key or None,
+                        "source": "roster_review_candidate",
+                        "identity_confidence": 0.0,
+                    },
+                    "location_evidence": {
+                        "method": observation.get("location_method"),
+                        "confidence": observation.get("location_confidence"),
+                        "source": observation.get("source"),
+                        "bbox_xyxy": deepcopy(observation.get("bbox_xyxy")),
+                        "hands_image": deepcopy(observation.get("hands_image")),
+                    },
+                    "pose": {
+                        "format": "coco17_image_v1",
+                        "coordinate_system": "full_source_image_pixels",
+                        "is_current_measurement": True,
+                        "keypoints_image": keypoints,
+                        "keypoint_scores": keypoint_scores,
+                    },
+                    "review_reason": "expected_roster_not_yet_stable",
+                }
+            )
+        return output
 
     def finalize(self) -> dict:
         """Close all remaining anonymous candidates and return audit metrics."""
@@ -515,6 +586,25 @@ class PersonOnlyFrameProcessor:
             has_fresh_observations=has_fresh_observations,
         )
         events = []
+        for raw_candidate in snapshot.get("roster_review_candidates") or []:
+            candidate = deepcopy(raw_candidate)
+            candidate["source_frame_index"] = int(context.source_frame_index)
+            candidate["measurement_bucket"] = int(context.measurement_bucket)
+            events.append(
+                ProcessorEvent(
+                    event_type="roster_candidate_observation",
+                    evidence_state="detected",
+                    confidence=float(candidate.get("confidence") or 0.0),
+                    data={
+                        "analysis_mode": "person_only",
+                        "track": candidate,
+                        "tracking": {
+                            "backend": snapshot["tracking"]["backend"],
+                            "roster": deepcopy(snapshot["tracking"]["roster"]),
+                        },
+                    },
+                )
+            )
         for raw_track in snapshot["tracks"]:
             track = deepcopy(raw_track)
             track["source_frame_index"] = int(context.source_frame_index)

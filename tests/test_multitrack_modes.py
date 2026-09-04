@@ -191,6 +191,70 @@ class MultiTrackModeTests(unittest.TestCase):
             {"bytetrack_17", "bytetrack_18"},
         )
 
+    def test_locked_bytetrack_roster_does_not_relabel_a_new_key_by_court_position(self):
+        """A changed ByteTrack key is review evidence, not a replacement player.
+
+        The fixed roster previously fell through to court-distance matching
+        after a key change.  That lets an ROI duplicate overwrite another
+        player's slot when the two boxes happen to be near the same court
+        position.
+        """
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS),
+            fps=10,
+            match_mode="person_only",
+            lock_match_roster=True,
+            expected_roster_count=2,
+            max_roster_count=2,
+            roster_stable_frames=1,
+            roster_discovery_seconds=0.0,
+            require_association_keys=True,
+        )
+        first = tracker.update(
+            1,
+            [self._observation((2.0, 2.0), "bytetrack_a"), self._observation((4.0, 11.0), "bytetrack_b")],
+        )
+        first_roster = tracker.roster_summary()
+        locked = tracker.update(
+            2,
+            [self._observation((2.1, 2.0), "bytetrack_a"), self._observation((4.0, 10.9), "bytetrack_b")],
+        )
+        locked_roster = tracker.roster_summary()
+        replaced = tracker.update(
+            3,
+            [self._observation((2.2, 2.0), "bytetrack_x"), self._observation((4.0, 10.8), "bytetrack_y")],
+        )
+
+        self.assertEqual(first_roster["status"], "bootstrapping")
+        self.assertEqual(locked_roster["status"], "locked")
+        self.assertEqual({item["status"] for item in replaced}, {"predicted"})
+        self.assertEqual(tracker.roster_summary()["unassigned_observation_count"], 2)
+
+    def test_expected_bytetrack_roster_restarts_discovery_when_key_set_changes(self):
+        """Four transient tracker fragments cannot consume the full lock window."""
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS),
+            fps=10,
+            match_mode="person_only",
+            lock_match_roster=True,
+            expected_roster_count=4,
+            max_roster_count=4,
+            roster_stable_frames=1,
+            roster_discovery_seconds=1.0,
+            require_association_keys=True,
+        )
+        first_keys = ["bytetrack_a", "bytetrack_b", "bytetrack_c", "bytetrack_d"]
+        replacement_keys = ["bytetrack_a", "bytetrack_b", "bytetrack_c", "bytetrack_e"]
+        positions = [(1.0, 1.0), (4.8, 1.1), (1.1, 12.0), (4.9, 11.9)]
+
+        tracker.update(1, [self._observation(position, key) for position, key in zip(positions, first_keys)])
+        tracker.update(2, [self._observation(position, key) for position, key in zip(positions, replacement_keys)])
+        tracker.update(11, [self._observation(position, key) for position, key in zip(positions, replacement_keys)])
+        self.assertEqual(tracker.roster_summary()["status"], "bootstrapping")
+
+        tracker.update(12, [self._observation(position, key) for position, key in zip(positions, replacement_keys)])
+        self.assertEqual(tracker.roster_summary()["status"], "locked")
+
     def test_roster_bootstrap_ignores_frames_without_a_fresh_pose_measurement(self):
         """Sampling gaps must not be mistaken for a zero-person detection.
 

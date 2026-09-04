@@ -441,6 +441,7 @@
           "type": "string",
           "enum": [
             "person_observation",
+            "roster_candidate_observation",
             "shuttle_observation",
             "interaction_candidate",
             "session_status",

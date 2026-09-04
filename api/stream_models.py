@@ -37,7 +37,7 @@ EVIDENCE_STATES = {
     "detected", "predicted", "missing", "derived", "candidate", "finalized",
 }
 EVENT_TYPES = {
-    "person_observation", "shuttle_observation", "interaction_candidate",
+    "person_observation", "roster_candidate_observation", "shuttle_observation", "interaction_candidate",
     "session_status", "session_finalized",
 }
 PROCESSING_DISPOSITIONS = {

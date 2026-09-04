@@ -8,16 +8,48 @@ from badminton_analysis.cancellation import AnalysisCancelled
 from webui.pipeline import run_analysis
 from webui.remote_gpu import (
     RemoteAnalysisError,
+    _candidate_photo_records_from_events,
     _load_local_config_file,
     _multipart_length,
     _remote_options,
     _submit_multipart,
     remote_gpu_config,
+    stream_roster_configuration,
 )
 from business_gateway.dev_api import LocalReplayManager
 
 
 class RemoteGpuTests(unittest.TestCase):
+    def test_stream_photo_metadata_is_restored_from_events_when_terminal_is_compact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_path = Path(temp_dir) / "stream_events.jsonl"
+            event_path.write_text(
+                '{"data":{"track":{"track_id":"track_001"},"candidate_photo":{"track_id":"track_001","selection_score":0.4,"view_label":"side_or_back"}}}\n'
+                '{"data":{"track":{"track_id":"track_001"},"candidate_photo":{"track_id":"track_001","selection_score":0.8,"view_label":"front"}}}\n',
+                encoding="utf-8",
+            )
+            records = _candidate_photo_records_from_events(
+                {"track_candidates": [{"track_id": "track_001", "state": "closed"}]},
+                event_path,
+            )
+
+        self.assertEqual(records[0]["candidate_photo"]["view_label"], "front")
+
+    def test_two_or_four_player_roster_is_locked_for_direct_streams(self):
+        self.assertEqual(
+            stream_roster_configuration(2),
+            {
+                "lock_match_roster": True,
+                "expected_player_count": 2,
+                "roster_stable_frames": 3,
+                "max_roster_count": 2,
+                "roster_discovery_seconds": 8.0,
+            },
+        )
+        self.assertEqual(stream_roster_configuration(4)["max_roster_count"], 4)
+        with self.assertRaisesRegex(RemoteAnalysisError, "2 人或 4 人"):
+            stream_roster_configuration(3)
+
     def test_cancelled_local_pipeline_exits_before_loading_models(self):
         with self.assertRaises(AnalysisCancelled):
             run_analysis(

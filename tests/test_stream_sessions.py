@@ -123,6 +123,34 @@ class StreamSessionManagerTests(unittest.TestCase):
         self.assertTrue(configuration["lock_match_roster"])
         self.assertEqual(configuration["roster_stable_frames"], 3)
 
+    def test_status_projects_unconfirmed_roster_candidate_for_webui_review(self):
+        _, created = self._create("business-stream-roster-review")
+        session_id = created["analysis_session_id"]
+        session = self.manager._load(session_id)
+        self.manager._append_event(
+            session,
+            "roster_candidate_observation",
+            1.25,
+            0,
+            0.88,
+            "detected",
+            {
+                "track": {
+                    "track_id": "candidate_bytetrack_12",
+                    "confidence": 0.88,
+                    "analytics_eligible": False,
+                }
+            },
+        )
+        self.manager._save(session)
+
+        _, status = self.manager.get_status(session_id)
+        candidate = status["track_candidates"][0]
+        self.assertEqual(candidate["track_id"], "candidate_bytetrack_12")
+        self.assertEqual(candidate["state"], "unconfirmed_roster")
+        self.assertFalse(candidate["analytics_eligible"])
+        self.assertIsNone(candidate["detected_coverage"])
+
     def test_default_segment_timeout_is_ten_seconds(self):
         """Two-second stream fragments may not block the GPU queue indefinitely."""
         with patch.dict("os.environ", {}, clear=False):

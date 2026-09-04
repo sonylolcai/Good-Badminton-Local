@@ -10,6 +10,7 @@ import http.client
 import json
 import mimetypes
 import os
+import re
 import ssl
 import time
 import uuid
@@ -18,6 +19,9 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from badminton_analysis.cancellation import AnalysisCancelled, raise_if_cancelled
+from business_gateway.streaming.client import StreamAPIError, StreamSessionClient
+from business_gateway.streaming.models import DeliveryLedger, SegmentMetadata, StreamClientConfig
+from business_gateway.streaming.segmenter import GrowingVideoSegmenter
 
 
 DEFAULT_GPU_API_URL = "http://xn-g.suanjiayun.com:52028"
@@ -141,6 +145,340 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
     return downloaded
 
 
+def stream_roster_configuration(expected_player_count):
+    """Return the fixed anonymous roster policy for one continuous match.
+
+    Track IDs are runtime implementation details, not the number of people in
+    a court video.  A badminton match contains either two or four players, so
+    direct stream sessions must lock that roster once enough stable on-court
+    evidence has been collected.  The running session retains tracker state
+    across its contiguous two-second segments; separate matches get separate
+    sessions and never inherit an anonymous ID by accident.
+    """
+    if expected_player_count not in {2, 4}:
+        raise RemoteAnalysisError("场上人数只能选择 2 人或 4 人")
+    return {
+        "lock_match_roster": True,
+        "expected_player_count": expected_player_count,
+        "roster_stable_frames": 3,
+        "max_roster_count": expected_player_count,
+        "roster_discovery_seconds": 8.0,
+    }
+
+
+def iter_remote_two_second_stream(video_path, corners, options, output_dir, gpu_base_url=None):
+    """Send independently decodable two-second MP4 fragments directly to GPU.
+
+    This is intentionally separate from :mod:`webui.stream_replay`: that
+    legacy development workflow posts the source file to a local business
+    gateway first.  Here the WebUI reads only its server-side GPU credentials,
+    creates a remote ``stream-session.v1`` session at *gpu_base_url*, then
+    uploads the fragments to that same remote origin.
+    """
+
+    source = Path(video_path)
+    if not source.is_file():
+        raise RemoteAnalysisError("请先上传可读取的视频文件")
+    if not corners or len(corners) != 4:
+        raise RemoteAnalysisError("请先确认四个球场角点")
+    config = remote_gpu_config(gpu_base_url)
+    if not config["api_key"]:
+        raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured in the WebUI process")
+
+    target = Path(output_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    client = StreamSessionClient(
+        StreamClientConfig(
+            base_url=config["base_url"],
+            api_key=config["api_key"],
+            timeout_seconds=config["timeout_seconds"],
+        ),
+        DeliveryLedger(target / "delivery-ledger.json"),
+    )
+    request_id = f"webui-stream-{uuid.uuid4().hex}"
+    normalized_corners = [[float(x), float(y)] for x, y in corners]
+    far_roi = options.get("far_pose_roi")
+    stream_configuration = {
+        "analysis_sample_hz": int(options["analysis_sample_hz"]),
+        "pose_imgsz": int(options["pose_imgsz"]),
+        "shuttle_detector": str(options["shuttle_detector"]),
+        # The deployed stream contract produces structured events, not an
+        # annotated MP4.  Never ask the server for an unsupported export.
+        "generate_annotated_video": False,
+        "preserve_audio": False,
+        "court_health_check_hz": 2,
+        "tracker_backend": str(options["tracker_backend"]),
+        "far_player_enhancement": bool(options.get("far_player_enhancement", False)),
+    }
+    stream_configuration.update(
+        stream_roster_configuration(int(options["expected_player_count"]))
+    )
+    if far_roi is not None:
+        stream_configuration["far_pose_roi"] = [float(value) for value in far_roi]
+    create_request = {
+        "schema_version": "stream-session.v1",
+        "camera_id": "webui-development-camera",
+        "calibration_id": f"webui-calibration-{request_id[-12:]}",
+        "court_corners": normalized_corners,
+        "analysis_mode": "person_only",
+        "client_reference": request_id,
+        "configuration": stream_configuration,
+    }
+    try:
+        created = client.create_session(create_request, idempotency_key=request_id)
+        session_id = str(created["analysis_session_id"])
+        yield {
+            "mode": "remote_gpu_two_second_stream",
+            "phase": "session_accepted",
+            "analysis_session_id": session_id,
+            "remote_base_url": config["base_url"],
+            "segment_seconds": 2.0,
+        }
+        segmenter = GrowingVideoSegmenter(
+            target / "segments",
+            segment_duration_sec=2.0,
+            # Re-encoding forces an aligned keyframe at each boundary, so a
+            # complete-file upload cannot silently become one long fragment.
+            encoding_mode="h264",
+            preserve_audio=False,
+        )
+        last_index = -1
+        for artifact in segmenter.iter_input(str(source), overwrite=True):
+            metadata = SegmentMetadata.from_file(
+                artifact.path,
+                segment_index=artifact.segment_index,
+                source_start_time_sec=artifact.source_start_time_sec,
+                duration_sec=artifact.duration_sec,
+                idempotency_prefix=request_id,
+                content_type=artifact.content_type,
+                court_corners=normalized_corners,
+            )
+            receipt = client.submit_segment(artifact.path, metadata)
+            last_index = artifact.segment_index
+            yield {
+                "mode": "remote_gpu_two_second_stream",
+                "phase": "segment_accepted",
+                "analysis_session_id": session_id,
+                "remote_base_url": config["base_url"],
+                "segment_index": artifact.segment_index,
+                "source_start_time_sec": artifact.source_start_time_sec,
+                "duration_sec": artifact.duration_sec,
+                "receipt": receipt.get("receipt"),
+            }
+        if last_index < 0:
+            raise RemoteAnalysisError("未生成可上传的 2 秒视频片段")
+        completion = client.complete(last_index, allow_partial=False)
+        yield {
+            "mode": "remote_gpu_two_second_stream",
+            "phase": "session_sealed",
+            "analysis_session_id": session_id,
+            "remote_base_url": config["base_url"],
+            "expected_last_segment_index": last_index,
+            "completion": completion,
+        }
+        terminal = client.wait_for_terminal(
+            poll_interval_seconds=config["poll_seconds"],
+            timeout_seconds=float(os.environ.get("GOOD_BADMINTON_STREAM_JOB_TIMEOUT", "43200")),
+        )
+        # A stream session returns lightweight terminal status only.  Materialise
+        # its immutable events on the WebUI host so the same per-track movement
+        # evidence shown for a full-video upload is available immediately here.
+        # Candidate crops are fetched server-side and saved locally: the browser
+        # never receives the GPU API key or a credential-bearing URL.
+        terminal["webui_result"] = _materialize_stream_webui_result(
+            client, config, target, terminal,
+        )
+        trace_path = target / "stream_trace.json"
+        try:
+            trace_path.write_text(
+                json.dumps(client.get_trace(), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except StreamAPIError:
+            trace_path = None
+        yield {
+            "mode": "remote_gpu_two_second_stream",
+            "phase": terminal.get("status") or "unknown",
+            "analysis_session_id": session_id,
+            "remote_base_url": config["base_url"],
+            "expected_last_segment_index": last_index,
+            "stream_status": terminal,
+            "trace_path": str(trace_path) if trace_path else None,
+        }
+    except (StreamAPIError, OSError, RuntimeError, ValueError) as exc:
+        raise RemoteAnalysisError(f"远端 GPU 的 2 秒分片推送失败：{exc}") from exc
+
+
+def recover_remote_two_second_stream(analysis_session_id, output_dir, gpu_base_url=None):
+    """Recover a completed direct-GPU session without uploading video again.
+
+    A browser refresh loses Gradio's in-memory result values, but the local
+    delivery ledger and the GPU's immutable stream events remain available.
+    This read-only recovery regenerates the WebUI evidence files (metrics and
+    downloaded anonymous candidate crops) in the original session directory.
+    """
+
+    session_id = str(analysis_session_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        raise RemoteAnalysisError("流会话 ID 格式无效")
+    target = Path(output_dir)
+    ledger_path = target / "delivery-ledger.json"
+    if not ledger_path.is_file():
+        raise RemoteAnalysisError("本机未找到该流会话的上传台账，无法安全恢复结果")
+    config = remote_gpu_config(gpu_base_url)
+    if not config["api_key"]:
+        raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured in the WebUI process")
+    ledger = DeliveryLedger(ledger_path)
+    if ledger.analysis_session_id != session_id:
+        raise RemoteAnalysisError("会话 ID 与本机上传台账不匹配")
+    client = StreamSessionClient(
+        StreamClientConfig(
+            base_url=config["base_url"],
+            api_key=config["api_key"],
+            timeout_seconds=config["timeout_seconds"],
+        ),
+        ledger,
+    )
+    terminal = client.get_status()
+    if str(terminal.get("analysis_session_id") or "") != session_id:
+        raise RemoteAnalysisError("GPU 返回的会话 ID 与请求不匹配")
+    terminal["webui_result"] = _materialize_stream_webui_result(
+        client, config, target, terminal,
+    )
+    terminal["display_source"] = "loaded_existing_remote_gpu_stream"
+    return terminal
+
+
+def _materialize_stream_webui_result(client, config, target, terminal):
+    """Create browser-ready evidence files from an immutable stream session."""
+
+    try:
+        from business_gateway.streaming.derivation import derive_stream_movement_metrics
+
+        derivation = derive_stream_movement_metrics(
+            target,
+            client=client,
+            terminal_status=terminal,
+            create_request=(client.ledger.snapshot().get("create") or {}).get("request") or {},
+        )
+        movement_metrics_path = derivation.get("movement_metrics_path")
+    except (OSError, RuntimeError, StreamAPIError, ValueError) as exc:
+        derivation = {"status": "failed", "reason": str(exc)}
+        movement_metrics_path = None
+    photos = _download_stream_candidate_photos(
+        config,
+        terminal,
+        target,
+        candidate_records=_candidate_photo_records_from_events(
+            terminal,
+            derivation.get("raw_events_path") if isinstance(derivation, dict) else None,
+        ),
+    )
+    return {
+        "analysis_output_dir": str(target),
+        "movement_metrics_path": movement_metrics_path,
+        "derivation": derivation,
+        "candidate_photos": photos,
+    }
+
+
+def _download_stream_candidate_photos(config, terminal_status, output_dir, *, candidate_records=None):
+    """Fetch known anonymous candidate crops into the local result directory.
+
+    Only IDs present in the completed status are requested.  The restrictive
+    identifier pattern and fixed API path prevent a remote status payload from
+    becoming an arbitrary URL fetch.  A missing crop is a normal evidence
+    limitation, never a reason to hide the remaining player data.
+    """
+
+    target = Path(output_dir) / "candidate_photos"
+    output = []
+    session_id = str((terminal_status or {}).get("analysis_session_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        return output
+    candidates = candidate_records or (terminal_status or {}).get("track_candidates") or []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        track_id = str(candidate.get("track_id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", track_id):
+            continue
+        photo = candidate.get("candidate_photo") or {}
+        record = {
+            "track_id": track_id,
+            "source_time_sec": photo.get("source_time_sec"),
+            "capture_quality": photo.get("capture_quality"),
+            "frontal_score": photo.get("frontal_score"),
+            "view_label": photo.get("view_label"),
+            "selection_policy": photo.get("selection_policy"),
+            "status": "not_available",
+        }
+        if not photo:
+            output.append(record)
+            continue
+        request = Request(
+            f"{config['base_url']}/api/v1/stream-sessions/{session_id}/candidate-photos/{track_id}",
+            headers={"X-API-Key": config["api_key"]},
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=config["timeout_seconds"]) as response:
+                content_type = response.headers.get_content_type() or ""
+                declared_size = int(response.headers.get("Content-Length") or 0)
+                if content_type != "image/jpeg" or declared_size > 10 * 1024 * 1024:
+                    raise ValueError("candidate photo response is not an acceptable JPEG")
+                payload = response.read(10 * 1024 * 1024 + 1)
+            if not payload or len(payload) > 10 * 1024 * 1024:
+                raise ValueError("candidate photo exceeds the local size limit")
+            target.mkdir(parents=True, exist_ok=True)
+            destination = target / f"{track_id}.jpg"
+            temporary = destination.with_suffix(".jpg.tmp")
+            temporary.write_bytes(payload)
+            os.replace(temporary, destination)
+            record.update({"status": "downloaded", "path": str(destination)})
+        except (OSError, ValueError, TimeoutError):
+            record["status"] = "unavailable"
+        output.append(record)
+    return output
+
+
+def _candidate_photo_records_from_events(terminal_status, raw_events_path):
+    """Restore photo metadata omitted from compact terminal status responses.
+
+    The session's final status intentionally stays small.  Earlier immutable
+    ``person_observation`` events retain the candidate-photo selection data,
+    which has already been downloaded locally by the movement derivation.
+    """
+
+    candidates = {
+        str(item.get("track_id")): dict(item)
+        for item in (terminal_status or {}).get("track_candidates") or []
+        if isinstance(item, dict) and item.get("track_id")
+    }
+    path = Path(raw_events_path) if raw_events_path else None
+    if not path or not path.is_file():
+        return list(candidates.values())
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            for raw in source:
+                event = json.loads(raw)
+                data = event.get("data") or {}
+                track = data.get("track") or {}
+                track_id = str(track.get("track_id") or "")
+                photo = data.get("candidate_photo")
+                if not track_id or not isinstance(photo, dict):
+                    continue
+                candidate = candidates.setdefault(track_id, {"track_id": track_id})
+                current = candidate.get("candidate_photo") or {}
+                current_score = float(current.get("selection_score") or -1.0)
+                incoming_score = float(photo.get("selection_score") or photo.get("capture_quality") or 0.0)
+                if incoming_score >= current_score:
+                    candidate["candidate_photo"] = dict(photo)
+    except (OSError, ValueError, TypeError):
+        pass
+    return [candidates[track_id] for track_id in sorted(candidates)]
+
+
 def _remote_options(options):
     # GPU API intentionally rejects arbitrary model paths; it owns the pinned
     # deployed model artifacts.  Everything else is part of the public contract.
@@ -200,11 +538,11 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
         raise RemoteAnalysisError(
             "远端 GPU 上传在 "
             f"{config['timeout_seconds']:g} 秒内未收到接收回执；"
-            "请先检查本地 127.0.0.1:8080 SSH 隧道和远端 /api/v1/health。"
+            "请检查当前 GPU 服务地址和远端 /api/v1/health。"
         ) from exc
     except OSError as exc:
         raise RemoteAnalysisError(
-            "远端 GPU 上传连接失败；请先检查本地 127.0.0.1:8080 SSH 隧道和远端服务。"
+            "远端 GPU 上传连接失败；请检查当前 GPU 服务地址和远端服务。"
             f" 原始错误：{exc}"
         ) from exc
     finally:

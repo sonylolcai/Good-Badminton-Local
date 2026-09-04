@@ -94,7 +94,10 @@ class CandidatePhotoCollector:
         }
 
     def _capture(self, frame: Any, context: FrameContext, event: ProcessorEvent) -> dict[str, Any] | None:
-        if event.event_type != "person_observation" or event.evidence_state != "detected":
+        if event.event_type not in {
+            "person_observation",
+            "roster_candidate_observation",
+        } or event.evidence_state != "detected":
             return None
         track = (event.data or {}).get("track")
         if not isinstance(track, dict):

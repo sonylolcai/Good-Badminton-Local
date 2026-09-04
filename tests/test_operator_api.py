@@ -5,7 +5,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from operator_api.main import _edge_gateway_base_url, _edge_gateway_internal_url, app
-from operator_api.services.operator_backoffice import _format_china_time
+from operator_api.services.operator_backoffice import _format_china_time, build_calibration_candidate
 
 
 class FakeDatabase:
@@ -50,6 +50,14 @@ class FakeDatabase:
     def set_court_capture_mode(self, venue_id, court_id, mode):
         self.capture_update = (venue_id, court_id, mode)
         return {"court_id": court_id, "mode": mode, "revision": 1, "updated_at": "2026-09-01T00:00:00Z"}
+
+    def calibration_candidate(self, venue_id, court_id, payload):
+        self.calibration_candidate_request = (venue_id, court_id, payload)
+        return {"camera_id": "camera-1", "method": payload["mode"], "court_corners": [[10, 20], [90, 20], [100, 100], [0, 100]], "evidence": payload}
+
+    def save_camera_calibration(self, venue_id, court_id, payload):
+        self.calibration_save_request = (venue_id, court_id, payload)
+        return {"id": "calibration-1", "quality_status": "validated", "court_corners": [[10, 20], [90, 20], [100, 100], [0, 100]]}
 
     def case_event_log(self, case_id, limit):
         return [{"event_id": "saved-1", "source": "gpu", "message": "saved", "payload": {}}]
@@ -122,6 +130,28 @@ class OperatorApiTests(unittest.TestCase):
         stored_utc = datetime(2026, 9, 1, 16, 30, 45, tzinfo=timezone.utc)
         self.assertEqual(_format_china_time(stored_utc), "2026-09-02 00:30:45")
         self.assertEqual(_format_china_time("2026-09-01 16:30:45+00"), "2026-09-02 00:30:45")
+
+    def test_visible_lines_can_extrapolate_an_occluded_near_baseline(self):
+        candidate = build_calibration_candidate({
+            "mode": "line_evidence",
+            "left_sideline": [{"x": 0, "y": 0}, {"x": 0, "y": 80}],
+            "right_sideline": [{"x": 100, "y": 0}, {"x": 100, "y": 80}],
+            # The near baseline at y=100 is deliberately not marked.
+            "cross_lines": [
+                {"court_y_m": 0, "points": [{"x": 0, "y": 0}, {"x": 100, "y": 0}]},
+                {"court_y_m": 6.7, "points": [{"x": 0, "y": 50}, {"x": 100, "y": 50}]},
+            ],
+        })
+        self.assertEqual(candidate["court_corners"], [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]])
+
+    def test_calibration_routes_require_confirmation_through_the_business_api(self):
+        payload = {"mode": "manual_corners", "corners": [{"x": 10, "y": 20}, {"x": 90, "y": 20}, {"x": 100, "y": 100}, {"x": 0, "y": 100}]}
+        candidate = self.client.post("/api/v1/venues/venue-1/courts/court-1/calibration-candidate", json=payload)
+        self.assertEqual(candidate.status_code, 200)
+        self.assertEqual(candidate.json()["candidate"]["method"], "manual_corners")
+        saved = self.client.post("/api/v1/venues/venue-1/courts/court-1/calibration", json=payload)
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["calibration"]["quality_status"], "validated")
 
 
 if __name__ == "__main__":

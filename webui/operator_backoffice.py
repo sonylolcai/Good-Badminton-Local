@@ -14,6 +14,7 @@ from hashlib import sha256
 from html import escape
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -189,17 +190,34 @@ class BusinessDatabase:
             or os.environ.get("GOOD_BADMINTON_BUSINESS_DATABASE_URL", "")
             or local_values.get("GOOD_BADMINTON_BUSINESS_DATABASE_URL", "")
         ).strip()
+        try:
+            self.connect_timeout_seconds = min(
+                10,
+                max(1, int(os.environ.get("GOOD_BADMINTON_BUSINESS_DATABASE_CONNECT_TIMEOUT", "3"))),
+            )
+        except ValueError:
+            self.connect_timeout_seconds = 3
+        self._readiness_cache: dict[str, Any] | None = None
+        self._readiness_checked_monotonic = 0.0
 
     def readiness(self) -> dict[str, Any]:
         if not self.database_url:
             return {"status": "not_configured", "message": "未配置 GOOD_BADMINTON_BUSINESS_DATABASE_URL；管理页不会写入影子数据。"}
+        # ``render_backoffice_tabs()`` reads this state for several tab
+        # defaults.  Reusing a very short snapshot prevents one unavailable
+        # database from serially blocking the whole WebUI during first paint.
+        if self._readiness_cache and time.monotonic() - self._readiness_checked_monotonic < 3:
+            return dict(self._readiness_cache)
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute("select current_database() as database, now() as checked_at")
                 row = cursor.fetchone()
-            return {"status": "ready", "database": row["database"], "checked_at": str(row["checked_at"])}
+            result = {"status": "ready", "database": row["database"], "checked_at": str(row["checked_at"])}
         except BackofficeError as exc:
-            return {"status": "unavailable", "message": str(exc)}
+            result = {"status": "unavailable", "message": str(exc)}
+        self._readiness_cache = result
+        self._readiness_checked_monotonic = time.monotonic()
+        return dict(result)
 
     def list_venues(self) -> list[list[str]]:
         return self._rows(
@@ -462,7 +480,12 @@ class BusinessDatabase:
         except ImportError as exc:
             raise BackofficeError("未安装 psycopg；请执行 pip install -r requirements.txt。") from exc
         try:
-            return psycopg.connect(self.database_url, row_factory=dict_row, autocommit=True)
+            return psycopg.connect(
+                self.database_url,
+                row_factory=dict_row,
+                autocommit=True,
+                connect_timeout=self.connect_timeout_seconds,
+            )
         except Exception as exc:
             raise BackofficeError(f"业务数据库不可用：{exc}") from exc
 

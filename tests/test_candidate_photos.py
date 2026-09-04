@@ -51,9 +51,9 @@ def _pose(*, frontal: bool | None) -> dict:
     return {"keypoints_image": points, "keypoint_scores": scores}
 
 
-def _event(*, frontal: bool | None, confidence: float = 0.9) -> ProcessorEvent:
+def _event(*, frontal: bool | None, confidence: float = 0.9, event_type: str = "person_observation") -> ProcessorEvent:
     return ProcessorEvent(
-        event_type="person_observation",
+        event_type=event_type,
         evidence_state="detected",
         confidence=confidence,
         data={
@@ -95,6 +95,18 @@ class CandidatePhotoCollectorTests(unittest.TestCase):
             photo = output.data["candidate_photo"]
             self.assertEqual(photo["view_label"], "not_assessed")
             self.assertEqual(photo["frontal_score"], 0.0)
+
+    def test_unconfirmed_roster_candidate_receives_a_review_crop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            collector = CandidatePhotoCollector(Path(temporary))
+            output = collector.attach(
+                np.full((128, 100, 3), 90, dtype=np.uint8),
+                _context(1.0),
+                [_event(frontal=None, event_type="roster_candidate_observation")],
+            )[0]
+
+            self.assertIn("candidate_photo", output.data)
+            self.assertTrue((Path(temporary) / "track_001.jpg").is_file())
 
     def test_checkpoint_preserves_the_front_priority_rank(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -45,6 +45,8 @@ _POST_STATUSES = {"published", "hidden"}
 _CLAIM_STATUSES = {"pending", "confirmed", "rejected", "corrected"}
 _DELIVERY_STATUSES = {"pending", "processing", "ready", "failed", "withheld"}
 _CHINA_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_COURT_WIDTH_M = 6.10
+_COURT_LENGTH_M = 13.40
 
 
 def _format_china_time(value: Any) -> str:
@@ -69,6 +71,151 @@ def _format_china_time(value: Any) -> str:
 def _as_text(value: Any) -> str | None:
     """Normalize PostgreSQL timestamp values for the JSON operator contract."""
     return None if value is None else str(value)
+
+
+def _point(value: Any, field: str) -> tuple[float, float]:
+    """Read one browser image point without accepting implicit coordinates."""
+    if not isinstance(value, dict):
+        raise BackofficeError(f"{field} 必须是图像坐标。")
+    try:
+        x, y = float(value["x"]), float(value["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BackofficeError(f"{field} 必须包含有效的 x、y 坐标。") from exc
+    if not all(abs(item) < 100000 for item in (x, y)):
+        raise BackofficeError(f"{field} 超出可接受图像范围。")
+    return x, y
+
+
+def _line(points: Any, field: str) -> tuple[float, float, float]:
+    if not isinstance(points, list) or len(points) != 2:
+        raise BackofficeError(f"{field} 必须标注两个可见点。")
+    x1, y1 = _point(points[0], f"{field}[0]")
+    x2, y2 = _point(points[1], f"{field}[1]")
+    a, b, c = y1 - y2, x2 - x1, x1 * y2 - x2 * y1
+    if a * a + b * b < 1e-8:
+        raise BackofficeError(f"{field} 的两个点不能重合。")
+    return a, b, c
+
+
+def _intersection(first: tuple[float, float, float], second: tuple[float, float, float], field: str) -> tuple[float, float]:
+    a1, b1, c1 = first
+    a2, b2, c2 = second
+    determinant = a1 * b2 - a2 * b1
+    if abs(determinant) < 1e-8:
+        raise BackofficeError(f"{field} 的两条线近平行，无法计算交点。")
+    return ((b1 * c2 - b2 * c1) / determinant, (c1 * a2 - c2 * a1) / determinant)
+
+
+def _solve_linear_system(matrix: list[list[float]], values: list[float]) -> list[float]:
+    """Solve the small 8x8 homography system without adding a CV dependency."""
+    size = len(values)
+    augmented = [list(row) + [values[index]] for index, row in enumerate(matrix)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(augmented[row][column]))
+        if abs(augmented[pivot][column]) < 1e-10:
+            raise BackofficeError("可见场地线不足以确定透视关系。")
+        augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
+        divisor = augmented[column][column]
+        augmented[column] = [item / divisor for item in augmented[column]]
+        for row in range(size):
+            if row == column:
+                continue
+            factor = augmented[row][column]
+            augmented[row] = [item - factor * pivot_item for item, pivot_item in zip(augmented[row], augmented[column])]
+    return [augmented[row][-1] for row in range(size)]
+
+
+def _inverse_3x3(matrix: list[list[float]]) -> list[list[float]]:
+    a, b, c = matrix[0]
+    d, e, f = matrix[1]
+    g, h, i = matrix[2]
+    determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(determinant) < 1e-10:
+        raise BackofficeError("标注的场地线无法形成有效的透视关系。")
+    return [
+        [(e * i - f * h) / determinant, (c * h - b * i) / determinant, (b * f - c * e) / determinant],
+        [(f * g - d * i) / determinant, (a * i - c * g) / determinant, (c * d - a * f) / determinant],
+        [(d * h - e * g) / determinant, (b * g - a * h) / determinant, (a * e - b * d) / determinant],
+    ]
+
+
+def _project(matrix: list[list[float]], x: float, y: float) -> list[float]:
+    denominator = matrix[2][0] * x + matrix[2][1] * y + matrix[2][2]
+    if abs(denominator) < 1e-10:
+        raise BackofficeError("计算出的虚拟角位于无效透视位置。")
+    return [
+        round((matrix[0][0] * x + matrix[0][1] * y + matrix[0][2]) / denominator, 2),
+        round((matrix[1][0] * x + matrix[1][1] * y + matrix[1][2]) / denominator, 2),
+    ]
+
+
+def _validate_corners(corners: list[list[float]]) -> list[list[float]]:
+    if len(corners) != 4:
+        raise BackofficeError("场地标定必须产生四个角。")
+    points = [(float(item[0]), float(item[1])) for item in corners]
+    if len({(round(x, 4), round(y, 4)) for x, y in points}) != 4:
+        raise BackofficeError("四个场地角必须互不重合。")
+    area = sum(points[index][0] * points[(index + 1) % 4][1] - points[(index + 1) % 4][0] * points[index][1] for index in range(4)) / 2
+    if abs(area) < 100:
+        raise BackofficeError("场地标定面积过小，无法用于空间分析。")
+    return [[round(x, 2), round(y, 2)] for x, y in points]
+
+
+def build_calibration_candidate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Create, but never persist, a preview-derived court calibration candidate.
+
+    Line evidence supports an occluded near baseline: the user supplies the two
+    sidelines plus any two *visible* horizontal court lines with their known
+    standard-court distances. Their intersections determine a homography and
+    extrapolate the unseen four corners. Two sidelines plus only one horizontal
+    line are intentionally rejected because that geometry is underdetermined.
+    """
+    mode = str(payload.get("mode") or "")
+    if mode == "manual_corners":
+        corners = _validate_corners([list(_point(item, f"corners[{index}]")) for index, item in enumerate(payload.get("corners") or [])])
+        return {"method": mode, "court_corners": corners, "evidence": {"mode": mode, "corners": payload.get("corners")}}
+    if mode != "line_evidence":
+        raise BackofficeError("标定方式必须是四角标注或可见场地线标注。")
+
+    left = _line(payload.get("left_sideline"), "左边线")
+    right = _line(payload.get("right_sideline"), "右边线")
+    cross_lines = payload.get("cross_lines")
+    if not isinstance(cross_lines, list) or len(cross_lines) != 2:
+        raise BackofficeError("请标注两条可见的横向场地线；近端底线不可见时可选择其他已知横线。")
+    parsed_cross_lines: list[tuple[float, tuple[float, float, float], dict[str, Any]]] = []
+    for index, item in enumerate(cross_lines):
+        if not isinstance(item, dict):
+            raise BackofficeError("横向场地线格式无效。")
+        try:
+            court_y = float(item["court_y_m"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BackofficeError("横向场地线必须声明其距远端底线的标准距离。") from exc
+        if not 0.0 <= court_y <= _COURT_LENGTH_M:
+            raise BackofficeError("横向场地线的标准距离不在场地范围内。")
+        parsed_cross_lines.append((court_y, _line(item.get("points"), f"横线[{index}]"), item))
+    parsed_cross_lines.sort(key=lambda item: item[0])
+    if abs(parsed_cross_lines[0][0] - parsed_cross_lines[1][0]) < 1e-6:
+        raise BackofficeError("两条横向场地线必须对应标准场地上的不同位置。")
+
+    first_y, first_line, _ = parsed_cross_lines[0]
+    second_y, second_line, _ = parsed_cross_lines[1]
+    image_points = [
+        _intersection(left, first_line, "左边线与第一横线"),
+        _intersection(right, first_line, "右边线与第一横线"),
+        _intersection(right, second_line, "右边线与第二横线"),
+        _intersection(left, second_line, "左边线与第二横线"),
+    ]
+    court_points = [(0.0, first_y), (_COURT_WIDTH_M, first_y), (_COURT_WIDTH_M, second_y), (0.0, second_y)]
+    equations: list[list[float]] = []
+    values: list[float] = []
+    for (u, v), (x, y) in zip(image_points, court_points):
+        equations.extend([[u, v, 1.0, 0.0, 0.0, 0.0, -x * u, -x * v], [0.0, 0.0, 0.0, u, v, 1.0, -y * u, -y * v]])
+        values.extend([x, y])
+    h = _solve_linear_system(equations, values)
+    image_to_court = [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1.0]]
+    court_to_image = _inverse_3x3(image_to_court)
+    corners = _validate_corners([_project(court_to_image, 0.0, 0.0), _project(court_to_image, _COURT_WIDTH_M, 0.0), _project(court_to_image, _COURT_WIDTH_M, _COURT_LENGTH_M), _project(court_to_image, 0.0, _COURT_LENGTH_M)])
+    return {"method": mode, "court_corners": corners, "evidence": {"mode": mode, "left_sideline": payload.get("left_sideline"), "right_sideline": payload.get("right_sideline"), "cross_lines": cross_lines}}
 
 
 OPERATOR_BACKOFFICE_CSS = """
@@ -572,6 +719,52 @@ class BusinessDatabase:
             })
         return {"courts": courts, "camera_connected": sum(1 for court in courts if court["camera"]["connected"]),
                 "active_cases": sum(1 for court in courts if court["case"] and court["case"]["status"] in {"requested", "receiving", "relaying", "processing"})}
+
+    def calibration_candidate(self, venue_id: str, court_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Calculate a candidate only for a court with a live business preview."""
+        rows = self._dict_rows(
+            """select cam.id::text as camera_id
+               from business.courts c
+               join business.cameras cam on cam.court_id=c.id
+               join business.edge_ingest_sessions s on s.camera_id=cam.id
+               where c.id=%s and c.venue_id=%s and s.status in ('requested', 'receiving')
+                 and s.preview_available=true
+               order by s.updated_at desc limit 1""",
+            (court_id, venue_id),
+        )
+        if not rows:
+            raise BackofficeError("请先开启预览并等待业务服务器收到可播放的视频片段，再标注场地。")
+        candidate = build_calibration_candidate(payload)
+        return {"camera_id": rows[0]["camera_id"], **candidate}
+
+    def save_camera_calibration(self, venue_id: str, court_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist only an explicitly confirmed, preview-derived calibration.
+
+        The validated record is immutable evidence for the next record session.
+        It never mutates the active preview session, which deliberately has no
+        calibration ID; the operator must stop preview and start recording.
+        """
+        candidate = self.calibration_candidate(venue_id, court_id, payload)
+        saved_calibration_id = str(uuid.uuid4())
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """select coalesce(max(version), 0) + 1 as next_version
+                   from business.camera_calibrations where camera_id=%s""",
+                (candidate["camera_id"],),
+            )
+            version = int(cursor.fetchone()["next_version"])
+            cursor.execute(
+                """insert into business.camera_calibrations
+                   (id, camera_id, version, court_corners, quality_status, evidence)
+                   values (%s, %s, %s, %s::jsonb, 'validated', %s::jsonb)""",
+                (saved_calibration_id, candidate["camera_id"], version,
+                 json.dumps(candidate["court_corners"]), json.dumps(candidate["evidence"])),
+            )
+        result = {"id": saved_calibration_id, "camera_id": candidate["camera_id"], "version": version,
+                  "quality_status": "validated", "court_corners": candidate["court_corners"], "method": candidate["method"]}
+        self._audit("camera.calibration_validated", "camera_calibration", saved_calibration_id,
+                    {"venue_ref": venue_id, "court_ref": court_id, "version": version, "method": candidate["method"]})
+        return result
 
     def set_court_capture_mode(self, venue_id: str, court_id: str, mode: str) -> dict[str, Any]:
         """Set the desired state which the unattended venue Mac polls.

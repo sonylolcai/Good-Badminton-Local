@@ -82,6 +82,28 @@ class CourtCaptureModeRequest(BaseModel):
     mode: CaptureMode
 
 
+class ImagePoint(BaseModel):
+    x: float = Field(ge=-100000, le=100000)
+    y: float = Field(ge=-100000, le=100000)
+
+
+class CrossCourtLine(BaseModel):
+    """One visible horizontal court line and its standard distance in metres."""
+
+    court_y_m: float = Field(ge=0, le=13.4)
+    points: list[ImagePoint] = Field(min_length=2, max_length=2)
+
+
+class CourtCalibrationRequest(BaseModel):
+    """Manual visible corners or enough line evidence to extrapolate them."""
+
+    mode: Literal["manual_corners", "line_evidence"]
+    corners: list[ImagePoint] = Field(default_factory=list, max_length=4)
+    left_sideline: list[ImagePoint] = Field(default_factory=list, max_length=2)
+    right_sideline: list[ImagePoint] = Field(default_factory=list, max_length=2)
+    cross_lines: list[CrossCourtLine] = Field(default_factory=list, max_length=2)
+
+
 def _origins() -> list[str]:
     configured = os.environ.get("GOOD_BADMINTON_OPERATOR_API_ALLOWED_ORIGINS", "")
     return [item.strip() for item in configured.split(",") if item.strip()] or [
@@ -271,6 +293,34 @@ def venue_operations(venue_id: Annotated[str, ApiPath(min_length=1)]) -> dict[st
         "summary": {"camera_connected": snapshot["camera_connected"], "active_cases": snapshot["active_cases"], "total_courts": len(snapshot["courts"])},
         "courts": snapshot["courts"],
     }
+
+
+@app.post("/api/v1/venues/{venue_id}/courts/{court_id}/calibration-candidate")
+def create_calibration_candidate(
+    venue_id: Annotated[str, ApiPath(min_length=1)],
+    court_id: Annotated[str, ApiPath(min_length=1)],
+    request: CourtCalibrationRequest,
+) -> dict[str, Any]:
+    """Calculate four candidate corners from the currently visible preview."""
+    db = get_db()
+    _require_venue(db, venue_id)
+    candidate = db.calibration_candidate(venue_id, court_id, request.model_dump())
+    return {"candidate": candidate,
+            "message": "已生成候选四角。请确认叠加线与画面中的可见场地线重合后再保存。"}
+
+
+@app.post("/api/v1/venues/{venue_id}/courts/{court_id}/calibration")
+def save_calibration(
+    venue_id: Annotated[str, ApiPath(min_length=1)],
+    court_id: Annotated[str, ApiPath(min_length=1)],
+    request: CourtCalibrationRequest,
+) -> dict[str, Any]:
+    """Confirm a preview-derived candidate and unlock only future record sessions."""
+    db = get_db()
+    _require_venue(db, venue_id)
+    calibration = db.save_camera_calibration(venue_id, court_id, request.model_dump())
+    return {"calibration": calibration,
+            "message": "场地标定已验证。请停止当前预览，再开始采集；后续会话才可向 GPU 推送。"}
 
 
 @app.post("/api/v1/venues/{venue_id}/courts/{court_id}/capture")

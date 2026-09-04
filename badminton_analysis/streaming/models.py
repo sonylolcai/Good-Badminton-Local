@@ -16,6 +16,7 @@ ANALYSIS_SAMPLE_RATES = frozenset({10, 15, 30})
 EVENT_TYPES = frozenset(
     {
         "person_observation",
+        "roster_candidate_observation",
         "shuttle_observation",
         "interaction_candidate",
         "session_status",

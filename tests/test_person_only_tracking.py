@@ -182,6 +182,33 @@ class PersonOnlyTrackingTests(unittest.TestCase):
         self.assertEqual(locked["tracking"]["roster"]["status"], "locked")
         self.assertEqual(locked["tracking"]["expected_player_count"], 2)
 
+    def test_expected_four_person_roster_waits_for_the_discovery_window(self):
+        """A configured count must not turn three warm-up frames into four IDs."""
+        tracker = self.tracker(
+            lock_match_roster=True,
+            expected_roster_count=4,
+            max_roster_count=4,
+            roster_stable_frames=2,
+            roster_discovery_seconds=1.0,
+        )
+        observations = [
+            self.observation((1.0, 1.0), "a"),
+            self.observation((4.8, 1.1), "b"),
+            self.observation((1.1, 12.0), "c"),
+            self.observation((4.9, 11.9), "d"),
+        ]
+
+        first = tracker.update(1, observations)
+        stable_but_early = tracker.update(2, observations)
+        before_deadline = tracker.update(10, observations)
+        locked = tracker.update(11, observations)
+
+        self.assertEqual(first["tracking"]["roster"]["status"], "bootstrapping")
+        self.assertEqual(stable_but_early["tracking"]["roster"]["status"], "bootstrapping")
+        self.assertEqual(before_deadline["tracking"]["roster"]["status"], "bootstrapping")
+        self.assertEqual(locked["tracking"]["roster"]["status"], "locked")
+        self.assertEqual(len(locked["tracks"]), 4)
+
     def test_court_only_gap_recovery_is_marked_uncertain_not_silent(self):
         tracker = self.tracker()
         tracker.update(1, [self.observation((1.0, 1.0), None)])
@@ -259,6 +286,39 @@ class PersonOnlyTrackingTests(unittest.TestCase):
         )[0]
         self.assertEqual(event.evidence_state, "detected")
         self.assertEqual(event.data["track"]["lifecycle_state"], "candidate")
+
+    def test_unstable_expected_roster_emits_review_candidates_not_empty_output(self):
+        """A fail-closed four-person roster must still expose raw evidence."""
+        tracker = self.tracker(
+            lock_match_roster=True,
+            expected_roster_count=4,
+            max_roster_count=4,
+            roster_stable_frames=2,
+            roster_discovery_seconds=1.0,
+        )
+        processor = PersonOnlyFrameProcessor(
+            tracker,
+            observation_provider=lambda frame, _context: frame,
+        )
+        context = FrameContext(
+            analysis_session_id="ssn_roster_review",
+            segment_index=0,
+            source_frame_index=1,
+            source_time_sec=0.1,
+            is_measurement_frame=True,
+            measurement_bucket=1,
+        )
+        events = list(processor.process_frame([
+            self.observation((1.0, 1.0), "a"),
+            self.observation((4.8, 1.1), "b"),
+            self.observation((1.1, 12.0), "c"),
+            self.observation((4.9, 11.9), "d"),
+        ], context))
+
+        self.assertEqual(len(events), 4)
+        self.assertTrue(all(event.event_type == "roster_candidate_observation" for event in events))
+        self.assertTrue(all(event.data["track"]["analytics_eligible"] is False for event in events))
+        self.assertTrue(all(event.data["track"]["lifecycle_state"] == "unconfirmed_roster" for event in events))
 
     def test_stream_processor_emits_anonymous_events_and_final_candidates(self):
         tracker = self.tracker()

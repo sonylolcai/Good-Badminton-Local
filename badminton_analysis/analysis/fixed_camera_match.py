@@ -202,6 +202,11 @@ class CourtMultiObjectTracker:
         self.roster_locked_frame = None
         self.roster_track_ids = []
         self._roster_stable_observation_frames = 0
+        # In a fixed ByteTrack roster, a count of four boxes is not evidence
+        # of four people.  Retain the exact confirmed-key set that began the
+        # discovery window so a warm-up/key-fragment frame cannot become four
+        # permanent player slots.
+        self._roster_bootstrap_association_keys = None
         self._last_roster_candidate_count = 0
         self._roster_discovery_started_frame = None
         self._roster_observed_max_candidate_count = 0
@@ -319,6 +324,8 @@ class CourtMultiObjectTracker:
 
         if candidate_count != self.expected_roster_count:
             self._roster_stable_observation_frames = 0
+            self._roster_bootstrap_association_keys = None
+            self._roster_discovery_started_frame = None
             self._last_roster_reason = (
                 "waiting_for_expected_on_court_count"
                 f" (observed={candidate_count}, expected={self.expected_roster_count})"
@@ -329,12 +336,66 @@ class CourtMultiObjectTracker:
             not observation.get("association_key") for observation in observations
         ):
             self._roster_stable_observation_frames = 0
+            self._roster_bootstrap_association_keys = None
+            self._roster_discovery_started_frame = None
             self._last_roster_reason = "awaiting_bytetrack_confirmation"
             return self.snapshot(frame_index)
 
-        self._roster_stable_observation_frames += 1
+        # The direct GPU stream runs person_only and carries a user-selected
+        # count.  It needs a real discovery window because pose/ByteTrack are
+        # still warming up.  The match pipeline keeps its established
+        # fixed-camera semantics: an explicit singles/doubles mode may lock as
+        # soon as its stable count is available.
+        if self.match_mode != "person_only":
+            self._roster_stable_observation_frames += 1
+            if self._roster_stable_observation_frames < self.roster_stable_frames:
+                self._last_roster_reason = "awaiting_second_stable_roster_observation"
+                return self.snapshot(frame_index)
+            ordered = sorted(
+                observations,
+                key=lambda item: (float(item["court_xy"][1]), float(item["court_xy"][0])),
+            )
+            for observation in ordered:
+                self._create_track(frame_index, observation, association_source="roster_bootstrap")
+            self.roster_track_ids = sorted(self.tracks)
+            self.roster_status = "locked"
+            self.roster_locked_frame = int(frame_index)
+            self._last_roster_reason = "stable_expected_on_court_count"
+            return self.snapshot(frame_index)
+
+        association_keys = None
+        if self.require_association_keys:
+            association_keys = tuple(
+                sorted(str(observation["association_key"]) for observation in observations)
+            )
+            if len(set(association_keys)) != self.expected_roster_count:
+                self._roster_stable_observation_frames = 0
+                self._roster_bootstrap_association_keys = None
+                self._roster_discovery_started_frame = None
+                self._last_roster_reason = "awaiting_distinct_bytetrack_confirmation"
+                return self.snapshot(frame_index)
+
+        if (
+            self._roster_discovery_started_frame is None
+            or association_keys != self._roster_bootstrap_association_keys
+        ):
+            self._roster_bootstrap_association_keys = association_keys
+            self._roster_stable_observation_frames = 1
+            self._roster_discovery_started_frame = int(frame_index)
+        else:
+            self._roster_stable_observation_frames += 1
         if self._roster_stable_observation_frames < self.roster_stable_frames:
             self._last_roster_reason = "awaiting_second_stable_roster_observation"
+            return self.snapshot(frame_index)
+
+        discovery_elapsed = int(frame_index) - int(self._roster_discovery_started_frame)
+        if discovery_elapsed < self.roster_discovery_frames:
+            self._last_roster_reason = (
+                "awaiting_expected_roster_discovery_window"
+                f" (elapsed_frames={discovery_elapsed}, "
+                f"required_frames={self.roster_discovery_frames}, "
+                f"expected={self.expected_roster_count})"
+            )
             return self.snapshot(frame_index)
 
         # The first IDs are deterministic labels only; they do not claim a
@@ -349,7 +410,7 @@ class CourtMultiObjectTracker:
         self.roster_track_ids = sorted(self.tracks)
         self.roster_status = "locked"
         self.roster_locked_frame = int(frame_index)
-        self._last_roster_reason = "stable_expected_on_court_count"
+        self._last_roster_reason = "stable_expected_bytetrack_roster_after_discovery_window"
         return self.snapshot(frame_index)
 
     def _update_discovering_roster(self, frame_index, observations):
@@ -390,29 +451,32 @@ class CourtMultiObjectTracker:
             unmatched_track_ids.remove(track_id)
             unmatched_observations.remove(index)
 
-        # Greedy metric assignment covers continuous observations. Its gate is
-        # in metres, so a side/oblique image view has exactly the same identity
-        # behavior as a rear view.
+        # Greedy metric assignment covers continuous observations when no
+        # durable identity backend is required.  In a locked ByteTrack roster,
+        # a newly seen key must stay unassigned: assigning it solely because it
+        # happens to be near an old court coordinate is how one player gets
+        # copied into another player's permanent slot.
         candidates = []
-        for track_id, track in self.tracks.items():
-            if track_id not in unmatched_track_ids:
-                continue
-            if track.missed_frames > self.max_missed_frames:
-                if not (
-                    self.lock_match_roster
-                    and track.missed_frames <= self.roster_reacquire_frames
-                ):
+        if not self.require_association_keys:
+            for track_id, track in self.tracks.items():
+                if track_id not in unmatched_track_ids:
                     continue
-                source = "roster_reassociation"
-                gate = self._roster_reassociation_gate(track)
-            else:
-                source = "court_association"
-                gate = self._association_gate(track, frame_index)
-            predicted = self._predict_position(track, frame_index)
-            for index, observation in enumerate(observations):
-                distance = self._distance(predicted, observation["court_xy"])
-                if distance <= gate:
-                    candidates.append((distance, track_id, index, source))
+                if track.missed_frames > self.max_missed_frames:
+                    if not (
+                        self.lock_match_roster
+                        and track.missed_frames <= self.roster_reacquire_frames
+                    ):
+                        continue
+                    source = "roster_reassociation"
+                    gate = self._roster_reassociation_gate(track)
+                else:
+                    source = "court_association"
+                    gate = self._association_gate(track, frame_index)
+                predicted = self._predict_position(track, frame_index)
+                for index, observation in enumerate(observations):
+                    distance = self._distance(predicted, observation["court_xy"])
+                    if distance <= gate:
+                        candidates.append((distance, track_id, index, source))
         for _distance, track_id, index, source in sorted(candidates):
             if track_id not in unmatched_track_ids or index not in unmatched_observations:
                 continue
@@ -431,15 +495,16 @@ class CourtMultiObjectTracker:
         # teammates returning on the same end remain unassigned rather than
         # being guessed, and the recovered association is explicitly low
         # confidence for downstream analytics.
-        for track_id, index in self._unambiguous_long_gap_recoveries(
-            unmatched_track_ids,
-            unmatched_observations,
-            observations,
-        ):
-            assignments.append((track_id, index))
-            assignment_sources[(track_id, index)] = "roster_end_recovery"
-            unmatched_track_ids.remove(track_id)
-            unmatched_observations.remove(index)
+        if not self.require_association_keys:
+            for track_id, index in self._unambiguous_long_gap_recoveries(
+                unmatched_track_ids,
+                unmatched_observations,
+                observations,
+            ):
+                assignments.append((track_id, index))
+                assignment_sources[(track_id, index)] = "roster_end_recovery"
+                unmatched_track_ids.remove(track_id)
+                unmatched_observations.remove(index)
 
         for track_id, index in assignments:
             self._apply_observation(
@@ -651,6 +716,9 @@ class CourtMultiObjectTracker:
                 "locked_frame": self.roster_locked_frame,
                 "track_ids": list(self.roster_track_ids),
                 "stable_observation_frames": self._roster_stable_observation_frames,
+                "bootstrap_association_keys": list(self._roster_bootstrap_association_keys)
+                if self._roster_bootstrap_association_keys is not None
+                else None,
                 "last_candidate_count": self._last_roster_candidate_count,
                 "discovery_started_frame": self._roster_discovery_started_frame,
                 "observed_max_candidate_count": self._roster_observed_max_candidate_count,
@@ -757,6 +825,12 @@ class CourtMultiObjectTracker:
         self.roster_track_ids = [str(value) for value in roster.get("track_ids", [])]
         self._roster_stable_observation_frames = int(
             roster.get("stable_observation_frames", 0)
+        )
+        bootstrap_keys = roster.get("bootstrap_association_keys")
+        self._roster_bootstrap_association_keys = (
+            tuple(str(value) for value in bootstrap_keys)
+            if isinstance(bootstrap_keys, list)
+            else None
         )
         self._last_roster_candidate_count = int(roster.get("last_candidate_count", 0))
         self._roster_discovery_started_frame = roster.get("discovery_started_frame")

@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import re
 import threading
 import time
 import traceback
@@ -14,6 +15,11 @@ load_runtime_environment()
 
 from webui.log_capture import get_backend_logs, install_backend_log_capture
 from webui.operator_backoffice import OPERATOR_BACKOFFICE_CSS, render_backoffice_tabs
+from webui.player_results import (
+    PLAYER_RESULT_HEADERS,
+    build_player_result_display,
+    extract_full_video_candidate_photos,
+)
 
 install_backend_log_capture()
 
@@ -22,6 +28,7 @@ import gradio as gr
 import numpy as np
 
 from badminton_analysis.cancellation import AnalysisCancelled
+from business_gateway.streaming.client import StreamAPIError
 from webui.pipeline import (
     _max_template_match_score,
     imread_safe,
@@ -29,7 +36,13 @@ from webui.pipeline import (
     prepare_court_from_video,
     run_analysis,
 )
-from webui.remote_gpu import RemoteAnalysisError, remote_gpu_config, run_remote_analysis
+from webui.remote_gpu import (
+    RemoteAnalysisError,
+    iter_remote_two_second_stream,
+    recover_remote_two_second_stream,
+    remote_gpu_config,
+    run_remote_analysis,
+)
 from webui.stream_replay import (
     StreamReplayError,
     iter_local_stream_replay,
@@ -509,13 +522,13 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             status["phase"] = "cancelling"
             status["cancellation_requested"] = True
         if updated or status["phase"] == "preparing":
-            yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy()
+            yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy(), None, [], {}
         time.sleep(0.4)
 
     if "cancelled" in outcome:
         status.update({"phase": "cancelled", "message": outcome["cancelled"]})
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
-        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy()
+        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy(), None, [], {}
         return
     if "interrupt_unconfirmed" in outcome:
         status.update({
@@ -523,7 +536,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             "message": outcome["interrupt_unconfirmed"],
         })
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
-        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy()
+        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy(), None, [], {}
         return
     if "error" in outcome:
         # Preserve the failure in the visible progress panel.  Raising a
@@ -536,7 +549,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             "action": "请查看 error 字段；若为上传/连接失败，请先恢复 127.0.0.1:8080 SSH 隧道。",
         })
         status["elapsed_seconds"] = round(time.monotonic() - started, 1)
-        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy()
+        yield None, None, None, None, None, None, None, [], None, [], {}, None, [], None, status.copy(), None, [], {}
         return
     result = outcome["result"]
 
@@ -572,6 +585,15 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
     )
     movement_metric_rows = _movement_metric_summary_rows(movement_metrics_detail)
     body_profile_rows = _body_profile_rows_from_metrics(movement_metrics_file)
+    player_photos = extract_full_video_candidate_photos(
+        video_file,
+        detections_file,
+        result.get("output_dir") or Path(detections_file).parent if detections_file else "",
+    )
+    player_gallery, player_rows, player_detail = build_player_result_display(
+        movement_metrics_detail,
+        photo_records=player_photos,
+    )
 
     status["phase"] = "succeeded"
     status["elapsed_seconds"] = round(time.monotonic() - started, 1)
@@ -584,6 +606,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         movement_metrics_file, movement_metric_rows, movement_metrics_detail,
         movement_rally_window_sweep_file,
         body_profile_rows, result.get("output_dir"), status.copy(),
+        player_gallery or None, player_rows, player_detail,
     )
 
 
@@ -652,6 +675,189 @@ def run_local_stream_replay(
                 "action": "确认业务网关和 GPU API 已按当前环境变量启动；开发默认业务网关为 127.0.0.1:8080。",
             },
         )
+
+
+def _full_video_upload_update(update):
+    """Keep the stream-status panel explicit for a direct full-file upload."""
+
+    return (*update, {
+        "mode": "full_video_direct_gpu",
+        "status": "idle",
+        "hint": "当前任务按完整视频直接提交到 GPU。",
+    })
+
+
+def _two_second_segment_upload_update(stream_status):
+    """Display direct-GPU segment progress in the primary analysis outputs."""
+
+    status = {
+        **(stream_status or {}),
+        "upload_mode": "two_second_segments",
+        "segment_seconds": 2.0,
+    }
+    stream_result = status.get("webui_result") or {}
+    metrics_path = stream_result.get("movement_metrics_path")
+    if metrics_path and not os.path.isfile(metrics_path):
+        metrics_path = None
+    metrics = _read_json_mapping(
+        metrics_path,
+        {"status": "streaming", "message": "等待远端会话生成可验证的人物运动数据。"},
+    )
+    gallery, player_rows, player_detail = build_player_result_display(
+        metrics,
+        track_candidates=status.get("track_candidates"),
+        photo_records=stream_result.get("candidate_photos"),
+    )
+    derivation = stream_result.get("derivation") or {}
+    return (
+        None, None, None, None, None, None, None, [],
+        metrics_path, _movement_metric_summary_rows(metrics), metrics,
+        None, _body_profile_rows_from_metrics(metrics_path), stream_result.get("analysis_output_dir"), status, status,
+        gallery or None, player_rows, {
+            **player_detail,
+            "stream_derivation": derivation,
+            "stream_status": status,
+        },
+    )
+
+
+def _find_remote_stream_session_workdir(analysis_session_id, stream_root=None):
+    """Find the local ledger for one direct-GPU stream session safely."""
+
+    session_id = str(analysis_session_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        return None
+    root = Path(stream_root or Path("outputs") / "remote_stream_sessions")
+    if not root.is_dir():
+        return None
+    for ledger_path in sorted(root.glob("*/delivery-ledger.json"), reverse=True):
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if str(ledger.get("analysis_session_id") or "") == session_id:
+            return ledger_path.parent
+    return None
+
+
+def load_remote_two_second_stream_result(analysis_session_id, gpu_base_url):
+    """Restore screenshots and all per-track evidence for an existing GPU session."""
+
+    session_id = str(analysis_session_id or "").strip()
+    if not session_id:
+        raise gr.Error("请输入直连 GPU 会话 ID，例如 ssn_xxx。")
+    workdir = _find_remote_stream_session_workdir(session_id)
+    if workdir is None:
+        raise gr.Error("本机未找到此会话的上传记录；请在原来的 WebUI 工作目录中恢复。")
+    try:
+        status = recover_remote_two_second_stream(
+            session_id,
+            workdir,
+            gpu_base_url=gpu_base_url,
+        )
+    except (RemoteAnalysisError, StreamAPIError) as exc:
+        raise gr.Error(str(exc)) from exc
+    terminal_state = str(status.get("status") or "")
+    if terminal_state not in {"finalized", "partial"}:
+        detail = status.get("error") or "会话尚未生成可展示的完成结果。"
+        raise gr.Error(f"会话 {session_id} 当前状态为 {terminal_state!r}：{detail}")
+    return _two_second_segment_upload_update(status)
+
+
+def run_analysis_with_upload_mode(
+    analysis_ready, video_file, template_path, corners,
+    pose_family, pose_mode, language, audio, match_mode,
+    output_video_style, shuttle_detector, tracker_backend,
+    movement_rally_settle_seconds, enable_huji_play_state,
+    pose_imgsz, analysis_sample_hz, pose_conf, far_player_enhancement, far_pose_roi,
+    generate_annotated_video, browser_video_reencode,
+    show_skeletons, show_player_trajectories,
+    show_court_trajectory, show_shuttlecock_trajectory,
+    show_player_stats, show_pose_roi, visualize_positions,
+    yolo_pose_model, ball_model, gpu_base_url, two_second_segment_push, expected_player_count,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Run the selected GPU transport without changing analysis settings.
+
+    When selected, the browser sends the recording to the local business
+    gateway, which produces independently decodable two-second MP4 segments
+    and pushes them to the GPU in sequence.  Otherwise the existing complete
+    file upload to ``/api/v1/jobs`` remains unchanged.
+    """
+
+    if bool(two_second_segment_push):
+        if not analysis_ready:
+            raise gr.Error("请先自动检测或手动确认四个球场角点，再启动 GPU 分片推送。")
+        if video_file is None:
+            raise gr.Error("请先上传视频。")
+        if not corners or len(corners) != 4:
+            raise gr.Error("请先确认四个球场角点。")
+        _validate_file_size(video_file, _MAX_VIDEO_BYTES, "Video")
+        stream_options = {
+            "analysis_sample_hz": int(analysis_sample_hz),
+            "pose_imgsz": int(pose_imgsz),
+            "shuttle_detector": shuttle_detector,
+            "tracker_backend": tracker_backend,
+            "far_player_enhancement": bool(far_player_enhancement),
+            "far_pose_roi": tuple(float(item.strip()) for item in far_pose_roi.split(',')),
+            "expected_player_count": int(expected_player_count),
+        }
+        stream_output_dir = os.path.join(
+            "outputs", "remote_stream_sessions", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        )
+        try:
+            for stream_status in iter_remote_two_second_stream(
+                video_file,
+                corners,
+                stream_options,
+                stream_output_dir,
+                gpu_base_url=gpu_base_url,
+            ):
+                yield _two_second_segment_upload_update(stream_status)
+        except RemoteAnalysisError as exc:
+            yield _two_second_segment_upload_update({
+                "mode": "remote_gpu_two_second_stream",
+                "phase": "failed",
+                "remote_base_url": str(gpu_base_url or "").strip(),
+                "error": str(exc),
+            })
+        return
+
+    for update in run_full_analysis(
+        analysis_ready,
+        video_file,
+        template_path,
+        corners,
+        pose_family,
+        pose_mode,
+        language,
+        audio,
+        match_mode,
+        output_video_style,
+        shuttle_detector,
+        tracker_backend,
+        movement_rally_settle_seconds,
+        enable_huji_play_state,
+        pose_imgsz,
+        analysis_sample_hz,
+        pose_conf,
+        far_player_enhancement,
+        far_pose_roi,
+        generate_annotated_video,
+        browser_video_reencode,
+        show_skeletons,
+        show_player_trajectories,
+        show_court_trajectory,
+        show_shuttlecock_trajectory,
+        show_player_stats,
+        show_pose_roi,
+        visualize_positions,
+        yolo_pose_model,
+        ball_model,
+        gpu_base_url,
+        progress=progress,
+    ):
+        yield _full_video_upload_update(update)
 
 
 def load_local_stream_replay_result(business_task_id: str):
@@ -2162,6 +2368,20 @@ def build_ui():
                         value=False,
                         label="生成标注视频（较慢，可用于肉眼复核）",
                     )
+                    two_second_segment_push = gr.Checkbox(
+                        value=False,
+                        label="每 2 秒直接分片推送到 GPU（开发测试）",
+                        info=(
+                            "勾选：WebUI 在本机将录像切成连续的 2 秒 MP4 片段，直接按顺序推送到上方 GPU 服务地址；"
+                            "不勾选：整段视频直接提交 GPU。此模式不经过本地业务网关或 127.0.0.1:8080。"
+                        ),
+                    )
+                    expected_player_count = gr.Radio(
+                        choices=[("2 人（单打）", 2), ("4 人（双打）", 4)],
+                        value=2,
+                        label="分片流式场上人数",
+                        info="仅在勾选 2 秒分片推送时生效。GPU 连续识别稳定人数后锁定名单，避免临时轨迹变成额外球员。",
+                    )
                     # Keep remaining implementation controls in the callback
                     # contract, but make them deployment defaults rather than
                     # routine end-user choices.
@@ -2201,11 +2421,11 @@ def build_ui():
                     md_step2 = gr.Markdown(t["step2"])
                     with gr.Row():
                         run_btn = gr.Button(t["run_btn"], variant="primary")
-                        stream_replay_btn = gr.Button("模拟流式分析（本地开发）", variant="secondary")
+                        stream_replay_btn = gr.Button("旧：经本地网关模拟流式（需 127.0.0.1:8080）", variant="secondary")
                         interrupt_btn = gr.Button(t["interrupt_btn"], variant="stop")
                     gr.Markdown(
-                        "`模拟流式分析` 会由本地业务网关把当前文件切成 2 秒片段，再逐段发送到本地 GPU 服务；"
-                        "用于验证流式协议和断点状态，不等同于真实摄像头实时推流。"
+                        "勾选左侧的 `每 2 秒直接分片推送到 GPU` 后，点击 `运行分析` 会直接向上方 GPU 服务地址创建流会话并上传分片。"
+                        "下方旧按钮仍保留给本地业务网关联调，不使用上方地址作为第一跳。"
                     )
                     with gr.Row():
                         stream_replay_task_id = gr.Textbox(
@@ -2214,6 +2434,13 @@ def build_ui():
                             scale=5,
                         )
                         load_stream_replay_btn = gr.Button("加载流式结果", variant="secondary", scale=1)
+                    with gr.Row():
+                        remote_stream_session_id = gr.Textbox(
+                            label="加载已完成直连 GPU 会话",
+                            placeholder="ssn_xxx（恢复截图和所有逐人数据，不重传视频）",
+                            scale=5,
+                        )
+                        load_remote_stream_btn = gr.Button("恢复 GPU 结果", variant="primary", scale=1)
 
                     md_results = gr.Markdown(t["results"])
                     output_status = gr.JSON(
@@ -2221,11 +2448,34 @@ def build_ui():
                         value={"phase": "idle", "hint": "点击运行分析后显示上传、排队、帧进度与执行来源。"},
                     )
                     stream_replay_status = gr.JSON(
-                        label="模拟流式任务状态（业务网关 → GPU）",
-                        value={"status": "idle", "hint": "启动后显示业务任务、GPU session、每段上传和处理状态。"},
+                        label="分片任务状态（直连 GPU；旧按钮才经本地网关）",
+                        value={
+                            "status": "idle",
+                            "hint": "勾选直连选项后显示远端 GPU session、每段上传和处理状态；旧按钮才会显示本地业务任务。",
+                        },
                     )
                     output_video = gr.Video(label=t["out_video"])
                     output_gallery = gr.Gallery(label=t["out_gallery"], columns=2, height="auto")
+                    gr.Markdown(
+                        "### 人物截图与逐人数据\n"
+                        "每张截图对应匿名视觉 `track_id`。完整视频从同一份高置信检测框生成截图；"
+                        "2 秒分片会话使用 GPU 返回的候选截图。截图不是人脸识别，不能自动推断姓名或队伍。"
+                    )
+                    output_player_gallery = gr.Gallery(
+                        label="人物截图（按视觉 Track ID）", columns=4, height="auto",
+                    )
+                    output_player_result_table = gr.Dataframe(
+                        headers=PLAYER_RESULT_HEADERS,
+                        datatype=["str", "str", "str", "number", "number", "number", "number", "number",
+                                  "number", "number", "number", "str", "number", "str"],
+                        interactive=False,
+                        label="逐人运动与证据数据",
+                        max_height=360,
+                    )
+                    output_player_result_detail = gr.JSON(
+                        label="逐人完整证据数据（截图来源、覆盖率、速度、区域与排除原因）",
+                        value={"status": "waiting_for_analysis"},
+                    )
                     output_metadata = gr.JSON(label=t["out_metadata"])
                     output_detections = gr.File(label=t["out_detections"])
                     output_tracknet_raw = gr.File(label="TrackNetV3 原始球点 CSV（可下载复核）")
@@ -2731,7 +2981,7 @@ def build_ui():
             ],
         )
         run_preflight.then(
-            fn=run_full_analysis,
+            fn=run_analysis_with_upload_mode,
             inputs=[
                  analysis_ready_state, video_input, template_path_state, corners_state,
                  pose_family, pose_mode, language, audio, match_mode, output_video_style, shuttle_detector, tracker_backend,
@@ -2741,7 +2991,7 @@ def build_ui():
                  show_skeletons, show_player_trajectories,
                 show_court_trajectory, show_shuttlecock_trajectory,
                 show_player_stats, show_pose_roi, visualize_positions,
-                yolo_pose_model, ball_model, gpu_base_url,
+                yolo_pose_model, ball_model, gpu_base_url, two_second_segment_push, expected_player_count,
             ],
             outputs=[
                 output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
@@ -2750,6 +3000,8 @@ def build_ui():
                 output_movement_metrics, output_movement_metric_summary, output_movement_metric_detail,
                 output_movement_rally_window_sweep,
                 body_profile_table, analysis_output_dir_state, output_status,
+                stream_replay_status,
+                output_player_gallery, output_player_result_table, output_player_result_detail,
             ],
         )
         stream_preflight = stream_replay_btn.click(
@@ -2787,6 +3039,20 @@ def build_ui():
                 body_profile_table,
                 analysis_output_dir_state,
                 stream_replay_status,
+            ],
+        )
+        load_remote_stream_btn.click(
+            fn=load_remote_two_second_stream_result,
+            inputs=[remote_stream_session_id, gpu_base_url],
+            outputs=[
+                output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
+                output_performance_report,
+                output_rally_summary, output_rallies,
+                output_movement_metrics, output_movement_metric_summary, output_movement_metric_detail,
+                output_movement_rally_window_sweep,
+                body_profile_table, analysis_output_dir_state, output_status,
+                stream_replay_status,
+                output_player_gallery, output_player_result_table, output_player_result_detail,
             ],
         )
         save_body_profile_btn.click(
