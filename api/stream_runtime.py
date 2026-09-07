@@ -26,6 +26,7 @@ from badminton_analysis.detection.yolo_pose import YOLOPoseProcessor
 from badminton_analysis.streaming.models import FinalizationContext, FrameContext, ProcessorEvent
 from badminton_analysis.tracking.person_only import PersonOnlyFrameProcessor, PersonOnlyTracker
 
+from .mode_sync import VisionModeSynchronizer
 from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile
 
 from .candidate_photos import CandidatePhotoCollector
@@ -320,6 +321,7 @@ class StreamProcessorFactory:
         ball_model_factory: Optional[Callable[[str], Any]] = None,
         byte_tracker_factory=None,
         vision_profile: SportVisionProfile = BADMINTON_PROFILE,
+        mode_synchronizer: Optional[VisionModeSynchronizer] = None,
     ):
         self.data_dir = Path(data_dir).resolve()
         # Ultralytics creates a settings directory while importing ``YOLO``.
@@ -336,13 +338,17 @@ class StreamProcessorFactory:
         self.ball_model_factory = ball_model_factory
         self.byte_tracker_factory = byte_tracker_factory
         self.vision_profile = vision_profile
+        # This factory performs visual inference only.  The separate
+        # synchronizer resolves the fixed deployment profile plus requested
+        # visual mode before any model or tracker is constructed.
+        self.mode_synchronizer = mode_synchronizer or VisionModeSynchronizer(
+            vision_profile
+        )
 
     def validate_session_request(self, request):
         if not isinstance(request.get("court_corners"), list) or len(request["court_corners"]) != 4:
-            raise ValueError("stream session requires exactly four business-supplied court_corners")
-        configuration = self.vision_profile.normalize_session_configuration(
-            request["configuration"]
-        )
+            raise ValueError("stream session requires exactly four calibration image corners")
+        configuration = self.mode_synchronizer.synchronize(request["configuration"])
         # Persist only fixed-profile-derived settings.  This prevents a later
         # worker or restore path from reinterpreting the same session under a
         # different sport/mode.

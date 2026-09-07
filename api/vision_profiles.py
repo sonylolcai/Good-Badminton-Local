@@ -10,7 +10,7 @@ pose, tracking and checkpoint implementation remains shared.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional, Tuple
+from typing import Optional, Tuple
 
 
 Point = Tuple[float, float]
@@ -81,89 +81,6 @@ class SportVisionProfile:
         raise ValueError(
             f"session_mode must be one of [{allowed}] for sport_id={self.sport_id}"
         )
-
-    def normalize_session_configuration(self, configuration: Mapping) -> dict:
-        """Validate one request against this process and inject derived facts.
-
-        Client-supplied roster values are accepted only when they agree with
-        the selected mode.  The returned mapping contains the geometry needed
-        by the shared runtime, so downstream callers do not need sport checks.
-        """
-        normalized = dict(configuration)
-        requested_sport = normalized.get("sport_id")
-        if requested_sport is not None and requested_sport != self.sport_id:
-            raise ValueError(
-                f"sport_id={requested_sport} does not match this {self.sport_id} GPU process"
-            )
-
-        mode = self.mode(normalized.get("session_mode"))
-        expected = normalized.get("expected_player_count")
-        if mode.expected_player_count is not None:
-            if expected is not None and int(expected) != mode.expected_player_count:
-                raise ValueError(
-                    "expected_player_count conflicts with "
-                    f"session_mode={mode.session_mode}; expected {mode.expected_player_count}"
-                )
-            expected = mode.expected_player_count
-        elif expected is not None and int(expected) not in mode.allowed_player_counts:
-            allowed = ", ".join(str(value) for value in mode.allowed_player_counts)
-            raise ValueError(
-                f"expected_player_count must be one of [{allowed}] for session_mode={mode.session_mode}"
-            )
-
-        maximum = normalized.get("max_roster_count")
-        if mode.expected_player_count is not None:
-            # ``max_roster_count`` existed before sport modes and is defaulted
-            # by the v1 normalizer.  It is therefore not a caller-controlled
-            # constraint for a fixed tennis mode: the profile overwrites it.
-            maximum = mode.expected_player_count
-        else:
-            maximum = int(maximum or max(mode.allowed_player_counts))
-            if maximum not in mode.allowed_player_counts:
-                allowed = ", ".join(str(value) for value in mode.allowed_player_counts)
-                raise ValueError(
-                    f"max_roster_count must be one of [{allowed}] for session_mode={mode.session_mode}"
-                )
-            if expected is not None and int(expected) > maximum:
-                raise ValueError("expected_player_count cannot exceed max_roster_count")
-
-        detector = str(normalized.get("shuttle_detector") or "none")
-        if detector not in self.allowed_ball_detectors:
-            allowed = ", ".join(self.allowed_ball_detectors)
-            raise ValueError(
-                f"shuttle_detector must be one of [{allowed}] for sport_id={self.sport_id}"
-            )
-
-        scope_id = str(
-            normalized.get("calibration_scope") or mode.default_calibration_scope
-        )
-        scope = mode.calibration_scope(scope_id)
-        normalized.update(
-            {
-                "sport_id": self.sport_id,
-                "session_mode": mode.session_mode,
-                "calibration_scope": scope.scope_id,
-                "court_dimensions_m": list(self.court_dimensions_m),
-                "calibration_world_points_m": [
-                    list(point) for point in scope.world_points_m
-                ],
-                "athlete_observation_region": mode.athlete_observation_region,
-                "athlete_observation_margin_m": float(
-                    mode.athlete_observation_margin_m
-                ),
-                "expected_player_count": (
-                    None if expected is None else int(expected)
-                ),
-                "max_roster_count": int(maximum),
-            }
-        )
-        if mode.expected_player_count == 1:
-            # A single-player training session has no teammate-discovery phase.
-            # Stable pose frames still guard roster bootstrap, but it must not
-            # wait through the legacy eight-second 2/4-player window.
-            normalized["roster_discovery_seconds"] = 0.0
-        return normalized
-
 
 def _full_court_scope(width: float, length: float) -> CalibrationScopeProfile:
     return CalibrationScopeProfile(

@@ -83,6 +83,10 @@ fi
 
 [[ -f "$SOURCE_DIR/deploy/start_gpu_api_container.sh" ]] || \
   fail "Package is missing deploy/start_gpu_api_container.sh"
+[[ -f "$SOURCE_DIR/deploy/start_badminton_gpu_container.sh" ]] || \
+  fail "Package is missing deploy/start_badminton_gpu_container.sh"
+[[ -f "$SOURCE_DIR/deploy/start_sport_gpu_container.sh" ]] || \
+  fail "Package is missing deploy/start_sport_gpu_container.sh"
 [[ -f "$SOURCE_DIR/deploy/install_lap.sh" ]] || \
   fail "Package is missing deploy/install_lap.sh"
 
@@ -198,6 +202,9 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR"
 cp -a "$SOURCE_DIR/." "$APP_DIR/"
 chmod +x "$APP_DIR/deploy/start_gpu_api_container.sh" \
+  "$APP_DIR/deploy/start_badminton_gpu_container.sh" \
+  "$APP_DIR/deploy/start_sport_gpu_container.sh" \
+  "$APP_DIR/deploy/start_tennis_gpu_container.sh" \
   "$APP_DIR/deploy/stop_gpu_api_container.sh" \
   "$APP_DIR/deploy/install_lap.sh" \
   "$APP_DIR/deploy/refresh_gpu_api_from_zip.sh"

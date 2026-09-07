@@ -1,12 +1,9 @@
-"""Start a GPU process permanently configured for tennis vision."""
+"""Fixed tennis entry point for the pure GPU visual-observation process."""
 
-import os
+from api.gpu_stream_app import create_gpu_stream_app
+from api.vision_profiles import TENNIS_PROFILE
 
-# The entrypoint itself selects tennis before the composition root is loaded.
-# A stream request can choose only ``singles_match`` or
-# ``single_player_training`` after this point.
-os.environ["GOOD_SPORT_VISION_PROFILE"] = "tennis"
 
-from api.app import app
+app = create_gpu_stream_app(vision_profile=TENNIS_PROFILE)
 
 __all__ = ["app"]

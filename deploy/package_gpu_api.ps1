@@ -28,6 +28,11 @@ $packageRoot = Join-Path $stagingRoot 'good-badminton-gpu-api'
 # experiments.  We only need source code and deployment files for an upgrade.
 $requiredExtraFiles = @(
     'deploy/refresh_gpu_api_from_zip.sh',
+    # Fixed-sport pure GPU launchers must be present even when this archive is
+    # built before the current working tree has been committed.
+    'deploy/start_sport_gpu_container.sh',
+    'deploy/start_badminton_gpu_container.sh',
+    'deploy/start_tennis_gpu_container.sh',
     'deploy/install_lap.sh',
     'deploy/package_gpu_api.ps1',
     'deploy/run_performance_gate.sh',
@@ -149,10 +154,12 @@ try {
     }
 
     $apiEntry = Join-Path $packageRoot 'api/app.py'
+    $pureStreamEntry = Join-Path $packageRoot 'api/gpu_stream_app.py'
     $launcher = Join-Path $packageRoot 'deploy/start_gpu_api_container.sh'
+    $sportLauncher = Join-Path $packageRoot 'deploy/start_sport_gpu_container.sh'
     $analysisPipeline = Join-Path $packageRoot 'webui/pipeline.py'
-    if (-not (Test-Path -LiteralPath $apiEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or -not (Test-Path -LiteralPath $analysisPipeline -PathType Leaf)) {
-        throw 'Package validation failed: api/app.py, the API launcher, or webui/pipeline.py is missing.'
+    if (-not (Test-Path -LiteralPath $apiEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $pureStreamEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or -not (Test-Path -LiteralPath $sportLauncher -PathType Leaf) -or -not (Test-Path -LiteralPath $analysisPipeline -PathType Leaf)) {
+        throw 'Package validation failed: legacy API, pure stream API, launchers, or legacy pipeline is missing.'
     }
 
     $absoluteOutputPath = [System.IO.Path]::GetFullPath($OutputPath)

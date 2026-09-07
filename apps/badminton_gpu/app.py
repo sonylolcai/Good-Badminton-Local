@@ -1,11 +1,9 @@
-"""Start a GPU process permanently configured for badminton vision."""
+"""Fixed badminton entry point for the pure GPU visual-observation process."""
 
-import os
+from api.gpu_stream_app import create_gpu_stream_app
+from api.vision_profiles import BADMINTON_PROFILE
 
-# The legacy ``api.app`` composition root resolves its profile during import.
-# Set it here rather than accepting a request-time sport switch.
-os.environ["GOOD_SPORT_VISION_PROFILE"] = "badminton"
 
-from api.app import app
+app = create_gpu_stream_app(vision_profile=BADMINTON_PROFILE)
 
 __all__ = ["app"]

@@ -8,6 +8,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from api.app import _configured_vision_profile, create_app
+from api.gpu_stream_app import create_gpu_stream_app
+from api.mode_sync import VisionModeSynchronizer
 from api.stream_runtime import StreamProcessorFactory
 from api.vision_profiles import (
     FULL_COURT,
@@ -20,6 +22,9 @@ from tests.stream_test_utils import create_request
 
 
 class GpuSportProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.tennis_modes = VisionModeSynchronizer(TENNIS_PROFILE)
+
     @staticmethod
     def configuration(**overrides):
         return {
@@ -32,9 +37,9 @@ class GpuSportProfileTests(unittest.TestCase):
 
     def test_tennis_requires_a_mode_and_derives_fixed_singles_roster(self):
         with self.assertRaisesRegex(ValueError, "session_mode is required"):
-            TENNIS_PROFILE.normalize_session_configuration(self.configuration())
+            self.tennis_modes.synchronize(self.configuration())
 
-        resolved = TENNIS_PROFILE.normalize_session_configuration(
+        resolved = self.tennis_modes.synchronize(
             self.configuration(session_mode="singles_match", calibration_scope=FULL_COURT)
         )
 
@@ -48,7 +53,7 @@ class GpuSportProfileTests(unittest.TestCase):
         )
 
     def test_training_derives_one_near_athlete_and_near_half_world_points(self):
-        resolved = TENNIS_PROFILE.normalize_session_configuration(
+        resolved = self.tennis_modes.synchronize(
             self.configuration(session_mode="single_player_training")
         )
 
@@ -76,10 +81,10 @@ class GpuSportProfileTests(unittest.TestCase):
         for configuration, message in cases:
             with self.subTest(configuration=configuration):
                 with self.assertRaisesRegex(ValueError, message):
-                    TENNIS_PROFILE.normalize_session_configuration(configuration)
+                    self.tennis_modes.synchronize(configuration)
 
     def test_near_half_maps_to_global_near_side_and_excludes_far_people(self):
-        resolved = TENNIS_PROFILE.normalize_session_configuration(
+        resolved = self.tennis_modes.synchronize(
             self.configuration(session_mode="single_player_training")
         )
         court = CourtSpace(
@@ -97,7 +102,7 @@ class GpuSportProfileTests(unittest.TestCase):
         self.assertFalse(court.contains_athlete((4.0, 5.0), margin_m=0.35))
 
     def test_training_tracker_locks_one_person_and_checkpoint_rejects_other_mode(self):
-        resolved = TENNIS_PROFILE.normalize_session_configuration(
+        resolved = self.tennis_modes.synchronize(
             self.configuration(session_mode="single_player_training")
         )
         tracker = PersonOnlyTracker(
@@ -164,6 +169,28 @@ class GpuSportProfileTests(unittest.TestCase):
             factory.validate_session_request(request)
             self.assertEqual(request["configuration"]["expected_player_count"], 1)
             self.assertEqual(request["configuration"]["shuttle_detector"], "none")
+
+    def test_pure_gpu_app_exposes_stream_contract_without_job_or_business_state(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"GOOD_BADMINTON_API_KEY": "test-key"}, clear=False
+        ):
+            app = create_gpu_stream_app(
+                data_dir=Path(directory),
+                start_worker=False,
+                vision_profile=TENNIS_PROFILE,
+            )
+            client = TestClient(app)
+
+            health = client.get("/api/v1/health")
+            self.assertEqual(health.status_code, 200)
+            self.assertEqual(health.json()["sport_id"], "tennis")
+            self.assertEqual(health.json()["service_kind"], "pure_gpu_visual_observation")
+            self.assertFalse(hasattr(app.state, "job_manager"))
+
+            # A pure GPU deployment has no endpoint that can run the legacy
+            # whole-video pipeline (hit/rally/report/rendering derivation).
+            response = client.post("/api/v1/jobs", headers={"X-API-Key": "test-key"})
+            self.assertEqual(response.status_code, 404)
 
     def test_process_profile_is_selected_only_at_startup(self):
         with patch.dict(

@@ -8,22 +8,13 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 
 from .jobs import AnalysisJobManager
-from .stream_errors import StreamSessionError, validation_error
-from .stream_models import MAX_SEGMENT_BYTES, validate_create_request
 from .stream_runtime import StreamProcessorFactory
+from .stream_routes import register_stream_routes
 from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile, get_vision_profile
-from .stream_sessions import (
-    StreamSessionManager,
-    cancel_session_handler,
-    complete_session_handler,
-    create_session_handler,
-    get_session_status_handler,
-    read_events_handler,
-    submit_segment_handler,
-)
+from .stream_sessions import StreamSessionManager
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
@@ -57,10 +48,6 @@ def create_app(
     app.state.stream_manager = stream_manager
     app.state.vision_profile = vision_profile
 
-    @app.exception_handler(StreamSessionError)
-    async def handle_stream_session_error(_request, exc):
-        return JSONResponse(status_code=exc.status_code, content=exc.to_error_response())
-
     def require_api_key(x_api_key: Optional[str] = Header(default=None)):
         expected = os.environ.get("GOOD_BADMINTON_API_KEY")
         if not expected:
@@ -68,8 +55,7 @@ def create_app(
         if x_api_key != expected:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-    @app.get("/api/v1/health")
-    def health():
+    def stream_health_payload():
         return {
             "status": "ok",
             "service": vision_profile.service_name,
@@ -82,125 +68,12 @@ def create_app(
             "api_auth_configured": bool(os.environ.get("GOOD_BADMINTON_API_KEY")),
         }
 
-    @app.post(
-        "/api/v1/stream-sessions",
-        status_code=status.HTTP_202_ACCEPTED,
-        dependencies=[Depends(require_api_key)],
+    register_stream_routes(
+        app,
+        stream_manager=stream_manager,
+        require_api_key=require_api_key,
+        health_payload=stream_health_payload,
     )
-    async def create_stream_session(
-        body: dict,
-        x_idempotency_key: Optional[str] = Header(default=None),
-    ):
-        # Validate once before touching the model runtime so unknown business
-        # fields can never be silently dropped at the GPU boundary.
-        try:
-            normalized = validate_create_request(body)
-        except ValueError as exc:
-            raise validation_error(str(exc))
-        validator = getattr(stream_manager.processor_factory, "validate_session_request", None)
-        if callable(validator):
-            try:
-                validator(normalized)
-            except (FileNotFoundError, ValueError, RuntimeError) as exc:
-                raise validation_error(str(exc))
-        response_status, payload = create_session_handler(
-            stream_manager,
-            body,
-            x_idempotency_key,
-        )
-        return JSONResponse(status_code=response_status, content=payload)
-
-    @app.post(
-        "/api/v1/stream-sessions/{session_id}/segments/{segment_index}",
-        dependencies=[Depends(require_api_key)],
-    )
-    async def submit_stream_segment(
-        session_id: str,
-        segment_index: int,
-        segment: UploadFile = File(...),
-        metadata: str = Form(...),
-    ):
-        try:
-            metadata_body = json.loads(metadata)
-        except json.JSONDecodeError as exc:
-            raise validation_error(
-                "metadata must be a JSON object",
-                analysis_session_id=session_id,
-            ) from exc
-        # UploadFile is spooled by Starlette; cap the one segment read so the
-        # service never accepts an unbounded request into the engine queue.
-        data_bytes = await segment.read(MAX_SEGMENT_BYTES + 1)
-        response_status, payload = submit_segment_handler(
-            stream_manager,
-            session_id,
-            segment_index,
-            metadata_body,
-            data_bytes,
-        )
-        return JSONResponse(status_code=response_status, content=payload)
-
-    @app.get(
-        "/api/v1/stream-sessions/{session_id}",
-        dependencies=[Depends(require_api_key)],
-    )
-    async def get_stream_session(session_id: str):
-        response_status, payload = get_session_status_handler(stream_manager, session_id)
-        return JSONResponse(status_code=response_status, content=payload)
-
-    @app.get(
-        "/api/v1/stream-sessions/{session_id}/events",
-        dependencies=[Depends(require_api_key)],
-    )
-    async def get_stream_events(
-        session_id: str,
-        cursor: Optional[str] = None,
-        limit: int = 100,
-    ):
-        response_status, payload = read_events_handler(
-            stream_manager,
-            session_id,
-            cursor=cursor,
-            limit=limit,
-        )
-        return JSONResponse(status_code=response_status, content=payload)
-
-    @app.get(
-        "/api/v1/stream-sessions/{session_id}/trace",
-        dependencies=[Depends(require_api_key)],
-    )
-    async def get_stream_trace(session_id: str):
-        # Reuse the status lookup for the same structured not-found behavior.
-        get_session_status_handler(stream_manager, session_id)
-        path = stream_manager.trace_path(session_id)
-        if path is None:
-            raise HTTPException(status_code=404, detail="Stream trace is not available")
-        return FileResponse(path, media_type="application/json", filename=path.name)
-
-    @app.get(
-        "/api/v1/stream-sessions/{session_id}/candidate-photos/{track_id}",
-        dependencies=[Depends(require_api_key)],
-    )
-    async def get_stream_candidate_photo(session_id: str, track_id: str):
-        path = stream_manager.candidate_photo_path(session_id, track_id)
-        if path is None:
-            raise HTTPException(status_code=404, detail="candidate photo is not available")
-        return FileResponse(path, media_type="image/jpeg", filename=f"{track_id}.jpg")
-
-    @app.post(
-        "/api/v1/stream-sessions/{session_id}/complete",
-        dependencies=[Depends(require_api_key)],
-    )
-    async def complete_stream_session(session_id: str, body: dict):
-        response_status, payload = complete_session_handler(stream_manager, session_id, body)
-        return JSONResponse(status_code=response_status, content=payload)
-
-    @app.delete(
-        "/api/v1/stream-sessions/{session_id}",
-        dependencies=[Depends(require_api_key)],
-    )
-    async def cancel_stream_session(session_id: str):
-        response_status, payload = cancel_session_handler(stream_manager, session_id)
-        return JSONResponse(status_code=response_status, content=payload)
 
     @app.post("/api/v1/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_api_key)])
     async def create_job(

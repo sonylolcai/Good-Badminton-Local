@@ -1,6 +1,6 @@
 # GPU 双运动独立部署迭代方案
 
-状态：R2（固定运动入口与人物模式拆分）已在 `feat/tennis-gpu-modes` 实施；网球球模型、独立发布包和 WebUI 仍待后续迭代。
+状态：R2（固定运动入口与人物模式拆分）已在 `feat/tennis-gpu-modes` 实施；纯 GPU 入口、模式同步模块和固定运动启动脚本已补齐。网球球模型、独立发布包和 WebUI 仍待后续迭代。
 范围：GPU 视觉分析与配套 WebUI 适配
 不在范围：自动计分、胜负、排名、业务报告、能量估算、人工身份认领规则
 
@@ -79,6 +79,23 @@ webui/
 运动入口可以配置视觉算法必须知道的事实：会话模式、场地尺寸、网的位置、人物观察多边形、球搜索区域、roster 人数、模型路径、采样率和筛选阈值。
 
 计分规则、落点是否得分、回合归属等信息继续由各自业务端维护。GPU 可以在未来输出有证据的触球或反弹候选，但它们仍是候选视觉事件，不是比赛结论。
+
+### 3.4 三条链路的固定边界
+
+```text
+业务服务：保存场馆/比赛/规则并解释匿名视觉事件
+    │ 只发送 opaque client_reference、分片顺序、标定和 visual session_mode
+    ▼
+模式同步：api/mode_sync.py
+    │ 固定入口的 profile 推导人数、几何和人物观察范围；拒绝换运动或冲突人数
+    ▼
+视觉解析：api/stream_runtime.py + shared tracker/pose/geometry
+    │ 只产生匿名人物、姿态、位置、球候选、质量和运行追踪
+    ▼
+纯 GPU HTTP：apps/<sport>_gpu/app.py + api/gpu_stream_app.py
+```
+
+纯入口没有 `/api/v1/jobs`，也不导入整文件任务、WebUI pipeline、击球/回合/报告或渲染模块。`api.app` 只作为旧羽毛球整文件流程的兼容 façade，不能作为新的 GPU 部署启动目标。
 
 ## 4. 运动适配接口
 
@@ -233,6 +250,18 @@ good-tennis-gpu-api-<version>.zip
 | 上传包名 | `good-badminton-gpu-api-upload.zip` | `good-tennis-gpu-api-upload.zip` |
 
 共享部署实现可以放在 `deploy/common/`，由两个小型运动脚本提供固定目录、进程名称和包身份。部署清单必须写入 `sport_id`；更新脚本在停止旧进程前验证包的运动身份，拒绝错误包。
+
+当前可复现的纯 GPU 启动命令如下。两个网球视觉会话模式是**同一个网球进程内的会话配置**，不应各启一个服务；这样业务端不能靠切换进程来改变视觉约束。
+
+```bash
+# 羽毛球：固定 apps.badminton_gpu.app:app
+bash deploy/start_badminton_gpu_container.sh /root/good-badminton-gpu-api
+
+# 网球：固定 apps.tennis_gpu.app:app；.gpu-api.env 中设 GOOD_SPORT_VISION_PROFILE=tennis
+bash deploy/start_tennis_gpu_container.sh /root/good-tennis-gpu-api
+```
+
+旧命令 `start_gpu_api_container.sh` 仅向后兼容地转发至羽毛球纯入口。共享启动器只允许上述两个 entry point，拒绝 `api.app:app` 或任意外部模块路径。
 
 ### 7.3 发布包裁剪
 
