@@ -1173,7 +1173,13 @@ def _attach_business_interpretation(result, publish=None):
     try:
         from business_gateway.post_match import generate_business_interpretation
 
-        interpretation = generate_business_interpretation(output_dir)
+        # A generic LLM report is intentionally not created for every match.
+        # Longitudinal coaching starts only after a human-confirmed person
+        # binding, through ``generate_longitudinal_coach_followup`` below.
+        interpretation = generate_business_interpretation(
+            output_dir,
+            include_performance_report=False,
+        )
     except (OSError, ValueError) as exc:
         status = {
             "status": "failed",
@@ -1448,7 +1454,7 @@ def _load_latest_movement_display():
 
 
 def save_body_profiles_and_refresh_metrics(analysis_dir, profile_rows, consent, sport_id="badminton"):
-    """Save explicit user inputs, recompute lightweight metrics, then refresh one report."""
+    """Save explicit user inputs and recompute movement evidence only."""
     if sport_id == "tennis":
         raise gr.Error("网球模式当前仅输出匿名视觉速度，不能写入羽毛球赛后身体参数或报告。")
     run_dir = Path(str(analysis_dir or ""))
@@ -1465,6 +1471,7 @@ def save_body_profiles_and_refresh_metrics(analysis_dir, profile_rows, consent, 
         interpretation = generate_business_interpretation(
             run_dir,
             body_profiles_path=body_path,
+            include_performance_report=False,
         )
         metrics = interpretation["movement_metrics"]
         report = interpretation["performance_report"] or {"status": "not_requested"}
@@ -1482,6 +1489,187 @@ def save_body_profiles_and_refresh_metrics(analysis_dir, profile_rows, consent, 
             "movement_metrics": metrics.get("metrics_path"),
             "performance_report_status": report.get("status"),
             "performance_report": report.get("report_path"),
+        },
+    )
+
+
+def _coach_profile_root():
+    return Path("outputs") / "coach_profiles"
+
+
+def _coach_athlete_profile_payload(
+    display_name,
+    dominant_hand,
+    primary_event,
+    training_stage,
+    serve_receive,
+    net_control,
+    rear_court_attack,
+    defensive_stability,
+    shot_consistency,
+    shot_selection,
+    court_awareness,
+    pressure_building,
+    adaptation,
+    strengths,
+    development_priorities,
+    current_training_goal,
+    training_progress_notes,
+    play_style_notes,
+):
+    """Construct only explicitly coach-entered profile data for the business layer."""
+
+    return {
+        "display_name": display_name,
+        "dominant_hand": dominant_hand,
+        "primary_event": primary_event,
+        "training_stage": training_stage,
+        "technical_ratings": {
+            "serve_receive": serve_receive,
+            "net_control": net_control,
+            "rear_court_attack": rear_court_attack,
+            "defensive_stability": defensive_stability,
+            "shot_consistency": shot_consistency,
+        },
+        "tactical_ratings": {
+            "shot_selection": shot_selection,
+            "court_awareness": court_awareness,
+            "pressure_building": pressure_building,
+            "adaptation": adaptation,
+        },
+        "strengths": strengths,
+        "development_priorities": development_priorities,
+        "current_training_goal": current_training_goal,
+        "training_progress_notes": training_progress_notes,
+        "play_style_notes": play_style_notes,
+    }
+
+
+def _coach_profile_form_values(profile):
+    profile = profile if isinstance(profile, dict) else {}
+    technical = profile.get("technical_ratings") if isinstance(profile.get("technical_ratings"), dict) else {}
+    tactical = profile.get("tactical_ratings") if isinstance(profile.get("tactical_ratings"), dict) else {}
+    rating = lambda group, key: group.get(key) if group.get(key) is not None else 0
+    return (
+        profile.get("display_name") or "",
+        profile.get("dominant_hand") or "unknown",
+        profile.get("primary_event") or "unknown",
+        profile.get("training_stage") or "assessment",
+        rating(technical, "serve_receive"),
+        rating(technical, "net_control"),
+        rating(technical, "rear_court_attack"),
+        rating(technical, "defensive_stability"),
+        rating(technical, "shot_consistency"),
+        rating(tactical, "shot_selection"),
+        rating(tactical, "court_awareness"),
+        rating(tactical, "pressure_building"),
+        rating(tactical, "adaptation"),
+        "\n".join(profile.get("strengths") or []),
+        "\n".join(profile.get("development_priorities") or []),
+        profile.get("current_training_goal") or "",
+        profile.get("training_progress_notes") or "",
+        profile.get("play_style_notes") or "",
+    )
+
+
+def load_coach_athlete_profile(person_id, sport_id="badminton"):
+    if sport_id == "tennis":
+        raise gr.Error("网球模式当前只输出匿名视觉速度，尚未启用羽毛球 AI 教练档案。")
+    person_id = str(person_id or "").strip()
+    if not person_id:
+        raise gr.Error("请输入固定的球员 person_id 后再读取教练档案。")
+    try:
+        from business_gateway.coach import load_or_create_athlete_profile
+
+        profile_path, profile = load_or_create_athlete_profile(
+            _coach_profile_root(), person_id, sport_id=sport_id
+        )
+    except (OSError, ValueError) as exc:
+        raise gr.Error(f"读取球员教练档案失败：{exc}") from exc
+    return (*_coach_profile_form_values(profile), {
+        "status": "loaded" if Path(profile_path).is_file() else "new_unsaved_profile",
+        "profile_path": str(profile_path),
+        "data_source": "coach_manual_input",
+        "policy": "档案字段由教练录入；不会由视频或 LLM 自动填充。",
+    })
+
+
+def save_coach_athlete_profile(person_id, sport_id, *form_values):
+    if sport_id == "tennis":
+        raise gr.Error("网球模式当前只输出匿名视觉速度，尚未启用羽毛球 AI 教练档案。")
+    person_id = str(person_id or "").strip()
+    if not person_id:
+        raise gr.Error("请输入固定的球员 person_id 后再保存教练档案。")
+    try:
+        from business_gateway.coach import save_athlete_profile
+
+        profile_path, profile = save_athlete_profile(
+            _coach_profile_root(),
+            person_id,
+            _coach_athlete_profile_payload(*form_values),
+            sport_id=sport_id,
+        )
+    except (OSError, ValueError) as exc:
+        raise gr.Error(f"保存球员教练档案失败：{exc}") from exc
+    return {
+        "status": "saved",
+        "profile_path": profile_path,
+        "person_id": person_id,
+        "display_name": profile.get("display_name"),
+        "data_source": profile.get("source"),
+        "policy": "主观评分、打法与训练进度均保留为教练录入，不与视觉测量混淆。",
+    }
+
+
+def generate_longitudinal_coach_followup(
+    analysis_dir,
+    person_id,
+    sport_id="badminton",
+    coach_match_notes="",
+):
+    """Create one baseline/follow-up coach artifact after human identity review.
+
+    This does not submit any identity data to the GPU.  It reads the immutable
+    local analysis artifacts, checks the separately saved human Track ID
+    binding, then updates a business-owned per-person profile under
+    ``outputs/coach_profiles``.
+    """
+
+    if sport_id == "tennis":
+        raise gr.Error("网球模式当前只输出匿名视觉速度，尚未启用羽毛球 AI 教练档案。")
+    run_dir = Path(str(analysis_dir or ""))
+    if not run_dir.is_dir():
+        raise gr.Error("请先完成一次分析并保存赛后身份绑定。")
+    person_id = str(person_id or "").strip()
+    if not person_id:
+        raise gr.Error("请输入已在赛后身份确认中绑定的 person_id。")
+    try:
+        from business_gateway.coach.longitudinal import record_coach_followup_from_analysis
+
+        report = record_coach_followup_from_analysis(
+            run_dir,
+            person_id=person_id,
+            profile_root=_coach_profile_root(),
+            manual_context={
+                "match_context": {"coach_match_notes": coach_match_notes}
+            } if str(coach_match_notes or "").strip() else None,
+        )
+    except (OSError, ValueError) as exc:
+        raise gr.Error(f"生成 AI 教练纵向反馈失败：{exc}") from exc
+    follow_up = report.get("follow_up") or {}
+    return (
+        report.get("report_path"),
+        {
+            "status": report.get("status"),
+            "report_path": report.get("report_path"),
+            "profile_path": report.get("profile_path"),
+            "mode": follow_up.get("mode"),
+            "summary": follow_up.get("summary"),
+            "focus_items": follow_up.get("focus_items") or [],
+            "training_plan": report.get("training_plan_candidate"),
+            "training_plan_path": report.get("training_plan_path"),
+            "limits": follow_up.get("limits") or [],
+            "llm_reason": report.get("reason"),
         },
     )
 
@@ -2813,7 +3001,7 @@ def build_ui():
                         elem_id="badminton-tracknet-raw",
                     )
                     output_performance_report = gr.File(
-                        label="运动表现报告（含大模型状态）",
+                        label="旧通用运动表现报告（本次流程不自动生成；AI 教练使用下方纵向档案）",
                         elem_id="badminton-performance-report",
                     )
                     output_movement_metrics = gr.File(label="运动数据（按视觉 Track ID）")
@@ -2854,8 +3042,107 @@ def build_ui():
                             value=False,
                             label="我同意仅将上述身高体重用于本次赛后能量消耗估算",
                         )
-                        save_body_profile_btn = gr.Button("保存身体参数并刷新运动数据/赛后报告")
+                        save_body_profile_btn = gr.Button("保存身体参数并刷新运动数据")
                         body_profile_status = gr.JSON(label="身体参数与运动数据刷新状态", value={"status": "waiting_for_analysis"})
+                        with gr.Accordion("球员专属 AI 教练档案与纵向跟进", open=False):
+                            gr.Markdown(
+                                "先由教练为每位学员录入已确认的能力、打法与训练进度；评分 `0` 表示暂未评估，"
+                                "不会被视频或 LLM 自动补全。首次连续 **3 场完整、同条件且身份已确认** 的比赛用于建立个人移动基线。"
+                                "之后每场只返回相对基线的变化、保持项和最多两项下一场关注点；单场波动会标为待确认，"
+                                "不再重复输出整份泛化优缺点。\n\n"
+                                "请先在“球路复核”页的“赛后身份与队伍确认”中，将当前 `track_id` 人工绑定到 `person_id`。"
+                                "该身份仅留在业务侧教练档案，绝不会发送给 GPU。"
+                            )
+                            with gr.Row():
+                                coach_person_id = gr.Textbox(
+                                    label="学员固定 person_id",
+                                    placeholder="与赛后身份确认中保存的 person_id 完全一致",
+                                    scale=3,
+                                )
+                                coach_profile_load_btn = gr.Button("读取档案", scale=1)
+                                coach_profile_save_btn = gr.Button(
+                                    "保存教练档案", variant="secondary", scale=1
+                                )
+                            with gr.Row():
+                                coach_display_name = gr.Textbox(label="学员称呼（可选）", scale=2)
+                                coach_dominant_hand = gr.Dropdown(
+                                    choices=[("未评估", "unknown"), ("右手", "right"), ("左手", "left")],
+                                    value="unknown",
+                                    label="持拍手",
+                                )
+                                coach_primary_event = gr.Dropdown(
+                                    choices=[("未评估", "unknown"), ("单打", "singles"), ("双打", "doubles"), ("混双", "mixed")],
+                                    value="unknown",
+                                    label="主要项目",
+                                )
+                                coach_training_stage = gr.Dropdown(
+                                    choices=[
+                                        ("初始评估", "assessment"),
+                                        ("技术基础", "technique_foundation"),
+                                        ("专项强化", "targeted_strengthening"),
+                                        ("赛前准备", "pre_competition"),
+                                        ("维持调整", "maintenance"),
+                                    ],
+                                    value="assessment",
+                                    label="当前训练阶段",
+                                )
+                            gr.Markdown("#### 教练主观技术评分（1–5；0 = 暂未评估）")
+                            with gr.Row():
+                                coach_serve_receive = gr.Slider(0, 5, value=0, step=1, label="发接发")
+                                coach_net_control = gr.Slider(0, 5, value=0, step=1, label="网前控制")
+                                coach_rear_court_attack = gr.Slider(0, 5, value=0, step=1, label="后场进攻")
+                                coach_defensive_stability = gr.Slider(0, 5, value=0, step=1, label="防守稳定性")
+                                coach_shot_consistency = gr.Slider(0, 5, value=0, step=1, label="击球一致性")
+                            gr.Markdown("#### 教练主观战术评分（1–5；0 = 暂未评估）")
+                            with gr.Row():
+                                coach_shot_selection = gr.Slider(0, 5, value=0, step=1, label="球路选择")
+                                coach_court_awareness = gr.Slider(0, 5, value=0, step=1, label="场地意识")
+                                coach_pressure_building = gr.Slider(0, 5, value=0, step=1, label="施压组织")
+                                coach_adaptation = gr.Slider(0, 5, value=0, step=1, label="临场调整")
+                            with gr.Row():
+                                coach_strengths = gr.Textbox(
+                                    label="教练已确认优势",
+                                    placeholder="每行一项，例如：网前控球",
+                                    lines=3,
+                                )
+                                coach_development_priorities = gr.Textbox(
+                                    label="当前培养重点",
+                                    placeholder="每行一项，例如：后场突击",
+                                    lines=3,
+                                )
+                            coach_current_training_goal = gr.Textbox(
+                                label="当前训练目标",
+                                placeholder="例如：提升单打后场连续进攻质量",
+                                lines=2,
+                            )
+                            coach_training_progress_notes = gr.Textbox(
+                                label="近期训练进度 / 教练备注",
+                                placeholder="例如：本周完成两次多球训练；下周观察训练迁移到比赛的表现",
+                                lines=3,
+                            )
+                            coach_play_style_notes = gr.Textbox(
+                                label="当前打法 / 已确认的调整方向",
+                                placeholder="教练记录，例如：以控网后场突击为主；本阶段尝试增加二次加速",
+                                lines=2,
+                            )
+                            coach_match_notes = gr.Textbox(
+                                label="本场比赛/训练表现与对手情况（可选，教练录入）",
+                                placeholder="例如：对手节奏快；第三局后场衔接下降。此记录不由视频自动推断。",
+                                lines=3,
+                            )
+                            coach_profile_status = gr.JSON(
+                                label="球员教练档案状态",
+                                value={"status": "waiting_for_person_id"},
+                            )
+                            coach_followup_btn = gr.Button(
+                                "保存档案并更新本场纵向跟进",
+                                variant="primary",
+                            )
+                            coach_followup_file = gr.File(label="AI 教练纵向反馈（证据与模型状态）")
+                            coach_followup_status = gr.JSON(
+                                label="本场 AI 教练跟进结果",
+                                value={"status": "waiting_for_confirmed_identity"},
+                            )
                         output_rally_summary = gr.Markdown("### 回合与拍数\n完成分析后显示候选回合与每回合拍数。")
                         output_rallies = gr.Dataframe(
                             headers=["回合", "开始(s)", "结束(s)", "候选拍数", "可见球候选", "缺球补拍", "结束依据", "置信度"],
@@ -3473,6 +3760,45 @@ def build_ui():
                 body_profile_table,
                 output_performance_report, body_profile_status,
             ],
+        )
+        coach_profile_form_inputs = [
+            coach_display_name, coach_dominant_hand, coach_primary_event, coach_training_stage,
+            coach_serve_receive, coach_net_control, coach_rear_court_attack,
+            coach_defensive_stability, coach_shot_consistency,
+            coach_shot_selection, coach_court_awareness, coach_pressure_building, coach_adaptation,
+            coach_strengths, coach_development_priorities, coach_current_training_goal,
+            coach_training_progress_notes, coach_play_style_notes,
+        ]
+        coach_profile_form_outputs = [
+            coach_display_name, coach_dominant_hand, coach_primary_event, coach_training_stage,
+            coach_serve_receive, coach_net_control, coach_rear_court_attack,
+            coach_defensive_stability, coach_shot_consistency,
+            coach_shot_selection, coach_court_awareness, coach_pressure_building, coach_adaptation,
+            coach_strengths, coach_development_priorities, coach_current_training_goal,
+            coach_training_progress_notes, coach_play_style_notes, coach_profile_status,
+        ]
+        coach_profile_load_btn.click(
+            fn=load_coach_athlete_profile,
+            inputs=[coach_person_id, sport_mode],
+            outputs=coach_profile_form_outputs,
+            show_progress="hidden",
+        )
+        coach_profile_save_btn.click(
+            fn=save_coach_athlete_profile,
+            inputs=[coach_person_id, sport_mode, *coach_profile_form_inputs],
+            outputs=[coach_profile_status],
+            show_progress="hidden",
+        )
+        coach_followup_btn.click(
+            fn=save_coach_athlete_profile,
+            inputs=[coach_person_id, sport_mode, *coach_profile_form_inputs],
+            outputs=[coach_profile_status],
+            show_progress="hidden",
+        ).then(
+            fn=generate_longitudinal_coach_followup,
+            inputs=[analysis_output_dir_state, coach_person_id, sport_mode, coach_match_notes],
+            outputs=[coach_followup_file, coach_followup_status],
+            show_progress="minimal",
         )
         demo.load(
             fn=_load_latest_movement_display,
