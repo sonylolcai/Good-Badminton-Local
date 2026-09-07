@@ -105,6 +105,27 @@ Required configuration:
 - `shuttle_detector`: `none`, `yolo` or explicitly enabled `tracknet_v3`.
 - `generate_annotated_video`: production default is `false`.
 
+Fixed-sport GPU deployments may additionally accept these optional anonymous
+vision fields. They select visual constraints only; they never identify a
+person, make a score decision or change the process to another sport.
+
+- `sport_id`: an optional identity assertion. It must match the deployment's
+  fixed profile (`badminton` or `tennis`).
+- `session_mode`: required by the tennis deployment. It accepts only
+  `singles_match` (two anonymous athletes) or `single_player_training` (one
+  near-side anonymous athlete). The badminton compatibility deployment keeps
+  `match` and its existing 2/4-person roster policy.
+- `calibration_scope`: `full_court` or, only for tennis single-player training,
+  `near_half_court`. In the latter case the four `court_corners` represent the
+  near net-line corners followed by the near baseline corners, and map to the
+  global near half of `tennis_singles_court_m_v1`.
+
+The server derives `expected_player_count` and `max_roster_count` from a fixed
+tennis mode: 2 for `singles_match`, 1 for `single_player_training`. A caller
+cannot override those values. The tennis deployment currently accepts only
+`shuttle_detector=none`; its independent tennis ball model is a later GPU
+iteration.
+
 If `shuttle_detector=tracknet_v3`, `tracknet_overlap_frames` MUST be 7 when present,
 because the verified temporal window length is 8. This contract does not claim that
 TrackNet can use the common 10Hz sampling without changing model semantics.

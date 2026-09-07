@@ -22,7 +22,7 @@ from ..streaming.models import FinalizationContext, FrameContext, ProcessorEvent
 from .bytetrack_adapter import ByteTrackAdapter
 
 
-PERSON_ONLY_SCHEMA_VERSION = "person-only.v1"
+PERSON_ONLY_SCHEMA_VERSION = "person-only.v2"
 PERSON_ONLY_STATES = {
     "candidate",
     "active",
@@ -56,6 +56,14 @@ class PersonOnlyTracker:
         max_roster_count: int = 4,
         roster_discovery_seconds: float = 8.0,
         roster_reacquire_seconds: float = 1.0,
+        court_dimensions_m=None,
+        calibration_world_points_m=None,
+        athlete_observation_region: str = "full_court_athletes",
+        athlete_observation_margin_m: float = 0.35,
+        sport_id: str = "badminton",
+        session_mode: str = "match",
+        calibration_scope: str = "full_court",
+        coordinate_system_id: str = "standard_badminton_court_m",
     ) -> None:
         if tracker_backend not in {"court_association", "bytetrack"}:
             raise ValueError("tracker_backend must be court_association or bytetrack")
@@ -66,7 +74,35 @@ class PersonOnlyTracker:
         if not 0 < float(reliable_coverage_threshold) <= 1:
             raise ValueError("reliable_coverage_threshold must be in (0, 1]")
 
-        self.court_space = CourtSpace(image_corners)
+        self.court_dimensions_m = (
+            None
+            if court_dimensions_m is None
+            else tuple(float(value) for value in court_dimensions_m)
+        )
+        self.calibration_world_points_m = (
+            None
+            if calibration_world_points_m is None
+            else [
+                [float(point[0]), float(point[1])]
+                for point in calibration_world_points_m
+            ]
+        )
+        self.athlete_observation_region = str(athlete_observation_region)
+        self.athlete_observation_margin_m = max(
+            0.0,
+            float(athlete_observation_margin_m),
+        )
+        self.sport_id = str(sport_id)
+        self.session_mode = str(session_mode)
+        self.calibration_scope = str(calibration_scope)
+        self.coordinate_system_id = str(coordinate_system_id)
+        court_kwargs = {
+            "world_points_m": self.calibration_world_points_m,
+            "athlete_observation_region": self.athlete_observation_region,
+        }
+        if self.court_dimensions_m is not None:
+            court_kwargs["court_dimensions"] = self.court_dimensions_m
+        self.court_space = CourtSpace(image_corners, **court_kwargs)
         self.image_corners = [
             [float(point[0]), float(point[1])] for point in image_corners
         ]
@@ -77,7 +113,7 @@ class PersonOnlyTracker:
             None if expected_roster_count is None else int(expected_roster_count)
         )
         self.roster_stable_frames = max(1, int(roster_stable_frames))
-        self.max_roster_count = max(2, int(max_roster_count))
+        self.max_roster_count = max(1, int(max_roster_count))
         self.roster_discovery_seconds = max(0.0, float(roster_discovery_seconds))
         self.roster_reacquire_seconds = float(roster_reacquire_seconds)
         self.min_confirmed_detections = int(min_confirmed_detections)
@@ -140,7 +176,14 @@ class PersonOnlyTracker:
                 source_time_sec=self._last_source_time_sec,
             )
 
-        normalized = [dict(item) for item in (observations if observations is not None else ())]
+        normalized = [
+            dict(item)
+            for item in (observations if observations is not None else ())
+            if self.court_space.contains_athlete(
+                item.get("court_xy"),
+                margin_m=self.athlete_observation_margin_m,
+            )
+        ]
         if self._byte_tracker is not None:
             association_keys = self._byte_tracker.update(normalized)
             for index, association_key in association_keys.items():
@@ -182,7 +225,10 @@ class PersonOnlyTracker:
         output = []
         for index, observation in enumerate(observations):
             court_xy = observation.get("court_xy")
-            if court_xy is None or not self.court_space.contains(court_xy, margin_m=0.35):
+            if court_xy is None or not self.court_space.contains_athlete(
+                court_xy,
+                margin_m=self.athlete_observation_margin_m,
+            ):
                 continue
             association_key = str(observation.get("association_key") or "")
             safe_key = "".join(
@@ -351,6 +397,14 @@ class PersonOnlyTracker:
         return {
             "state_version": PERSON_ONLY_SCHEMA_VERSION,
             "tracker_backend": self.tracker_backend,
+            "sport_id": self.sport_id,
+            "session_mode": self.session_mode,
+            "calibration_scope": self.calibration_scope,
+            "coordinate_system_id": self.coordinate_system_id,
+            "court_dimensions_m": [self.court_space.width_m, self.court_space.length_m],
+            "calibration_world_points_m": deepcopy(self.calibration_world_points_m),
+            "athlete_observation_region": self.athlete_observation_region,
+            "athlete_observation_margin_m": self.athlete_observation_margin_m,
             "lock_match_roster": self.lock_match_roster,
             "expected_roster_count": self._tracker.expected_roster_count,
             "roster_stable_frames": self.roster_stable_frames,
@@ -371,6 +425,22 @@ class PersonOnlyTracker:
             raise ValueError("unsupported person_only checkpoint")
         if state.get("tracker_backend") != self.tracker_backend:
             raise ValueError("person_only checkpoint tracker backend does not match")
+        expected_geometry = {
+            "sport_id": self.sport_id,
+            "session_mode": self.session_mode,
+            "calibration_scope": self.calibration_scope,
+            "coordinate_system_id": self.coordinate_system_id,
+            "court_dimensions_m": [self.court_space.width_m, self.court_space.length_m],
+            "calibration_world_points_m": self.calibration_world_points_m,
+            "athlete_observation_region": self.athlete_observation_region,
+            "athlete_observation_margin_m": self.athlete_observation_margin_m,
+        }
+        restored_geometry = {
+            key: state.get(key)
+            for key in expected_geometry
+        }
+        if restored_geometry != expected_geometry:
+            raise ValueError("person_only checkpoint vision profile does not match")
         if bool(state.get("lock_match_roster", False)) != self.lock_match_roster:
             raise ValueError("person_only roster lock setting does not match")
         if (
@@ -441,7 +511,10 @@ class PersonOnlyTracker:
         return {
             "schema_version": PERSON_ONLY_SCHEMA_VERSION,
             "analysis_mode": "person_only",
-            "coordinate_system": "standard_badminton_court_m",
+            "coordinate_system": self.coordinate_system_id,
+            "sport_id": self.sport_id,
+            "session_mode": self.session_mode,
+            "calibration_scope": self.calibration_scope,
             "tracking": {
                 "backend": self.tracker_backend,
                 "open_set": not self.lock_match_roster,

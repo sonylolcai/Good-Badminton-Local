@@ -59,10 +59,22 @@ COCO17_KEYPOINT_NAMES = [
 class CourtSpace:
     """A standard-court coordinate system independent of image orientation."""
 
-    def __init__(self, image_corners, court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH)):
+    def __init__(
+        self,
+        image_corners,
+        court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH),
+        *,
+        world_points_m=None,
+        athlete_observation_region="full_court_athletes",
+    ):
         self.width_m, self.length_m = (float(value) for value in court_dimensions)
-        self.mapper = CourtMapper(image_corners, court_dimensions=court_dimensions)
+        self.mapper = CourtMapper(
+            image_corners,
+            court_dimensions=court_dimensions,
+            world_points_m=world_points_m,
+        )
         self.net_y_m = self.length_m / 2.0
+        self.athlete_observation_region = str(athlete_observation_region)
 
     def image_to_court(self, image_xy):
         point = self.mapper.image_to_court(image_xy)
@@ -86,6 +98,19 @@ class CourtSpace:
             return False
         x, y = (float(value) for value in court_xy)
         return -margin_m <= x <= self.width_m + margin_m and -margin_m <= y <= self.length_m + margin_m
+
+    def contains_athlete(self, court_xy, margin_m=0.0):
+        """Return whether a pose may enter the anonymous roster.
+
+        The map itself stays a full sport coordinate system.  A training mode
+        can therefore map a near half-court to its true global coordinates
+        while excluding people on the far side from tracker bootstrap.
+        """
+        if not self.contains(court_xy, margin_m=margin_m):
+            return False
+        if self.athlete_observation_region == "near_court_athlete":
+            return float(court_xy[1]) >= self.net_y_m - margin_m
+        return True
 
 
 @dataclass

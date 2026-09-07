@@ -26,6 +26,8 @@ from badminton_analysis.detection.yolo_pose import YOLOPoseProcessor
 from badminton_analysis.streaming.models import FinalizationContext, FrameContext, ProcessorEvent
 from badminton_analysis.tracking.person_only import PersonOnlyFrameProcessor, PersonOnlyTracker
 
+from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile
+
 from .candidate_photos import CandidatePhotoCollector
 
 
@@ -159,7 +161,10 @@ class PoseObservationProvider:
             return None
 
         court_xy = self.tracker.court_space.image_to_court(image_xy)
-        if court_xy is None or not self.tracker.court_space.contains(court_xy, margin_m=0.35):
+        if court_xy is None or not self.tracker.court_space.contains_athlete(
+            court_xy,
+            margin_m=self.tracker.athlete_observation_margin_m,
+        ):
             return None
         hands = {}
         if visible(9):
@@ -314,6 +319,7 @@ class StreamProcessorFactory:
         pose_model_factory: Optional[Callable[[str], Any]] = None,
         ball_model_factory: Optional[Callable[[str], Any]] = None,
         byte_tracker_factory=None,
+        vision_profile: SportVisionProfile = BADMINTON_PROFILE,
     ):
         self.data_dir = Path(data_dir).resolve()
         # Ultralytics creates a settings directory while importing ``YOLO``.
@@ -329,11 +335,18 @@ class StreamProcessorFactory:
         self.pose_model_factory = pose_model_factory
         self.ball_model_factory = ball_model_factory
         self.byte_tracker_factory = byte_tracker_factory
+        self.vision_profile = vision_profile
 
     def validate_session_request(self, request):
         if not isinstance(request.get("court_corners"), list) or len(request["court_corners"]) != 4:
             raise ValueError("stream session requires exactly four business-supplied court_corners")
-        configuration = request["configuration"]
+        configuration = self.vision_profile.normalize_session_configuration(
+            request["configuration"]
+        )
+        # Persist only fixed-profile-derived settings.  This prevents a later
+        # worker or restore path from reinterpreting the same session under a
+        # different sport/mode.
+        request["configuration"] = configuration
         if configuration.get("generate_annotated_video"):
             raise ValueError(
                 "streaming annotated-video export is not implemented; keep generate_annotated_video=false"
@@ -353,6 +366,14 @@ class StreamProcessorFactory:
                 configuration.get("far_player_enhancement", False)
             ),
             "far_roi": configuration.get("far_pose_roi"),
+            "world_points_m": configuration["calibration_world_points_m"],
+            "court_dimensions_m": configuration["court_dimensions_m"],
+            "athlete_observation_region": configuration[
+                "athlete_observation_region"
+            ],
+            "athlete_observation_margin_m": configuration[
+                "athlete_observation_margin_m"
+            ],
         }
         sample_hz = int(configuration["analysis_sample_hz"])
         # This is a session contract choice, not a GPU-process default.  The
@@ -381,6 +402,14 @@ class StreamProcessorFactory:
             roster_discovery_seconds=float(
                 configuration.get("roster_discovery_seconds", 8.0)
             ),
+            court_dimensions_m=calibration["court_dimensions_m"],
+            calibration_world_points_m=calibration["world_points_m"],
+            athlete_observation_region=calibration["athlete_observation_region"],
+            athlete_observation_margin_m=calibration["athlete_observation_margin_m"],
+            sport_id=configuration["sport_id"],
+            session_mode=configuration["session_mode"],
+            calibration_scope=configuration["calibration_scope"],
+            coordinate_system_id=self.vision_profile.coordinate_system_id,
         )
 
         project_root = Path(__file__).resolve().parents[1]

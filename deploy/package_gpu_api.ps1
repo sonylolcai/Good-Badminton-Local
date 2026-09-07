@@ -122,6 +122,7 @@ try {
     # weights and virtual environments remain excluded by construction.
     $deployableUntrackedPrefixes = @(
         'api/',
+        'apps/',
         'badminton_analysis/',
         'business_gateway/',
         'good_badminton_contracts/',

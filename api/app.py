@@ -14,6 +14,7 @@ from .jobs import AnalysisJobManager
 from .stream_errors import StreamSessionError, validation_error
 from .stream_models import MAX_SEGMENT_BYTES, validate_create_request
 from .stream_runtime import StreamProcessorFactory
+from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile, get_vision_profile
 from .stream_sessions import (
     StreamSessionManager,
     cancel_session_handler,
@@ -37,19 +38,24 @@ def create_app(
     *,
     stream_processor_factory=None,
     stream_manager=None,
+    vision_profile: SportVisionProfile = BADMINTON_PROFILE,
 ):
     data_path = Path(data_dir or os.environ.get("GOOD_BADMINTON_API_DATA_DIR", "api_data")).resolve()
     manager = AnalysisJobManager(data_path, start_worker=start_worker)
     if stream_manager is None:
-        stream_processor_factory = stream_processor_factory or StreamProcessorFactory(data_path)
+        stream_processor_factory = stream_processor_factory or StreamProcessorFactory(
+            data_path,
+            vision_profile=vision_profile,
+        )
         stream_manager = StreamSessionManager(
             data_path,
             processor_factory=stream_processor_factory,
             start_worker=start_worker,
         )
-    app = FastAPI(title="Good-Badminton GPU API", version="1.0.0")
+    app = FastAPI(title=f"{vision_profile.service_name} GPU API", version="1.0.0")
     app.state.job_manager = manager
     app.state.stream_manager = stream_manager
+    app.state.vision_profile = vision_profile
 
     @app.exception_handler(StreamSessionError)
     async def handle_stream_session_error(_request, exc):
@@ -66,7 +72,11 @@ def create_app(
     def health():
         return {
             "status": "ok",
-            "service": "good-badminton-gpu-api",
+            "service": vision_profile.service_name,
+            "sport_id": vision_profile.sport_id,
+            "coordinate_system_id": vision_profile.coordinate_system_id,
+            "supported_session_modes": list(vision_profile.supported_session_modes),
+            "contract_versions": ["stream-session.v1"],
             "worker_running": manager.worker_running,
             "stream_worker_running": stream_manager.worker_running,
             "api_auth_configured": bool(os.environ.get("GOOD_BADMINTON_API_KEY")),
@@ -498,7 +508,12 @@ async def _save_upload(upload, staging_dir, allowed_extensions, field_name):
     return path
 
 
-app = create_app()
+def _configured_vision_profile():
+    """Resolve the one sport identity for the legacy import-time entrypoint."""
+    return get_vision_profile(os.environ.get("GOOD_SPORT_VISION_PROFILE", "badminton"))
+
+
+app = create_app(vision_profile=_configured_vision_profile())
 
 
 if __name__ == "__main__":
