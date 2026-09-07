@@ -17,6 +17,7 @@ from webui.log_capture import get_backend_logs, install_backend_log_capture
 from webui.operator_backoffice import OPERATOR_BACKOFFICE_CSS, render_backoffice_tabs
 from webui.player_results import (
     PLAYER_RESULT_HEADERS,
+    TENNIS_PLAYER_RESULT_HEADERS,
     build_player_result_display,
     extract_full_video_candidate_photos,
 )
@@ -38,10 +39,12 @@ from webui.pipeline import (
 )
 from webui.remote_gpu import (
     RemoteAnalysisError,
+    configured_gpu_base_url,
     iter_remote_two_second_stream,
     recover_remote_two_second_stream,
     remote_gpu_config,
     run_remote_analysis,
+    verify_remote_gpu_sport,
 )
 from webui.stream_replay import (
     StreamReplayError,
@@ -78,6 +81,16 @@ from webui.task_control import AnalysisTaskController
 _MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MB
 _ANALYSIS_TASKS = AnalysisTaskController()
+
+TENNIS_MOVEMENT_METRIC_HEADERS = [
+    "匿名视觉 Track ID",
+    "距离(m)",
+    "平均速度(m/s)",
+    "峰值速度(m/s)",
+    "有效移动(s)",
+    "可用覆盖率(%)",
+    "数据质量",
+]
 
 
 def _write_execution_metadata(result, execution):
@@ -132,9 +145,63 @@ def _bgr_to_rgb(img):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def detect_court(video_file, template_file, language="zh", progress=gr.Progress(track_tqdm=False)):
+def _extract_tennis_calibration_frame(video_file):
+    """Save one readable frame for manual tennis calibration without line AI."""
+    capture = cv2.VideoCapture(str(video_file))
+    if not capture.isOpened():
+        raise gr.Error("无法读取网球视频；请上传可播放的视频或清晰的球场截图。")
+    try:
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        # Avoid the very first frame, which is often a fade-in. This is only a
+        # manual-calibration canvas; no badminton court detector is invoked.
+        candidates = [max(0, total // 8), total // 2, 0] if total else [0]
+        frame = None
+        for index in candidates:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, candidate = capture.read()
+            if ok and candidate is not None:
+                frame = candidate
+                break
+    finally:
+        capture.release()
+    if frame is None:
+        raise gr.Error("无法从网球视频提取标定帧；请上传一张清晰的球场截图。")
+    target = Path("outputs") / "court_templates"
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / f"tennis_manual_calibration_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+    if not cv2.imwrite(str(path), frame):
+        raise gr.Error("保存网球标定帧失败。")
+    return str(path)
+
+
+def detect_court(
+    video_file,
+    template_file,
+    language="zh",
+    sport_id="badminton",
+    progress=gr.Progress(track_tqdm=False),
+):
     """Use an uploaded template when supplied; otherwise generate one from video."""
     text = _UI_TEXT.get(language, _UI_TEXT["zh"])
+    if sport_id == "tennis":
+        if template_file:
+            _validate_file_size(template_file, _MAX_IMAGE_BYTES, "Template image")
+            template_path = template_file
+        else:
+            if video_file is None:
+                raise gr.Error(text["need_video"])
+            _validate_file_size(video_file, _MAX_VIDEO_BYTES, "Video")
+            template_path = _extract_tennis_calibration_frame(video_file)
+        template_img = imread_safe(template_path)
+        if template_img is None:
+            raise gr.Error("无法读取网球标定图。")
+        return (
+            _bgr_to_rgb(template_img),
+            None,
+            template_path,
+            "网球模式不使用羽毛球自动线检测。请按左上、右上、右下、左下依次点击单打场地四角，再确认手动角点。",
+            False,
+        )
     if template_file:
         _validate_file_size(template_file, _MAX_IMAGE_BYTES, "Template image")
         result = prepare_court(template_file)
@@ -173,7 +240,7 @@ def detect_court(video_file, template_file, language="zh", progress=gr.Progress(
     return preview_rgb, corners, template_path, status, bool(corners)
 
 
-def on_court_image_select(corners_state, template_file, evt: gr.SelectData):
+def on_court_image_select(corners_state, template_file, sport_id="badminton", evt: gr.SelectData = None):
     """Accumulate clicked points and redraw markers on the template."""
     if not template_file:
         raise gr.Error("Please generate or upload a court template first.")
@@ -183,6 +250,8 @@ def on_court_image_select(corners_state, template_file, evt: gr.SelectData):
     if len(corners_state) >= 4:
         corners_state = []
 
+    if evt is None:
+        raise gr.Error("未收到球场点击坐标。")
     x, y = evt.index
     corners_state.append((x, y))
     if len(corners_state) == 4:
@@ -198,9 +267,12 @@ def on_court_image_select(corners_state, template_file, evt: gr.SelectData):
         cv2.polylines(preview, [np.array(corners_state, dtype=np.int32)],
                       len(corners_state) == 4, (0, 255, 0), 2)
 
-    status = f"Corners selected: {len(corners_state)}/4"
+    status = f"已选择角点：{len(corners_state)}/4"
     if len(corners_state) == 4:
-        status += " — corners locked. Click 'Apply Manual Corners' or re-click to restart."
+        if sport_id == "tennis":
+            status += " — 已按单打场地四角排序。请确认手动角点。"
+        else:
+            status += " — 角点已锁定。请确认手动角点，或继续点击后重新选择。"
 
     corners_out = corners_state if len(corners_state) == 4 else None
     return _bgr_to_rgb(preview), corners_state, corners_out, status
@@ -213,7 +285,7 @@ def _normalize_court_corners(points):
     return [top[0], top[1], bottom[1], bottom[0]]
 
 
-def apply_manual_corners(template_file, corners_state):
+def apply_manual_corners(template_file, corners_state, sport_id="badminton"):
     """Confirm the four detected or manually selected court corners.
 
     ``corners_state`` is the canonical resolved state: automatic detection
@@ -226,6 +298,19 @@ def apply_manual_corners(template_file, corners_state):
         raise gr.Error("Please generate or upload a court template first.")
     if not corners_state or len(corners_state) != 4:
         raise gr.Error("Please click exactly 4 corners on the court image first.")
+
+    if sport_id == "tennis":
+        template_img = imread_safe(template_file)
+        if template_img is None:
+            raise gr.Error("无法读取网球标定图。")
+        preview = template_img.copy()
+        normalized = _normalize_court_corners(corners_state)
+        cv2.polylines(preview, [np.array(normalized, dtype=np.int32)], True, (0, 255, 0), 3)
+        for index, point in enumerate(normalized, 1):
+            cv2.circle(preview, point, 6, (0, 0, 255), -1)
+            cv2.putText(preview, str(index), (point[0] + 8, point[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2, cv2.LINE_AA)
+        return _bgr_to_rgb(preview), normalized, True
 
     result = prepare_court(template_file, manual_corners=corners_state)
     preview_rgb = _bgr_to_rgb(result["preview_bgr"])
@@ -241,13 +326,177 @@ def reset_court_selection(language="zh"):
     return None, None, [], None, text["corner_none"], False
 
 
-def ensure_court_for_analysis(video_file, template_path, corners, click_corners, language="zh"):
+def configure_sport_mode(sport_id):
+    """Update only presentation defaults; server-side validation remains final."""
+    sport_id = "tennis" if sport_id == "tennis" else "badminton"
+    if sport_id == "tennis":
+        return (
+            "## 网球单打视觉分析\n"
+            "只上传单打对打视频。服务端固定追踪两名匿名运动员，并输出每人的场地平面速度；"
+            "当前不检测网球、不判分、不生成回合或训练结论。",
+            "### 网球标定\n"
+            "请使用完整单打场地画面，手动点击左上、右上、右下、左下四个角点。"
+            "不要使用羽毛球自动线检测结果。",
+            gr.update(
+                value=configured_gpu_base_url("tennis"),
+                label="网球 GPU 服务地址",
+                info="必须指向 health 返回 sport_id=tennis 的纯视觉流式 GPU 服务。",
+            ),
+            gr.update(value="none", visible=False),
+            gr.update(value=True, visible=False, interactive=False),
+            gr.update(
+                choices=[("2 人（网球单打，固定）", 2)],
+                value=2,
+                interactive=False,
+                label="网球视觉 roster",
+                info="网球对打模式固定为两名运动员。",
+            ),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(value=False, visible=False),
+        )
+    return (
+        "## 羽毛球视觉分析\n"
+        "保留原有完整视频与 2 秒直连分片两种上传方式；运动模式由当前羽毛球 GPU 服务固定。",
+        "### 羽毛球标定\n"
+        "可自动检测或手动确认球场四角；自动结果不可靠时请手动复核。",
+        gr.update(
+            value=configured_gpu_base_url("badminton"),
+            label="羽毛球 GPU 服务地址（开发用）",
+            info="完整上传与模拟流式分析均使用此地址；API Key 仍只从 WebUI 服务器配置读取。",
+        ),
+        gr.update(value="yolo", visible=True),
+        gr.update(value=False, visible=True, interactive=True),
+        gr.update(
+            choices=[("2 人（单打）", 2), ("4 人（双打）", 4)],
+            value=2,
+            interactive=True,
+            label="分片流式场上人数",
+            info="仅在勾选 2 秒分片推送时生效。",
+        ),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
+    )
+
+
+def configure_sport_presentation(sport_id):
+    """Keep labels and result columns aligned with the selected visual mode."""
+    if sport_id == "tennis":
+        return (
+            gr.update(value="提取网球标定帧（再手动选四角）"),
+            gr.update(value="### 第一步 — 网球标定图与手动角点"),
+            gr.update(
+                value=(
+                    "网球会固定使用 2 秒直连分片上传到网球 GPU；"
+                    "不调用本地业务网关，也不会分析球、比分、回合或身体参数。"
+                )
+            ),
+            gr.update(
+                headers=TENNIS_PLAYER_RESULT_HEADERS,
+                datatype=["str", "str", "str", "number", "number", "number", "number", "number", "number", "str"],
+                label="网球逐人视觉速度与证据",
+            ),
+            gr.update(
+                headers=TENNIS_MOVEMENT_METRIC_HEADERS,
+                datatype=["str", "number", "number", "number", "number", "number", "str"],
+                label="网球逐人速度汇总（仅使用真实高置信检测）",
+            ),
+            gr.update(label="网球视觉速度原始数据（覆盖率、排除原因与标定限制）"),
+        )
+    return (
+        gr.update(value="自动选择视频帧并检测球场"),
+        gr.update(value="### 第一步 — 球场检测"),
+        gr.update(
+            value=(
+                "勾选左侧的 `每 2 秒直接分片推送到 GPU` 后，点击 `运行分析` 会直接向上方 GPU 服务地址创建流会话并上传分片。"
+                "下方旧按钮仍保留给本地业务网关联调，不使用上方地址作为第一跳。"
+            )
+        ),
+        gr.update(
+            headers=PLAYER_RESULT_HEADERS,
+            datatype=["str", "str", "str", "number", "number", "number", "number", "number",
+                      "number", "number", "number", "str", "number", "str"],
+            label="逐人运动与证据数据",
+        ),
+        gr.update(
+            headers=[
+                "track_id", "距离(m)", "平均速度(m/s)", "峰值速度(m/s)",
+                "有效移动(s)", "高强度(s)", "加速事件", "减速事件", "敏捷移动（整场/30秒峰值）",
+                "可用覆盖率(%)", "运动消耗估算(kcal)", "数据质量",
+            ],
+            datatype=["str", "number", "number", "number", "number", "number",
+                      "number", "number", "str", "number", "str", "str"],
+            label="运动员运动数据汇总（仅使用真实高置信检测）",
+        ),
+        gr.update(label="运动员完整分析数据（覆盖率、排除原因、场地区域与能量估算）"),
+    )
+
+
+def verify_selected_gpu(sport_id, gpu_base_url):
+    """Expose the same fail-closed health check used immediately before upload."""
+    try:
+        health = verify_remote_gpu_sport(sport_id, gpu_base_url)
+    except RemoteAnalysisError as exc:
+        return f"⚠️ GPU 未通过校验：{escape(str(exc))}"
+    return (
+        f"✅ 已连接 **{escape(str(health.get('service') or 'GPU service'))}**"
+        f"（sport_id=`{escape(str(health.get('sport_id')))}`，"
+        f"支持模式：{', '.join(escape(str(item)) for item in health.get('supported_session_modes') or []) or '未声明'}）。"
+    )
+
+
+def reset_analysis_results_for_sport(sport_id):
+    """Clear stale artifacts before presenting another fixed sport mode.
+
+    Files remain on disk for later recovery, but an old badminton report must
+    never look like the result of the currently selected tennis session.
+    """
+    sport_id = "tennis" if sport_id == "tennis" else "badminton"
+    status = {
+        "phase": "idle",
+        "sport_id": sport_id,
+        "hint": "已切换运动模式；请上传视频、确认该运动的球场角点后重新分析。",
+    }
+    return (
+        None, None, None, None, None, None, None, [],
+        None, [], {"status": "waiting_for_analysis", "sport_id": sport_id},
+        None, [], None, status, status,
+        None, [], {
+            "schema_version": "webui-player-result.v1",
+            "sport_id": sport_id,
+            "players": [],
+            "limitations": ["切换运动模式后不复用上一模式的可视化结果。"],
+        },
+    )
+
+
+def ensure_court_for_analysis(
+    video_file,
+    template_path,
+    corners,
+    click_corners,
+    language="zh",
+    sport_id="badminton",
+):
     """Validate the selected template and fall back to a frame from the active video."""
     text = _UI_TEXT.get(language, _UI_TEXT["zh"])
     if video_file is None:
         raise gr.Error(text["need_video"])
 
     ready = bool(template_path and corners and len(corners) == 4)
+    if sport_id == "tennis":
+        if not ready:
+            raise gr.Error("网球对打需先在标定图上手动确认完整单打场地的四个角点。")
+        return gr.update(), corners, click_corners, template_path, gr.update(), True
     match_score = _max_template_match_score(video_file, template_path) if template_path else None
     if ready and match_score is not None and match_score >= 0.75:
         return gr.update(), corners, click_corners, template_path, gr.update(), True
@@ -621,9 +870,12 @@ def run_local_stream_replay(
     generate_annotated_video,
     far_player_enhancement,
     gpu_base_url,
+    sport_id="badminton",
 ):
     """Submit a recording and surface the business-derived movement metrics."""
 
+    if sport_id == "tennis":
+        raise gr.Error("网球模式只允许直连网球 GPU 流式视觉服务，不进入羽毛球业务网关。")
     if not analysis_ready:
         raise gr.Error("请先自动检测或手动确认四个球场角点，再启动模拟流式分析。")
     if video_file is None:
@@ -740,7 +992,7 @@ def _find_remote_stream_session_workdir(analysis_session_id, stream_root=None):
     return None
 
 
-def load_remote_two_second_stream_result(analysis_session_id, gpu_base_url):
+def load_remote_two_second_stream_result(analysis_session_id, gpu_base_url, sport_id="badminton"):
     """Restore screenshots and all per-track evidence for an existing GPU session."""
 
     session_id = str(analysis_session_id or "").strip()
@@ -754,6 +1006,7 @@ def load_remote_two_second_stream_result(analysis_session_id, gpu_base_url):
             session_id,
             workdir,
             gpu_base_url=gpu_base_url,
+            sport_id=sport_id,
         )
     except (RemoteAnalysisError, StreamAPIError) as exc:
         raise gr.Error(str(exc)) from exc
@@ -775,6 +1028,7 @@ def run_analysis_with_upload_mode(
     show_court_trajectory, show_shuttlecock_trajectory,
     show_player_stats, show_pose_roi, visualize_positions,
     yolo_pose_model, ball_model, gpu_base_url, two_second_segment_push, expected_player_count,
+    sport_id="badminton",
     progress=gr.Progress(track_tqdm=False),
 ):
     """Run the selected GPU transport without changing analysis settings.
@@ -785,7 +1039,11 @@ def run_analysis_with_upload_mode(
     file upload to ``/api/v1/jobs`` remains unchanged.
     """
 
-    if bool(two_second_segment_push):
+    sport_id = "tennis" if sport_id == "tennis" else "badminton"
+    # Tennis has no legacy full-file or local fallback path. Its fixed sport
+    # service accepts only stream sessions, which keeps video interpretation
+    # separate from the legacy badminton whole-video business facade.
+    if sport_id == "tennis" or bool(two_second_segment_push):
         if not analysis_ready:
             raise gr.Error("请先自动检测或手动确认四个球场角点，再启动 GPU 分片推送。")
         if video_file is None:
@@ -796,11 +1054,11 @@ def run_analysis_with_upload_mode(
         stream_options = {
             "analysis_sample_hz": int(analysis_sample_hz),
             "pose_imgsz": int(pose_imgsz),
-            "shuttle_detector": shuttle_detector,
+            "shuttle_detector": "none" if sport_id == "tennis" else shuttle_detector,
             "tracker_backend": tracker_backend,
             "far_player_enhancement": bool(far_player_enhancement),
             "far_pose_roi": tuple(float(item.strip()) for item in far_pose_roi.split(',')),
-            "expected_player_count": int(expected_player_count),
+            "expected_player_count": 2 if sport_id == "tennis" else int(expected_player_count),
         }
         stream_output_dir = os.path.join(
             "outputs", "remote_stream_sessions", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -812,6 +1070,8 @@ def run_analysis_with_upload_mode(
                 stream_options,
                 stream_output_dir,
                 gpu_base_url=gpu_base_url,
+                sport_id=sport_id,
+                session_mode="singles_match" if sport_id == "tennis" else None,
             ):
                 yield _two_second_segment_upload_update(stream_status)
         except RemoteAnalysisError as exc:
@@ -860,7 +1120,7 @@ def run_analysis_with_upload_mode(
         yield _full_video_upload_update(update)
 
 
-def load_local_stream_replay_result(business_task_id: str):
+def load_local_stream_replay_result(business_task_id: str, sport_id="badminton"):
     """Reload one durable stream-replay result into the visible WebUI.
 
     A stream replay runs asynchronously in the separate business gateway.  A
@@ -870,6 +1130,8 @@ def load_local_stream_replay_result(business_task_id: str):
     the received evidence.
     """
 
+    if sport_id == "tennis":
+        raise gr.Error("网球模式不接入羽毛球业务网关的模拟流式与赛后指标。")
     task_id = str(business_task_id or "").strip()
     if not task_id:
         raise gr.Error("请输入业务任务 ID，例如 bstr_xxx。")
@@ -1107,6 +1369,7 @@ def _movement_metric_summary_rows(metrics):
     or speed cannot be read without its evidence limitations.
     """
     rows = []
+    tennis_visual_only = (metrics or {}).get("sport_id") == "tennis"
     for item in (metrics or {}).get("players") or []:
         movement = item.get("movement") or {}
         coverage = item.get("measurement_coverage") or {}
@@ -1124,20 +1387,31 @@ def _movement_metric_summary_rows(metrics):
             energy_display = str(energy_value)
         else:
             energy_display = "待填写体重"
-        rows.append([
-            item.get("track_id"),
-            movement.get("distance_m"),
-            movement.get("mean_speed_mps"),
-            movement.get("peak_speed_mps"),
-            movement.get("moving_time_sec"),
-            movement.get("high_intensity_movement_time_sec"),
-            movement.get("acceleration_event_count"),
-            movement.get("deceleration_event_count"),
-            f"{movement.get('direction_change_count') or 0} / {movement.get('peak_direction_changes_30s') or 0}",
-            round(float(coverage.get("usable_measurement_ratio") or 0.0) * 100.0, 1),
-            energy_display,
-            (item.get("quality") or {}).get("status"),
-        ])
+        if tennis_visual_only:
+            rows.append([
+                item.get("track_id"),
+                movement.get("distance_m"),
+                movement.get("mean_speed_mps"),
+                movement.get("peak_speed_mps"),
+                movement.get("moving_time_sec"),
+                round(float(coverage.get("usable_measurement_ratio") or 0.0) * 100.0, 1),
+                (item.get("quality") or {}).get("status"),
+            ])
+        else:
+            rows.append([
+                item.get("track_id"),
+                movement.get("distance_m"),
+                movement.get("mean_speed_mps"),
+                movement.get("peak_speed_mps"),
+                movement.get("moving_time_sec"),
+                movement.get("high_intensity_movement_time_sec"),
+                movement.get("acceleration_event_count"),
+                movement.get("deceleration_event_count"),
+                f"{movement.get('direction_change_count') or 0} / {movement.get('peak_direction_changes_30s') or 0}",
+                round(float(coverage.get("usable_measurement_ratio") or 0.0) * 100.0, 1),
+                energy_display,
+                (item.get("quality") or {}).get("status"),
+            ])
     return rows
 
 
@@ -1173,8 +1447,10 @@ def _load_latest_movement_display():
     )
 
 
-def save_body_profiles_and_refresh_metrics(analysis_dir, profile_rows, consent):
+def save_body_profiles_and_refresh_metrics(analysis_dir, profile_rows, consent, sport_id="badminton"):
     """Save explicit user inputs, recompute lightweight metrics, then refresh one report."""
+    if sport_id == "tennis":
+        raise gr.Error("网球模式当前仅输出匿名视觉速度，不能写入羽毛球赛后身体参数或报告。")
     run_dir = Path(str(analysis_dir or ""))
     if not run_dir.is_dir():
         raise gr.Error("请先完成一次视频分析，再填写体重和身高。")
@@ -1339,6 +1615,24 @@ _UI_TEXT = {
 
 
 _APP_CSS = """
+/* Gradio 6 applies value/label updates reliably, but component visibility
+ * updates are not consistently reflected after a queued callback.  Keep the
+ * sport boundary explicit in the browser as well: tennis never presents a
+ * badminton detector, legacy business-stream restore, or post-match body
+ * workflow.  The Python callbacks still enforce the same boundary server-side.
+ */
+html[data-good-sport-mode="tennis"] #badminton-shuttle-detector,
+html[data-good-sport-mode="tennis"] #badminton-annotated-video,
+html[data-good-sport-mode="tennis"] #badminton-legacy-stream-button,
+html[data-good-sport-mode="tennis"] #badminton-legacy-stream-restore,
+html[data-good-sport-mode="tennis"] #badminton-tracknet-raw,
+html[data-good-sport-mode="tennis"] #badminton-performance-report,
+html[data-good-sport-mode="tennis"] #badminton-business-results,
+html[data-good-sport-mode="tennis"] #badminton-rally-review-tab-button,
+html[data-good-sport-mode="tennis"] #badminton-analysis-history-tab-button {
+  display: none !important;
+}
+
 #backend-console-trigger {
   position: fixed;
   right: 18px;
@@ -1428,6 +1722,14 @@ _APP_CSS = """
 #review-frame-controls .frame-rate-hint {
   color: #667085;
   font-size: 0.82rem;
+}
+"""
+
+
+_SPORT_MODE_CLIENT_SYNC = """
+(sportId) => {
+  document.documentElement.dataset.goodSportMode = sportId === "tennis" ? "tennis" : "badminton";
+  return sportId;
 }
 """
 
@@ -2296,6 +2598,16 @@ def build_ui():
         title="Good Badminton — AI Badminton Analysis",
     ) as demo:
         md_title = gr.Markdown(t["title"])
+        sport_mode = gr.Radio(
+            choices=[("羽毛球模式", "badminton"), ("网球模式（单打对打）", "tennis")],
+            value="badminton",
+            label="运动模式",
+            info="每次分析固定一种运动，并在上传前校验对应 GPU 实例的 sport_id。",
+        )
+        sport_mode_banner = gr.Markdown(
+            "## 羽毛球视觉分析\n"
+            "保留原有完整视频与 2 秒直连分片两种上传方式；运动模式由当前羽毛球 GPU 服务固定。"
+        )
 
         corners_state = gr.State(value=None)
         click_corners_state = gr.State(value=[])
@@ -2307,8 +2619,11 @@ def build_ui():
             with gr.Tab("分析工作台"):
                 with gr.Tabs():
                     analysis_tab = gr.Tab("视频分析")
-                    review_tab = gr.Tab("球路复核")
-                    history_tab = gr.Tab("分析任务历史")
+                    review_tab = gr.Tab("球路复核", elem_id="badminton-rally-review-tab")
+                    history_tab = gr.Tab(
+                        "分析任务历史",
+                        elem_id="badminton-analysis-history-tab",
+                    )
 
         with analysis_tab:
             with gr.Row():
@@ -2345,8 +2660,9 @@ def build_ui():
                             "不检测仅保留人物数据；YOLO 采集球点与球速候选；"
                             "TrackNetV3 更适合试验球轨迹，但耗时明显更高。"
                         ),
+                        elem_id="badminton-shuttle-detector",
                     )
-                    with gr.Row():
+                    with gr.Row(visible=True) as legacy_business_stream_controls:
                         pose_imgsz = gr.Dropdown(
                             choices=[640, 960, 1280], value=960,
                             label="Pose 尺寸", scale=1,
@@ -2367,6 +2683,7 @@ def build_ui():
                     generate_annotated_video = gr.Checkbox(
                         value=False,
                         label="生成标注视频（较慢，可用于肉眼复核）",
+                        elem_id="badminton-annotated-video",
                     )
                     two_second_segment_push = gr.Checkbox(
                         value=False,
@@ -2396,9 +2713,14 @@ def build_ui():
                     far_pose_roi = gr.State(value="0.12,0.30,0.86,0.82")
                     gpu_base_url = gr.Textbox(
                         label="GPU 服务地址（开发用）",
-                        value=remote_gpu_config()["base_url"],
+                        value=configured_gpu_base_url("badminton"),
                         placeholder="例如 http://xn-g.suanjiayun.com:55606",
                         info="完整上传与模拟流式分析均使用此地址；API Key 仍只从本机配置读取。生产环境应由业务服务固定配置。",
+                    )
+                    with gr.Row():
+                        verify_gpu_btn = gr.Button("校验当前 GPU 运动身份", size="sm")
+                    gpu_service_status = gr.Markdown(
+                        "尚未校验 GPU。开始分析前会再次自动校验，错误运动实例不会接收视频。"
                     )
                     browser_video_reencode = gr.State(value=False)
                     show_skeletons = gr.State(value=True)
@@ -2412,6 +2734,10 @@ def build_ui():
                     ball_model = gr.State(value="weights/yolo11s-ball.pt")
 
                 with gr.Column(scale=2):
+                    sport_calibration_help = gr.Markdown(
+                        "### 羽毛球标定\n"
+                        "可自动检测或手动确认球场四角；自动结果不可靠时请手动复核。"
+                    )
                     md_step1 = gr.Markdown(t["step1"])
                     detect_btn = gr.Button(t["detect_btn"], variant="primary")
                     court_image = gr.Image(label=t["court_preview"], interactive=False, type="numpy")
@@ -2421,13 +2747,17 @@ def build_ui():
                     md_step2 = gr.Markdown(t["step2"])
                     with gr.Row():
                         run_btn = gr.Button(t["run_btn"], variant="primary")
-                        stream_replay_btn = gr.Button("旧：经本地网关模拟流式（需 127.0.0.1:8080）", variant="secondary")
+                        stream_replay_btn = gr.Button(
+                            "旧：经本地网关模拟流式（需 127.0.0.1:8080）",
+                            variant="secondary",
+                            elem_id="badminton-legacy-stream-button",
+                        )
                         interrupt_btn = gr.Button(t["interrupt_btn"], variant="stop")
-                    gr.Markdown(
+                    upload_transport_hint = gr.Markdown(
                         "勾选左侧的 `每 2 秒直接分片推送到 GPU` 后，点击 `运行分析` 会直接向上方 GPU 服务地址创建流会话并上传分片。"
                         "下方旧按钮仍保留给本地业务网关联调，不使用上方地址作为第一跳。"
                     )
-                    with gr.Row():
+                    with gr.Row(elem_id="badminton-legacy-stream-restore"):
                         stream_replay_task_id = gr.Textbox(
                             label="加载已完成流式任务",
                             placeholder="bstr_xxx（刷新页面后可重新查看数据，不重跑视频）",
@@ -2478,8 +2808,14 @@ def build_ui():
                     )
                     output_metadata = gr.JSON(label=t["out_metadata"])
                     output_detections = gr.File(label=t["out_detections"])
-                    output_tracknet_raw = gr.File(label="TrackNetV3 原始球点 CSV（可下载复核）")
-                    output_performance_report = gr.File(label="运动表现报告（含大模型状态）")
+                    output_tracknet_raw = gr.File(
+                        label="TrackNetV3 原始球点 CSV（可下载复核）",
+                        elem_id="badminton-tracknet-raw",
+                    )
+                    output_performance_report = gr.File(
+                        label="运动表现报告（含大模型状态）",
+                        elem_id="badminton-performance-report",
+                    )
                     output_movement_metrics = gr.File(label="运动数据（按视觉 Track ID）")
                     output_movement_metric_summary = gr.Dataframe(
                         headers=[
@@ -2496,34 +2832,38 @@ def build_ui():
                         label="运动员完整分析数据（覆盖率、排除原因、场地区域与能量估算）",
                         value={"status": "waiting_for_analysis"},
                     )
-                    output_movement_rally_window_sweep = gr.File(label="无球回合稳定窗口对照（0.5/0.7/1.0 秒）")
                     analysis_output_dir_state = gr.State(value=None)
-                    gr.Markdown(
-                        "### 赛后运动数据与身体参数\n"
-                        "分析完成后会按每个视觉 `track_id` 生成距离、速度、加减速、变向和场地区域数据。"
-                        "填写体重/身高并确认后，系统只计算**已测移动时段**的能量消耗区间；不会从视频猜测身体数据。"
-                    )
-                    body_profile_table = gr.Dataframe(
-                        headers=["track_id", "weight_kg", "height_cm"],
-                        datatype=["str", "number", "number"],
-                        interactive=True,
-                        label="赛后填写（按 Track ID；单打通常两行）",
-                        max_height=180,
-                    )
-                    body_profile_consent = gr.Checkbox(
-                        value=False,
-                        label="我同意仅将上述身高体重用于本次赛后能量消耗估算",
-                    )
-                    save_body_profile_btn = gr.Button("保存身体参数并刷新运动数据/赛后报告")
-                    body_profile_status = gr.JSON(label="身体参数与运动数据刷新状态", value={"status": "waiting_for_analysis"})
-                    output_rally_summary = gr.Markdown("### 回合与拍数\n完成分析后显示候选回合与每回合拍数。")
-                    output_rallies = gr.Dataframe(
-                        headers=["回合", "开始(s)", "结束(s)", "候选拍数", "可见球候选", "缺球补拍", "结束依据", "置信度"],
-                        datatype=["str", "number", "number", "number", "number", "number", "str", "number"],
-                        interactive=False,
-                        label="候选回合明细（所有结果均待人工复核）",
-                        max_height=300,
-                    )
+                    with gr.Group(
+                        visible=True,
+                        elem_id="badminton-business-results",
+                    ) as badminton_business_results:
+                        output_movement_rally_window_sweep = gr.File(label="无球回合稳定窗口对照（0.5/0.7/1.0 秒）")
+                        gr.Markdown(
+                            "### 赛后运动数据与身体参数\n"
+                            "分析完成后会按每个视觉 `track_id` 生成距离、速度、加减速、变向和场地区域数据。"
+                            "填写体重/身高并确认后，系统只计算**已测移动时段**的能量消耗区间；不会从视频猜测身体数据。"
+                        )
+                        body_profile_table = gr.Dataframe(
+                            headers=["track_id", "weight_kg", "height_cm"],
+                            datatype=["str", "number", "number"],
+                            interactive=True,
+                            label="赛后填写（按 Track ID；单打通常两行）",
+                            max_height=180,
+                        )
+                        body_profile_consent = gr.Checkbox(
+                            value=False,
+                            label="我同意仅将上述身高体重用于本次赛后能量消耗估算",
+                        )
+                        save_body_profile_btn = gr.Button("保存身体参数并刷新运动数据/赛后报告")
+                        body_profile_status = gr.JSON(label="身体参数与运动数据刷新状态", value={"status": "waiting_for_analysis"})
+                        output_rally_summary = gr.Markdown("### 回合与拍数\n完成分析后显示候选回合与每回合拍数。")
+                        output_rallies = gr.Dataframe(
+                            headers=["回合", "开始(s)", "结束(s)", "候选拍数", "可见球候选", "缺球补拍", "结束依据", "置信度"],
+                            datatype=["str", "number", "number", "number", "number", "number", "str", "number"],
+                            interactive=False,
+                            label="候选回合明细（所有结果均待人工复核）",
+                            max_height=300,
+                        )
 
         with review_tab:
             gr.Markdown(
@@ -2935,6 +3275,75 @@ def build_ui():
             ],
         )
 
+        sport_mode_change = sport_mode.change(
+            fn=configure_sport_mode,
+            inputs=[sport_mode],
+            outputs=[
+                sport_mode_banner,
+                sport_calibration_help,
+                gpu_base_url,
+                shuttle_detector,
+                two_second_segment_push,
+                expected_player_count,
+                stream_replay_btn,
+                stream_replay_task_id,
+                load_stream_replay_btn,
+                output_tracknet_raw,
+                output_performance_report,
+                badminton_business_results,
+                generate_annotated_video,
+            ],
+            js=_SPORT_MODE_CLIENT_SYNC,
+            show_progress="hidden",
+        )
+        sport_mode_change.then(
+            fn=reset_court_selection,
+            inputs=[language],
+            outputs=[
+                court_image,
+                corners_state,
+                click_corners_state,
+                template_path_state,
+                corner_status,
+                analysis_ready_state,
+            ],
+            show_progress="hidden",
+        )
+        sport_mode_change.then(
+            fn=reset_analysis_results_for_sport,
+            inputs=[sport_mode],
+            outputs=[
+                output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
+                output_performance_report,
+                output_rally_summary, output_rallies,
+                output_movement_metrics, output_movement_metric_summary, output_movement_metric_detail,
+                output_movement_rally_window_sweep,
+                body_profile_table, analysis_output_dir_state, output_status,
+                stream_replay_status,
+                output_player_gallery, output_player_result_table, output_player_result_detail,
+            ],
+            show_progress="hidden",
+        )
+        sport_mode_change.then(
+            fn=configure_sport_presentation,
+            inputs=[sport_mode],
+            outputs=[
+                detect_btn,
+                md_step1,
+                upload_transport_hint,
+                output_player_result_table,
+                output_movement_metric_summary,
+                output_movement_metric_detail,
+            ],
+            show_progress="hidden",
+        )
+        verify_gpu_btn.click(
+            fn=verify_selected_gpu,
+            inputs=[sport_mode, gpu_base_url],
+            outputs=[gpu_service_status],
+            show_progress="hidden",
+        )
+
         video_input.change(
             fn=reset_court_selection,
             inputs=[language],
@@ -2948,13 +3357,13 @@ def build_ui():
 
         detect_btn.click(
             fn=detect_court,
-            inputs=[video_input, template_input, language],
+            inputs=[video_input, template_input, language, sport_mode],
             outputs=[court_image, corners_state, template_path_state, corner_status, analysis_ready_state],
         )
 
         court_image.select(
             fn=on_court_image_select,
-            inputs=[click_corners_state, template_path_state],
+            inputs=[click_corners_state, template_path_state, sport_mode],
             outputs=[court_image, click_corners_state, corners_state, corner_status],
         )
 
@@ -2963,7 +3372,7 @@ def build_ui():
             # Automatic detection produces ``corners_state`` directly. Manual
             # clicks promote their completed four-point set into the same
             # state, so both paths use one canonical input at confirmation.
-            inputs=[template_path_state, corners_state],
+            inputs=[template_path_state, corners_state, sport_mode],
             outputs=[court_image, corners_state, analysis_ready_state],
         ).then(
             fn=lambda c, lang: _UI_TEXT.get(lang, _UI_TEXT["zh"])["manual_ok"].format(len(c)) if c
@@ -2974,7 +3383,7 @@ def build_ui():
 
         run_preflight = run_btn.click(
             fn=ensure_court_for_analysis,
-            inputs=[video_input, template_path_state, corners_state, click_corners_state, language],
+            inputs=[video_input, template_path_state, corners_state, click_corners_state, language, sport_mode],
             outputs=[
                 court_image, corners_state, click_corners_state,
                 template_path_state, corner_status, analysis_ready_state,
@@ -2992,6 +3401,7 @@ def build_ui():
                 show_court_trajectory, show_shuttlecock_trajectory,
                 show_player_stats, show_pose_roi, visualize_positions,
                 yolo_pose_model, ball_model, gpu_base_url, two_second_segment_push, expected_player_count,
+                sport_mode,
             ],
             outputs=[
                 output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
@@ -3006,7 +3416,7 @@ def build_ui():
         )
         stream_preflight = stream_replay_btn.click(
             fn=ensure_court_for_analysis,
-            inputs=[video_input, template_path_state, corners_state, click_corners_state, language],
+            inputs=[video_input, template_path_state, corners_state, click_corners_state, language, sport_mode],
             outputs=[
                 court_image, corners_state, click_corners_state,
                 template_path_state, corner_status, analysis_ready_state,
@@ -3018,7 +3428,7 @@ def build_ui():
                 analysis_ready_state, video_input, corners_state,
                 shuttle_detector, tracker_backend, pose_imgsz, analysis_sample_hz,
                 generate_annotated_video, far_player_enhancement,
-                gpu_base_url,
+                gpu_base_url, sport_mode,
             ],
             outputs=[
                 output_movement_metrics,
@@ -3031,7 +3441,7 @@ def build_ui():
         )
         load_stream_replay_btn.click(
             fn=load_local_stream_replay_result,
-            inputs=[stream_replay_task_id],
+            inputs=[stream_replay_task_id, sport_mode],
             outputs=[
                 output_movement_metrics,
                 output_movement_metric_summary,
@@ -3043,7 +3453,7 @@ def build_ui():
         )
         load_remote_stream_btn.click(
             fn=load_remote_two_second_stream_result,
-            inputs=[remote_stream_session_id, gpu_base_url],
+            inputs=[remote_stream_session_id, gpu_base_url, sport_mode],
             outputs=[
                 output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
                 output_performance_report,
@@ -3057,7 +3467,7 @@ def build_ui():
         )
         save_body_profile_btn.click(
             fn=save_body_profiles_and_refresh_metrics,
-            inputs=[analysis_output_dir_state, body_profile_table, body_profile_consent],
+            inputs=[analysis_output_dir_state, body_profile_table, body_profile_consent, sport_mode],
             outputs=[
                 output_movement_metrics, output_movement_metric_summary, output_movement_metric_detail,
                 body_profile_table,

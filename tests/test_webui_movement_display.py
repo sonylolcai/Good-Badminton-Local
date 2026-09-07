@@ -40,6 +40,23 @@ class WebUIMovementDisplayTests(unittest.TestCase):
         })
         self.assertEqual(rows[0][10], "待填写体重")
 
+    def test_tennis_summary_omits_business_metrics_and_energy(self):
+        rows = _movement_metric_summary_rows({
+            "sport_id": "tennis",
+            "players": [{
+                "track_id": "track_001",
+                "movement": {
+                    "distance_m": 12.3,
+                    "mean_speed_mps": 1.2,
+                    "peak_speed_mps": 3.4,
+                    "moving_time_sec": 8.0,
+                },
+                "measurement_coverage": {"usable_measurement_ratio": 0.625},
+                "quality": {"status": "measured"},
+            }],
+        })
+        self.assertEqual(rows, [["track_001", 12.3, 1.2, 3.4, 8.0, 62.5, "measured"]])
+
 
 if __name__ == "__main__":
     unittest.main()
