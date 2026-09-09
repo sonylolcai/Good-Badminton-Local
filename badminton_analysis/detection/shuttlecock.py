@@ -27,6 +27,7 @@ class ShuttlecockTracker:
         max_aspect_ratio=4.0,
         max_prediction_frames=3,
         prediction_confidence_decay=0.6,
+        required_class_names=None,
     ):
         self.yolo_ball_model = yolo_ball_model
         self.trajectory_length = trajectory_length
@@ -40,6 +41,10 @@ class ShuttlecockTracker:
         self.max_aspect_ratio = max_aspect_ratio
         self.max_prediction_frames = max(0, int(max_prediction_frames))
         self.prediction_confidence_decay = float(prediction_confidence_decay)
+        self.required_class_names = tuple(
+            str(name) for name in (required_class_names or ())
+        )
+        self.required_class_ids = self._resolve_required_class_ids()
         if not 0.0 <= self.prediction_confidence_decay <= 1.0:
             raise ValueError("prediction_confidence_decay must be between 0 and 1")
 
@@ -217,6 +222,11 @@ class ShuttlecockTracker:
 
         xywh = boxes.xywh.detach().cpu().numpy()
         confidences = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.ones(len(xywh))
+        class_ids = (
+            boxes.cls.detach().cpu().numpy()
+            if getattr(boxes, "cls", None) is not None
+            else None
+        )
         frame_area = max(1, frame_shape[0] * frame_shape[1])
 
         candidates = []
@@ -225,8 +235,17 @@ class ShuttlecockTracker:
             "box_too_large": 0,
             "aspect_ratio": 0,
             "outside_court_roi": 0,
+            "unexpected_class": 0,
+            "class_unavailable": 0,
         }
-        for box, confidence in zip(xywh, confidences):
+        for index, (box, confidence) in enumerate(zip(xywh, confidences)):
+            if self.required_class_ids:
+                if class_ids is None or index >= len(class_ids):
+                    rejected["class_unavailable"] += 1
+                    continue
+                if int(class_ids[index]) not in self.required_class_ids:
+                    rejected["unexpected_class"] += 1
+                    continue
             center_x, center_y, width, height = [float(value) for value in box]
             if width <= 0 or height <= 0:
                 rejected["invalid_geometry"] += 1
@@ -251,6 +270,9 @@ class ShuttlecockTracker:
                     "confidence": float(confidence),
                     "area_ratio": float(area_ratio),
                     "aspect_ratio": float(aspect_ratio),
+                    "class_name": self._class_name_for_index(
+                        None if class_ids is None else int(class_ids[index])
+                    ),
                 }
             )
 
@@ -260,6 +282,43 @@ class ShuttlecockTracker:
                 reason: count for reason, count in rejected.items() if count
             },
         }
+
+    def _resolve_required_class_ids(self):
+        """Resolve an optional model-label allow-list once at construction.
+
+        The original shuttle model is a single-class checkpoint and retains
+        its historical open-class behaviour.  Sport-specific adapters pass an
+        explicit label list, which prevents a generic COCO ``sports ball`` or
+        a badminton checkpoint from becoming fabricated tennis evidence.
+        """
+        if not self.required_class_names:
+            return None
+        names = getattr(self.yolo_ball_model, "names", None)
+        if isinstance(names, dict):
+            normalized = {int(index): str(name) for index, name in names.items()}
+        elif isinstance(names, (list, tuple)):
+            normalized = {index: str(name) for index, name in enumerate(names)}
+        else:
+            raise ValueError(
+                "YOLO ball model must expose class names for sport-specific ball detection"
+            )
+        accepted = {
+            index for index, name in normalized.items() if name in self.required_class_names
+        }
+        if not accepted:
+            expected = ", ".join(self.required_class_names)
+            available = ", ".join(sorted(normalized.values())) or "<none>"
+            raise ValueError(
+                f"YOLO ball model is missing required class [{expected}]; available classes: [{available}]"
+            )
+        self._class_names_by_id = normalized
+        return accepted
+
+    def _class_name_for_index(self, index):
+        names = getattr(self, "_class_names_by_id", None)
+        if index is None or not names:
+            return None
+        return names.get(int(index))
 
     def _select_candidate(self, candidates):
         if not candidates:

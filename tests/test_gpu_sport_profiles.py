@@ -66,7 +66,7 @@ class GpuSportProfileTests(unittest.TestCase):
             [[0.0, 11.885], [8.23, 11.885], [8.23, 23.77], [0.0, 23.77]],
         )
 
-    def test_tennis_rejects_wrong_sport_mode_roster_and_ball_detector(self):
+    def test_tennis_rejects_wrong_sport_mode_and_roster(self):
         cases = (
             (self.configuration(sport_id="badminton", session_mode="singles_match"), "does not match"),
             (self.configuration(session_mode="doubles"), "session_mode must be one of"),
@@ -76,12 +76,22 @@ class GpuSportProfileTests(unittest.TestCase):
                 ),
                 "conflicts",
             ),
-            (self.configuration(session_mode="singles_match", shuttle_detector="yolo"), "must be one of"),
         )
         for configuration, message in cases:
             with self.subTest(configuration=configuration):
                 with self.assertRaisesRegex(ValueError, message):
                     self.tennis_modes.synchronize(configuration)
+
+    def test_tennis_allows_yolo_only_as_its_fixed_profile_ball_adapter(self):
+        resolved = self.tennis_modes.synchronize(
+            self.configuration(session_mode="singles_match", shuttle_detector="yolo")
+        )
+        self.assertEqual(resolved["sport_id"], "tennis")
+        self.assertEqual(resolved["shuttle_detector"], "yolo")
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            self.tennis_modes.synchronize(
+                self.configuration(session_mode="singles_match", shuttle_detector="tracknet_v3")
+            )
 
     def test_near_half_maps_to_global_near_side_and_excludes_far_people(self):
         resolved = self.tennis_modes.synchronize(

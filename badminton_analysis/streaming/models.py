@@ -18,6 +18,7 @@ EVENT_TYPES = frozenset(
         "person_observation",
         "roster_candidate_observation",
         "shuttle_observation",
+        "ball_observation",
         "interaction_candidate",
         "session_status",
         "session_finalized",

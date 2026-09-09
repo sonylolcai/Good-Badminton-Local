@@ -9,18 +9,26 @@ set -euo pipefail
 # the application directory, so this replacement never removes API keys,
 # queued/completed job records, or model weights.
 #
-# Default server contract:
-#   uploaded package: /root/good-badminton-gpu-api-upload.zip
-#   application code: /root/good-badminton-gpu-api
-#   persistent state: /root/good-badminton-gpu-api-state
+# The explicit third argument selects one of two fixed deployment identities;
+# it cannot be supplied by a WebUI request or changed after the server starts.
+# Defaults preserve the existing badminton command.
 #
 # The package must be produced by deploy/package_gpu_api.ps1.  It contains a
-# single `good-badminton-gpu-api/` top-level directory, no virtual environment,
+# single fixed-sport top-level directory, no virtual environment,
 # no model files, no API data and no secrets.  The script also accepts a flat
 # archive containing api/app.py for recovery purposes.
 
-ARCHIVE_PATH="${1:-/root/good-badminton-gpu-api-upload.zip}"
-APP_DIR="${2:-/root/good-badminton-gpu-api}"
+SPORT_ID="${3:-badminton}"
+case "$SPORT_ID" in
+  badminton|tennis) ;;
+  *) echo "ERROR: sport must be badminton or tennis (got: $SPORT_ID)" >&2; exit 64 ;;
+esac
+DEPLOY_NAME="good-${SPORT_ID}-gpu-api"
+DEFAULT_ARCHIVE_PATH="/root/${DEPLOY_NAME}-upload.zip"
+DEFAULT_APP_DIR="/root/${DEPLOY_NAME}"
+
+ARCHIVE_PATH="${1:-$DEFAULT_ARCHIVE_PATH}"
+APP_DIR="${2:-$DEFAULT_APP_DIR}"
 STATE_DIR="${GOOD_BADMINTON_STATE_DIR:-${APP_DIR}-state}"
 PYTHON_BIN="${GOOD_BADMINTON_PYTHON_BIN:-python3}"
 ENV_FILE="${STATE_DIR}/.gpu-api.env"
@@ -35,12 +43,12 @@ fail() {
 }
 
 # Do not ever turn a typo or an unset environment variable into a broad rm.
-[[ "$APP_DIR" == /root/good-badminton-gpu-api ]] || \
-  fail "For safety APP_DIR must be exactly /root/good-badminton-gpu-api (got: $APP_DIR)."
-[[ "$STATE_DIR" == /root/good-badminton-gpu-api-state ]] || \
-  fail "For safety STATE_DIR must be exactly /root/good-badminton-gpu-api-state (got: $STATE_DIR)."
-[[ "$ARCHIVE_PATH" == /root/good-badminton-gpu-api-upload.zip ]] || \
-  fail "For safety ARCHIVE_PATH must be exactly /root/good-badminton-gpu-api-upload.zip (got: $ARCHIVE_PATH)."
+[[ "$APP_DIR" == "$DEFAULT_APP_DIR" ]] || \
+  fail "For safety APP_DIR must be exactly $DEFAULT_APP_DIR (got: $APP_DIR)."
+[[ "$STATE_DIR" == "${DEFAULT_APP_DIR}-state" ]] || \
+  fail "For safety STATE_DIR must be exactly ${DEFAULT_APP_DIR}-state (got: $STATE_DIR)."
+[[ "$ARCHIVE_PATH" == "$DEFAULT_ARCHIVE_PATH" ]] || \
+  fail "For safety ARCHIVE_PATH must be exactly $DEFAULT_ARCHIVE_PATH (got: $ARCHIVE_PATH)."
 if [[ -n "$LEGACY_APP_DIR" ]]; then
   [[ "$LEGACY_APP_DIR" == /root/* && "$LEGACY_APP_DIR" != /root && \
      "$LEGACY_APP_DIR" != "$APP_DIR" && -d "$LEGACY_APP_DIR" ]] || \
@@ -73,12 +81,12 @@ echo "[1/6] Validating uploaded package..."
 unzip -q "$ARCHIVE_PATH" -d "$STAGING_DIR"
 
 SOURCE_DIR=""
-if [[ -f "$STAGING_DIR/good-badminton-gpu-api/api/app.py" ]]; then
-  SOURCE_DIR="$STAGING_DIR/good-badminton-gpu-api"
+if [[ -f "$STAGING_DIR/$DEPLOY_NAME/api/gpu_stream_app.py" ]]; then
+  SOURCE_DIR="$STAGING_DIR/$DEPLOY_NAME"
 elif [[ -f "$STAGING_DIR/api/app.py" ]]; then
   SOURCE_DIR="$STAGING_DIR"
 else
-  fail "Package does not contain good-badminton-gpu-api/api/app.py"
+  fail "Package does not contain $DEPLOY_NAME/api/gpu_stream_app.py"
 fi
 
 [[ -f "$SOURCE_DIR/deploy/start_gpu_api_container.sh" ]] || \
@@ -87,6 +95,8 @@ fi
   fail "Package is missing deploy/start_badminton_gpu_container.sh"
 [[ -f "$SOURCE_DIR/deploy/start_sport_gpu_container.sh" ]] || \
   fail "Package is missing deploy/start_sport_gpu_container.sh"
+[[ -f "$SOURCE_DIR/apps/${SPORT_ID}_gpu/app.py" ]] || \
+  fail "Package is missing fixed ${SPORT_ID} GPU entry point"
 [[ -f "$SOURCE_DIR/deploy/install_lap.sh" ]] || \
   fail "Package is missing deploy/install_lap.sh"
 
@@ -174,8 +184,16 @@ printf 'GOOD_BADMINTON_API_DATA_DIR=%s\n' "$DATA_DIR" >> "$env_tmp"
 chmod 600 "$env_tmp"
 mv "$env_tmp" "$ENV_FILE"
 
-[[ -f "$WEIGHTS_DIR/yolo11s-ball.pt" ]] || fail \
-  "Missing $WEIGHTS_DIR/yolo11s-ball.pt. Upload the checked ball-model weight there once; it is preserved on later code upgrades."
+if [[ "$SPORT_ID" == "badminton" ]]; then
+  [[ -f "$WEIGHTS_DIR/yolo11s-ball.pt" ]] || fail \
+    "Missing $WEIGHTS_DIR/yolo11s-ball.pt. Upload the checked ball-model weight there once; it is preserved on later code upgrades."
+else
+  tennis_checkpoint="$(sed -n 's/^GOOD_TENNIS_STREAM_BALL_MODEL=//p' "$ENV_FILE" | tail -n 1 | tr -d '\r')"
+  [[ -n "$tennis_checkpoint" ]] || fail \
+    "Set GOOD_TENNIS_STREAM_BALL_MODEL in $ENV_FILE before refreshing the tennis service."
+  [[ -f "$tennis_checkpoint" ]] || fail \
+    "Tennis YOLO checkpoint not found: $tennis_checkpoint"
+fi
 
 echo "[5/7] Stopping the old API, if present..."
 stop_existing_api() {
@@ -220,7 +238,7 @@ ln -s "$WEIGHTS_DIR" "$APP_DIR/weights"
 echo "[7/7] Starting and verifying the refreshed API..."
 GOOD_BADMINTON_ENV_FILE="$ENV_FILE" \
 GOOD_BADMINTON_PYTHON_BIN="$PYTHON_BIN" \
-  "$APP_DIR/deploy/start_gpu_api_container.sh" "$APP_DIR"
+  "$APP_DIR/deploy/start_${SPORT_ID}_gpu_container.sh" "$APP_DIR"
 
 set -a
 # shellcheck disable=SC1090

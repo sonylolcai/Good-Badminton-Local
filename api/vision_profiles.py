@@ -157,8 +157,10 @@ TENNIS_PROFILE = SportVisionProfile(
     # Tennis must be explicit because silently treating a training video as a
     # two-player match leaves the roster waiting forever.
     default_session_mode=None,
-    # Tennis ball inference gets its own model adapter in the next iteration.
-    allowed_ball_detectors=("none",),
+    # ``shuttle_detector`` is the stable stream-session.v1 wire field.  In a
+    # tennis process its ``yolo`` value means the tennis-only model adapter;
+    # it never selects the badminton shuttle checkpoint.
+    allowed_ball_detectors=("none", "yolo"),
 )
 
 

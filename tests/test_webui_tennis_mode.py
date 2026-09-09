@@ -33,8 +33,9 @@ class TennisWebUiModeTests(unittest.TestCase):
 
         self.assertEqual(len(updates), 13)
         self.assertIn("网球单打视觉分析", updates[0])
-        self.assertIn("不检测网球、不判分、不生成回合", updates[0])
-        self.assertEqual(updates[3]["value"], "none")
+        self.assertIn("网球专用 YOLO 权重", updates[0])
+        self.assertIn("不会改用羽毛球模型", updates[0])
+        self.assertEqual(updates[3]["value"], "yolo")
         self.assertTrue(updates[4]["value"])
         self.assertFalse(updates[4]["interactive"])
         self.assertEqual(updates[5]["value"], 2)
@@ -87,7 +88,7 @@ class TennisWebUiModeTests(unittest.TestCase):
         self.assertEqual(stream.call_args.kwargs["sport_id"], "tennis")
         self.assertEqual(stream.call_args.kwargs["session_mode"], "singles_match")
         options = stream.call_args.args[2]
-        self.assertEqual(options["shuttle_detector"], "none")
+        self.assertEqual(options["shuttle_detector"], "yolo")
         self.assertEqual(options["expected_player_count"], 2)
 
 

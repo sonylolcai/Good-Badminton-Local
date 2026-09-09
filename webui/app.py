@@ -333,7 +333,8 @@ def configure_sport_mode(sport_id):
         return (
             "## 网球单打视觉分析\n"
             "只上传单打对打视频。服务端固定追踪两名匿名运动员，并输出每人的场地平面速度；"
-            "当前不检测网球、不判分、不生成回合或训练结论。",
+            "同时使用网球专用 YOLO 权重采集原始球位置；不判分、不生成回合或训练结论。"
+            "若服务器未部署 tennis_ball 权重，任务会明确失败，不会改用羽毛球模型。",
             "### 网球标定\n"
             "请使用完整单打场地画面，手动点击左上、右上、右下、左下四个角点。"
             "不要使用羽毛球自动线检测结果。",
@@ -342,7 +343,7 @@ def configure_sport_mode(sport_id):
                 label="网球 GPU 服务地址",
                 info="必须指向 health 返回 sport_id=tennis 的纯视觉流式 GPU 服务。",
             ),
-            gr.update(value="none", visible=False),
+            gr.update(value="yolo", visible=False),
             gr.update(value=True, visible=False, interactive=False),
             gr.update(
                 choices=[("2 人（网球单打，固定）", 2)],
@@ -1054,7 +1055,9 @@ def run_analysis_with_upload_mode(
         stream_options = {
             "analysis_sample_hz": int(analysis_sample_hz),
             "pose_imgsz": int(pose_imgsz),
-            "shuttle_detector": "none" if sport_id == "tennis" else shuttle_detector,
+            # stream-session.v1 keeps this legacy wire name.  The fixed
+            # tennis GPU profile interprets ``yolo`` as tennis-ball-only.
+            "shuttle_detector": "yolo" if sport_id == "tennis" else shuttle_detector,
             "tracker_backend": tracker_backend,
             "far_player_enhancement": bool(far_player_enhancement),
             "far_pose_roi": tuple(float(item.strip()) for item in far_pose_roi.split(',')),

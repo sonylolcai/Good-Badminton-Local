@@ -287,9 +287,6 @@ def iter_remote_two_second_stream(
             {
                 "sport_id": sport_id,
                 "session_mode": session_mode,
-                # Tennis person tracking is available now; its ball model is
-                # intentionally not wired in this release.
-                "shuttle_detector": "none",
             }
         )
     stream_configuration.update(

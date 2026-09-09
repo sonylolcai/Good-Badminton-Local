@@ -3,6 +3,12 @@ param(
     # The file to upload through the GPU provider's browser upload page.
     [string]$OutputPath = '',
 
+    # Produce an independently deployable, fixed-sport package. The source
+    # core is shared, but the archive name and server-side refresh target are
+    # never interchangeable.
+    [ValidateSet('badminton', 'tennis')]
+    [string]$Sport = 'badminton',
+
     # Adds extended annotation and benchmark tooling.  The primary TrackNet
     # runtime adapters are always included below; no upstream source or model
     # weights are ever placed in this package.
@@ -16,10 +22,11 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     # $PSScriptRoot for this script. Resolve the conventional output path only
     # after entering the script body so the documented no-argument command
     # works in both Windows PowerShell 5.1 and PowerShell 7.
-    $OutputPath = Join-Path $PSScriptRoot 'good-badminton-gpu-api-upload.zip'
+    $OutputPath = Join-Path $PSScriptRoot ("good-$Sport-gpu-api-upload.zip")
 }
 $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("good-badminton-gpu-package-" + [guid]::NewGuid().ToString('N'))
-$packageRoot = Join-Path $stagingRoot 'good-badminton-gpu-api'
+$packageName = "good-$Sport-gpu-api"
+$packageRoot = Join-Path $stagingRoot $packageName
 
 # The GPU instance has no reliable public egress.  This archive is therefore
 # built from the *current working tree*, including tracked local modifications,
@@ -184,7 +191,7 @@ try {
             # System.IO.Path.GetRelativePath, so calculate it without relying
             # on PowerShell 7/.NET 6 APIs.
             $relativePath = $_.FullName.Substring($packageRoot.Length).TrimStart('\', '/').Replace('\', '/')
-            $entryPath = "good-badminton-gpu-api/$relativePath"
+            $entryPath = "$packageName/$relativePath"
             [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                 $zip,
                 $_.FullName,
@@ -200,13 +207,13 @@ try {
     $item = Get-Item -LiteralPath $absoluteOutputPath
     Write-Host "Created GPU deployment package: $($item.FullName)"
     Write-Host "Size: $([math]::Round($item.Length / 1MB, 2)) MiB"
-    Write-Host 'Upload it to /root/good-badminton-gpu-api-upload.zip, then run:'
-    Write-Host 'bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh'
+    Write-Host "Upload it to /root/$packageName-upload.zip, then run:"
+    Write-Host "bash /root/$packageName/deploy/refresh_gpu_api_from_zip.sh /root/$packageName-upload.zip /root/$packageName $Sport"
     if ($IncludeTrackNetABTools) {
         Write-Host 'TrackNet A/B tools are included; source code and checkpoint ZIPs remain separate uploads.'
     }
     Write-Host 'First deployment only (when that fixed directory does not yet exist):'
-    Write-Host "unzip -p /root/good-badminton-gpu-api-upload.zip good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash"
+    Write-Host "unzip -p /root/$packageName-upload.zip $packageName/deploy/refresh_gpu_api_from_zip.sh | bash -s -- /root/$packageName-upload.zip /root/$packageName $Sport"
 }
 finally {
     if (Test-Path -LiteralPath $stagingRoot) {

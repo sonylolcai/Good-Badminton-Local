@@ -22,6 +22,7 @@ from typing import Any, Callable, Mapping, Optional
 import numpy as np
 
 from badminton_analysis.detection.shuttlecock import ShuttlecockTracker
+from badminton_analysis.detection.tennis_ball import TennisBallTracker
 from badminton_analysis.detection.yolo_pose import YOLOPoseProcessor
 from badminton_analysis.streaming.models import FinalizationContext, FrameContext, ProcessorEvent
 from badminton_analysis.tracking.person_only import PersonOnlyFrameProcessor, PersonOnlyTracker
@@ -259,6 +260,55 @@ class YoloShuttleFrameProcessor:
         self.tracker.frame_index = int(state.get("frame_index", 0))
 
 
+class YoloTennisBallFrameProcessor(YoloShuttleFrameProcessor):
+    """Emit tennis-only raw ball measurements under their own event contract."""
+
+    def __init__(self, tracker: TennisBallTracker, court_corners, model_path: str):
+        super().__init__(tracker, court_corners)
+        self.model_path = str(model_path)
+
+    def process_frame(self, frame, context: FrameContext):
+        detected = self.tracker.detect_ball(
+            frame,
+            conf=float(os.environ.get("GOOD_TENNIS_STREAM_BALL_CONF", "0.15")),
+            roi_corners=self.court_corners,
+        )
+        self.tracker.update_trajectory(detected, roi_corners=self.court_corners)
+        state = self.tracker.get_last_detection()
+        status = str(state.get("status") or "missing")
+        evidence = "detected" if status == "detected" else "missing"
+        confidence = float(state.get("confidence") or 0.0)
+        return [
+            ProcessorEvent(
+                event_type="ball_observation",
+                evidence_state=evidence,
+                confidence=max(0.0, min(1.0, confidence)),
+                data={
+                    "sport_id": "tennis",
+                    "ball_kind": "tennis_ball",
+                    "detector": "yolo",
+                    "model_checkpoint": Path(self.model_path).name,
+                    "model_required_class": TennisBallTracker.REQUIRED_CLASS_NAME,
+                    "measurement": deepcopy(state),
+                    "source_frame_index": int(context.source_frame_index),
+                    "measurement_bucket": int(context.measurement_bucket),
+                },
+            )
+        ]
+
+    def snapshot_state(self):
+        state = super().snapshot_state()
+        state["state_version"] = "yolo-tennis-ball-stream.v1"
+        return state
+
+    def restore_state(self, state: Mapping[str, Any]):
+        if state.get("state_version") != "yolo-tennis-ball-stream.v1":
+            raise ValueError("unsupported YOLO tennis-ball checkpoint")
+        restored = dict(state)
+        restored["state_version"] = "yolo-shuttle-stream.v1"
+        super().restore_state(restored)
+
+
 class CompositeMeasurementProcessor:
     """Run person and optional YOLO-ball measurement on the same sampled frame."""
 
@@ -361,6 +411,24 @@ class StreamProcessorFactory:
             raise ValueError(
                 "TrackNetV3 streaming requires a configured bounded-state temporal processor factory"
             )
+        if (
+            self.vision_profile.sport_id == "tennis"
+            and configuration.get("shuttle_detector") == "yolo"
+        ):
+            self._tennis_ball_model_path()
+
+    @staticmethod
+    def _tennis_ball_model_path() -> str:
+        """Require a dedicated tennis checkpoint instead of a generic default."""
+        configured = str(os.environ.get("GOOD_TENNIS_STREAM_BALL_MODEL") or "").strip()
+        if not configured:
+            raise ValueError(
+                "tennis YOLO ball detection requires GOOD_TENNIS_STREAM_BALL_MODEL "
+                "pointing to a tennis_ball-labelled checkpoint"
+            )
+        if not Path(configured).is_file():
+            raise ValueError(f"tennis YOLO ball checkpoint not found: {configured}")
+        return configured
 
     def __call__(self, session):
         self.validate_session_request(session)
@@ -456,6 +524,21 @@ class StreamProcessorFactory:
         if shuttle_detector == "none":
             return CompositeMeasurementProcessor(person, candidate_photos=candidate_photos), None
         if shuttle_detector == "yolo":
+            if self.vision_profile.sport_id == "tennis":
+                ball_path = self._tennis_ball_model_path()
+                ball_model = (
+                    self.ball_model_factory(ball_path)
+                    if self.ball_model_factory is not None
+                    else _load_ultralytics_model(ball_path, "tennis_ball")
+                )
+                tennis_ball = YoloTennisBallFrameProcessor(
+                    TennisBallTracker(ball_model),
+                    calibration["image_corners"],
+                    ball_path,
+                )
+                return CompositeMeasurementProcessor(
+                    person, tennis_ball, candidate_photos
+                ), None
             ball_path = os.environ.get(
                 "GOOD_BADMINTON_STREAM_BALL_MODEL",
                 str(project_root / "weights" / "yolo11s-ball.pt"),
