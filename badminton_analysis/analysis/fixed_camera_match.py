@@ -99,17 +99,39 @@ class CourtSpace:
         x, y = (float(value) for value in court_xy)
         return -margin_m <= x <= self.width_m + margin_m and -margin_m <= y <= self.length_m + margin_m
 
-    def contains_athlete(self, court_xy, margin_m=0.0):
+    def contains_athlete(
+        self,
+        court_xy,
+        margin_m=0.0,
+        *,
+        lateral_margin_m=None,
+        baseline_margin_m=None,
+    ):
         """Return whether a pose may enter the anonymous roster.
 
         The map itself stays a full sport coordinate system.  A training mode
         can therefore map a near half-court to its true global coordinates
         while excluding people on the far side from tracker bootstrap.
         """
-        if not self.contains(court_xy, margin_m=margin_m):
+        if court_xy is None:
+            return False
+        lateral_margin = float(
+            margin_m if lateral_margin_m is None else lateral_margin_m
+        )
+        baseline_margin = float(
+            margin_m if baseline_margin_m is None else baseline_margin_m
+        )
+        x, y = (float(value) for value in court_xy)
+        if not (
+            -lateral_margin <= x <= self.width_m + lateral_margin
+            and -baseline_margin <= y <= self.length_m + baseline_margin
+        ):
             return False
         if self.athlete_observation_region == "near_court_athlete":
-            return float(court_xy[1]) >= self.net_y_m - margin_m
+            # The baseline allowance is for the player's own baseline.  It
+            # must not turn a near-half training session into a far-side
+            # observer zone around the net.
+            return y >= self.net_y_m - float(margin_m)
         return True
 
 

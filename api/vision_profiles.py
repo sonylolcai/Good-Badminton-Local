@@ -40,6 +40,11 @@ class SessionModeProfile:
     default_calibration_scope: str
     athlete_observation_region: str
     athlete_observation_margin_m: float
+    # Keep the legacy uniform margin in the contract, but allow a sport to
+    # retain baseline retrieval positions without accidentally accepting
+    # spectators outside the sidelines.
+    athlete_observation_lateral_margin_m: float | None = None
+    athlete_observation_baseline_margin_m: float | None = None
 
     def calibration_scope(self, scope_id: str) -> CalibrationScopeProfile:
         for scope in self.calibration_scopes:
@@ -110,6 +115,8 @@ BADMINTON_PROFILE = SportVisionProfile(
             default_calibration_scope=FULL_COURT,
             athlete_observation_region=FULL_COURT_ATHLETES,
             athlete_observation_margin_m=0.35,
+            athlete_observation_lateral_margin_m=0.35,
+            athlete_observation_baseline_margin_m=0.35,
         ),
     ),
     default_session_mode="match",
@@ -131,7 +138,11 @@ TENNIS_PROFILE = SportVisionProfile(
             ),
             default_calibration_scope=FULL_COURT,
             athlete_observation_region=FULL_COURT_ATHLETES,
-            athlete_observation_margin_m=3.0,
+            # Compatibility fallback for old callers.  The active stream uses
+            # the two explicit margins below.
+            athlete_observation_margin_m=0.35,
+            athlete_observation_lateral_margin_m=0.75,
+            athlete_observation_baseline_margin_m=3.0,
         ),
         SessionModeProfile(
             session_mode="single_player_training",
@@ -151,7 +162,11 @@ TENNIS_PROFILE = SportVisionProfile(
             ),
             default_calibration_scope=NEAR_HALF_COURT,
             athlete_observation_region=NEAR_COURT_ATHLETE,
-            athlete_observation_margin_m=3.0,
+            # A one-person near-half session still needs a small net-side
+            # tolerance, not a three-metre extension into the far half.
+            athlete_observation_margin_m=0.35,
+            athlete_observation_lateral_margin_m=0.75,
+            athlete_observation_baseline_margin_m=3.0,
         ),
     ),
     # Tennis must be explicit because silently treating a training video as a

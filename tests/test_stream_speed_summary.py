@@ -30,6 +30,14 @@ class StreamSpeedSummaryTests(unittest.TestCase):
             self._event(1.0, "detected", [3.0, 10.0], bucket=4),
             # A one-second gap may not be bridged into a speed measurement.
             self._event(2.0, "detected", [4.0, 10.0], bucket=8),
+            {
+                "event_type": "ball_observation",
+                "evidence_state": "detected",
+                "data": {
+                    "detector_mode": "experimental_badminton_yolo",
+                    "experimental": True,
+                },
+            },
         ]
         with tempfile.TemporaryDirectory() as directory:
             result = summarize_stream_player_speeds(
@@ -53,6 +61,12 @@ class StreamSpeedSummaryTests(unittest.TestCase):
         # gap is independently rejected, so neither gap becomes inferred motion.
         self.assertEqual(player["measurement_coverage"]["excluded_segment_count"], 2)
         self.assertEqual(player["quality"]["status"], "measured")
+        self.assertEqual(payload["ball_detection"]["detected_event_count"], 1)
+        self.assertTrue(payload["ball_detection"]["experimental"])
+        self.assertEqual(
+            payload["ball_detection"]["accuracy_status"],
+            "requires_same_video_ground_truth",
+        )
 
     @staticmethod
     def _event(source_time, status, point, *, bucket):

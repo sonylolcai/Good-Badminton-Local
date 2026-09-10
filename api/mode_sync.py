@@ -91,6 +91,16 @@ class VisionModeSynchronizer:
                 "athlete_observation_margin_m": float(
                     mode.athlete_observation_margin_m
                 ),
+                "athlete_observation_lateral_margin_m": float(
+                    mode.athlete_observation_lateral_margin_m
+                    if mode.athlete_observation_lateral_margin_m is not None
+                    else mode.athlete_observation_margin_m
+                ),
+                "athlete_observation_baseline_margin_m": float(
+                    mode.athlete_observation_baseline_margin_m
+                    if mode.athlete_observation_baseline_margin_m is not None
+                    else mode.athlete_observation_margin_m
+                ),
                 "expected_player_count": (
                     None if expected is None else int(expected)
                 ),

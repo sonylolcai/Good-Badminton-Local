@@ -21,7 +21,6 @@ class TennisWebUiModeTests(unittest.TestCase):
     def test_tennis_browser_mode_sync_hides_badminton_only_controls(self):
         self.assertIn("dataset.goodSportMode", _SPORT_MODE_CLIENT_SYNC)
         for element_id in (
-            "badminton-shuttle-detector",
             "badminton-legacy-stream-button",
             "badminton-business-results",
             "badminton-rally-review-tab-button",
@@ -31,17 +30,21 @@ class TennisWebUiModeTests(unittest.TestCase):
     def test_tennis_mode_exposes_visual_only_fixed_singles_defaults(self):
         updates = configure_sport_mode("tennis")
 
-        self.assertEqual(len(updates), 13)
+        self.assertEqual(len(updates), 14)
         self.assertIn("网球单打视觉分析", updates[0])
-        self.assertIn("网球专用 YOLO 权重", updates[0])
-        self.assertIn("不会改用羽毛球模型", updates[0])
-        self.assertEqual(updates[3]["value"], "yolo")
+        self.assertIn("当前 YOLO-ball 羽毛球权重", updates[0])
+        self.assertIn("非专用网球模型证据", updates[0])
+        self.assertEqual(updates[3]["value"], "none")
+        self.assertTrue(updates[3]["visible"])
+        self.assertEqual([item[1] for item in updates[3]["choices"]], ["none", "yolo"])
         self.assertTrue(updates[4]["value"])
         self.assertFalse(updates[4]["interactive"])
         self.assertEqual(updates[5]["value"], 2)
         # The remaining five updates hide legacy business-only controls.
         self.assertTrue(all(update["visible"] is False for update in updates[7:]))
         self.assertFalse(updates[12]["value"])
+        self.assertFalse(updates[13]["value"])
+        self.assertFalse(updates[13]["visible"])
 
         presentation = configure_sport_presentation("tennis")
         self.assertIn("手动", presentation[0]["value"])
@@ -90,6 +93,26 @@ class TennisWebUiModeTests(unittest.TestCase):
         options = stream.call_args.args[2]
         self.assertEqual(options["shuttle_detector"], "yolo")
         self.assertEqual(options["expected_player_count"], 2)
+
+    def test_tennis_pose_only_selection_does_not_enable_ball_detection(self):
+        corners = [(10, 10), (110, 10), (110, 210), (10, 210)]
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "tennis-match.mp4"
+            video.write_bytes(b"test-video")
+            with patch(
+                "webui.app.iter_remote_two_second_stream",
+                return_value=iter([{"phase": "finalized", "analysis_session_id": "ssn_tennis"}]),
+            ) as stream:
+                list(run_analysis_with_upload_mode(
+                    True, str(video), "court.jpg", corners,
+                    "yolo", "whole_body", "zh", False, "singles",
+                    "standard", "none", "bytetrack", 0.7, False,
+                    640, 10, 0.5, False, "0.1,0.2,0.8,0.9",
+                    False, False, True, True, True, True, True, True,
+                    True, "weights/yolo11n-pose.pt", "weights/yolo11s-ball.pt",
+                    "http://tennis.example:8080", False, 4, "tennis",
+                ))
+        self.assertEqual(stream.call_args.args[2]["shuttle_detector"], "none")
 
 
 if __name__ == "__main__":

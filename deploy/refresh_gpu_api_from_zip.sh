@@ -184,15 +184,31 @@ printf 'GOOD_BADMINTON_API_DATA_DIR=%s\n' "$DATA_DIR" >> "$env_tmp"
 chmod 600 "$env_tmp"
 mv "$env_tmp" "$ENV_FILE"
 
+if [[ "$SPORT_ID" == "tennis" && -f "$SOURCE_DIR/weights/yolo11n-pose.pt" ]]; then
+  # The optional tennis trial package is self-contained for person pose.
+  # Move it into persistent state before replacing APP_DIR.
+  cp -p "$SOURCE_DIR/weights/yolo11n-pose.pt" "$WEIGHTS_DIR/yolo11n-pose.pt"
+  echo "Installed pose checkpoint into persistent weights."
+fi
+if [[ "$SPORT_ID" == "tennis" && -f "$SOURCE_DIR/weights/yolo11s-ball.pt" ]]; then
+  # The optional package payload is the existing badminton checkpoint used
+  # only by the explicit tennis experimental mode. Move it into persistent
+  # state before replacing APP_DIR, just like all other server weights.
+  cp -p "$SOURCE_DIR/weights/yolo11s-ball.pt" "$WEIGHTS_DIR/yolo11s-ball.pt"
+  echo "Installed experimental tennis YOLO-ball checkpoint into persistent weights."
+fi
+
 if [[ "$SPORT_ID" == "badminton" ]]; then
   [[ -f "$WEIGHTS_DIR/yolo11s-ball.pt" ]] || fail \
     "Missing $WEIGHTS_DIR/yolo11s-ball.pt. Upload the checked ball-model weight there once; it is preserved on later code upgrades."
 else
   tennis_checkpoint="$(sed -n 's/^GOOD_TENNIS_STREAM_BALL_MODEL=//p' "$ENV_FILE" | tail -n 1 | tr -d '\r')"
-  [[ -n "$tennis_checkpoint" ]] || fail \
-    "Set GOOD_TENNIS_STREAM_BALL_MODEL in $ENV_FILE before refreshing the tennis service."
-  [[ -f "$tennis_checkpoint" ]] || fail \
-    "Tennis YOLO checkpoint not found: $tennis_checkpoint"
+  if [[ -n "$tennis_checkpoint" && ! -f "$tennis_checkpoint" ]]; then
+    fail "Tennis YOLO checkpoint not found: $tennis_checkpoint"
+  fi
+  if [[ -z "$tennis_checkpoint" && ! -f "$WEIGHTS_DIR/yolo11s-ball.pt" ]]; then
+    echo "No tennis ball checkpoint installed; tennis service will start in pose-only mode."
+  fi
 fi
 
 echo "[5/7] Stopping the old API, if present..."

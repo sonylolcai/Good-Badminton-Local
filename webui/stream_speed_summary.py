@@ -47,6 +47,7 @@ def summarize_stream_player_speeds(
 
     configuration = dict(create_request.get("configuration") or {})
     samples, observation_counts = _detected_samples(events)
+    ball_detection = _ball_detection_summary(events)
     players = [
         _player_speed_summary(track_id, values, observation_counts.get(track_id, 0))
         for track_id, values in sorted(samples.items())
@@ -69,10 +70,12 @@ def summarize_stream_player_speeds(
             "speed_window_seconds": SPEED_WINDOW_SECONDS,
         },
         "players": players,
+        "ball_detection": ball_detection,
         "limitations": [
             "track_id is an anonymous visual identifier, not a confirmed person identity.",
             "Only adjacent detected court positions are used; predicted, missing and gapped observations are excluded.",
             "Speed is court-plane metres per second and is only as accurate as the approved four-point calibration.",
+            "Ball detection rate is not accuracy. Precision/recall requires manually labelled tennis-ball ground truth for this same video.",
         ],
     }
     speed_path = derived_dir / "player_speed_summary_v1.json"
@@ -146,6 +149,38 @@ def _detected_samples(events: list[dict[str, Any]]):
     for values in samples.values():
         values.sort(key=lambda item: item["time_sec"])
     return samples, observation_counts
+
+
+def _ball_detection_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose review counts without turning unlabelled detections into accuracy."""
+    ball_events = [
+        event for event in events if event.get("event_type") == "ball_observation"
+    ]
+    detected = [
+        event for event in ball_events if event.get("evidence_state") == "detected"
+    ]
+    metadata = [
+        (event.get("data") or {}) for event in ball_events
+        if isinstance(event.get("data"), Mapping)
+    ]
+    return {
+        "requested": bool(ball_events),
+        "event_count": len(ball_events),
+        "detected_event_count": len(detected),
+        "missing_event_count": sum(
+            1 for event in ball_events if event.get("evidence_state") == "missing"
+        ),
+        "detection_rate": _round(len(detected) / len(ball_events)) if ball_events else None,
+        "detector_modes": sorted({
+            str(item.get("detector_mode") or "unknown") for item in metadata
+        }),
+        "experimental": any(bool(item.get("experimental")) for item in metadata),
+        "accuracy": None,
+        "accuracy_status": (
+            "requires_same_video_ground_truth"
+            if ball_events else "not_requested"
+        ),
+    }
 
 
 def _player_speed_summary(track_id: str, samples: list[dict[str, float]], opportunity_count: int):

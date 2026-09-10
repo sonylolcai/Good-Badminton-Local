@@ -110,6 +110,35 @@ class GpuSportProfileTests(unittest.TestCase):
         self.assertAlmostEqual(court.image_to_court((100, 100))[1], 23.77, places=4)
         self.assertTrue(court.contains_athlete((4.0, 18.0), margin_m=0.35))
         self.assertFalse(court.contains_athlete((4.0, 5.0), margin_m=0.35))
+        self.assertTrue(court.contains_athlete(
+            (4.0, 26.0),
+            lateral_margin_m=resolved["athlete_observation_lateral_margin_m"],
+            baseline_margin_m=resolved["athlete_observation_baseline_margin_m"],
+        ))
+        self.assertFalse(court.contains_athlete(
+            (4.0, 10.0),
+            margin_m=resolved["athlete_observation_margin_m"],
+            lateral_margin_m=resolved["athlete_observation_lateral_margin_m"],
+            baseline_margin_m=resolved["athlete_observation_baseline_margin_m"],
+        ))
+
+    def test_tennis_keeps_baseline_extension_without_opening_sidelines(self):
+        resolved = self.tennis_modes.synchronize(
+            self.configuration(session_mode="singles_match")
+        )
+        court = CourtSpace(
+            [(0, 0), (100, 0), (100, 100), (0, 100)],
+            court_dimensions=resolved["court_dimensions_m"],
+            world_points_m=resolved["calibration_world_points_m"],
+            athlete_observation_region=resolved["athlete_observation_region"],
+        )
+        margins = {
+            "lateral_margin_m": resolved["athlete_observation_lateral_margin_m"],
+            "baseline_margin_m": resolved["athlete_observation_baseline_margin_m"],
+        }
+        self.assertTrue(court.contains_athlete((4.0, -2.5), **margins))
+        self.assertTrue(court.contains_athlete((4.0, 23.77 + 2.5), **margins))
+        self.assertFalse(court.contains_athlete((-1.0, 12.0), **margins))
 
     def test_training_tracker_locks_one_person_and_checkpoint_rejects_other_mode(self):
         resolved = self.tennis_modes.synchronize(

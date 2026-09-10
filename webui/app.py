@@ -30,6 +30,7 @@ import numpy as np
 
 from badminton_analysis.cancellation import AnalysisCancelled
 from business_gateway.streaming.client import StreamAPIError
+from business_gateway.promotion_video import PromotionVideoError, generate_promotion_video
 from webui.pipeline import (
     _max_template_match_score,
     imread_safe,
@@ -333,8 +334,8 @@ def configure_sport_mode(sport_id):
         return (
             "## 网球单打视觉分析\n"
             "只上传单打对打视频。服务端固定追踪两名匿名运动员，并输出每人的场地平面速度；"
-            "同时使用网球专用 YOLO 权重采集原始球位置；不判分、不生成回合或训练结论。"
-            "若服务器未部署 tennis_ball 权重，任务会明确失败，不会改用羽毛球模型。",
+            "可选择仅人物，或试用当前 YOLO-ball 羽毛球权重采集实验球点；不判分、不生成回合或训练结论。"
+            "实验球点会明确标注为非专用网球模型证据。",
             "### 网球标定\n"
             "请使用完整单打场地画面，手动点击左上、右上、右下、左下四个角点。"
             "不要使用羽毛球自动线检测结果。",
@@ -343,7 +344,19 @@ def configure_sport_mode(sport_id):
                 label="网球 GPU 服务地址",
                 info="必须指向 health 返回 sport_id=tennis 的纯视觉流式 GPU 服务。",
             ),
-            gr.update(value="yolo", visible=False),
+            gr.update(
+                choices=[
+                    ("仅人物姿态与跑位（不检测球）", "none"),
+                    ("试用当前 YOLO-ball（羽毛球权重，实验）", "yolo"),
+                ],
+                value="none",
+                visible=True,
+                label="网球球体检测",
+                info=(
+                    "默认仅人物。实验模式使用当前 yolo11s-ball.pt 的 badminton 类别，"
+                    "只用于观察命中与误检，不代表网球准确率。"
+                ),
+            ),
             gr.update(value=True, visible=False, interactive=False),
             gr.update(
                 choices=[("2 人（网球单打，固定）", 2)],
@@ -359,6 +372,11 @@ def configure_sport_mode(sport_id):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(value=False, visible=False),
+            # The current tennis stream API returns JSON evidence only.  Do
+            # not leave a previously selected badminton promotion value in
+            # Gradio state: it would be submitted even when the control is
+            # no longer applicable to this transport.
+            gr.update(value=False, visible=False, interactive=False),
         )
     return (
         "## 羽毛球视觉分析\n"
@@ -382,6 +400,7 @@ def configure_sport_mode(sport_id):
         gr.update(visible=True),
         gr.update(visible=True),
         gr.update(visible=True),
+        gr.update(value=False, visible=True, interactive=True),
         gr.update(visible=True),
         gr.update(visible=True),
         gr.update(visible=True),
@@ -398,7 +417,7 @@ def configure_sport_presentation(sport_id):
             gr.update(
                 value=(
                     "网球会固定使用 2 秒直连分片上传到网球 GPU；"
-                    "不调用本地业务网关，也不会分析球、比分、回合或身体参数。"
+                    "按球体检测选项输出原始球点，但不会分析比分、回合或身体参数。"
                 )
             ),
             gr.update(
@@ -536,7 +555,8 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                        show_skeletons, show_player_trajectories,
                       show_court_trajectory, show_shuttlecock_trajectory,
                        show_player_stats, show_pose_roi, visualize_positions,
-                      yolo_pose_model, ball_model, gpu_base_url,
+                       yolo_pose_model, ball_model, gpu_base_url,
+                       generate_promotion_video=False,
                       progress=gr.Progress(track_tqdm=False)):
     if not analysis_ready:
         gr.Warning("已切换到当前视频帧，请在预览图中点击四个球场角点，然后应用手动角点。")
@@ -560,6 +580,11 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
     ):
         raise gr.Error("远端 ROI 必须满足 0 <= x1 < x2 <= 1 且 0 <= y1 < y2 <= 1。")
 
+    # A promotion video composes the existing annotated video in its centre
+    # panel.  Enabling the marketing switch therefore requests that one
+    # existing visual artifact up front; the later business renderer does not
+    # run pose/ball inference again.
+    effective_annotated_video = bool(generate_annotated_video or generate_promotion_video)
     options = {
         "pose_family": pose_family,
         "pose_mode": pose_mode,
@@ -576,7 +601,8 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
         "tracker_backend": tracker_backend,
         "enable_bytetrack": tracker_backend == "bytetrack",
         "output_video_style": output_video_style,
-        "generate_annotated_video": generate_annotated_video,
+        "generate_annotated_video": effective_annotated_video,
+        "generate_promotion_video": bool(generate_promotion_video),
         "browser_video_reencode": browser_video_reencode,
         # This is an execution mode rather than a display toggle. ``none``
         # does not invoke a shuttle detector or create ball evidence.
@@ -962,8 +988,11 @@ def _two_second_segment_upload_update(stream_status):
         photo_records=stream_result.get("candidate_photos"),
     )
     derivation = stream_result.get("derivation") or {}
+    raw_events_path = derivation.get("raw_events_path")
+    if raw_events_path and not os.path.isfile(raw_events_path):
+        raw_events_path = None
     return (
-        None, None, None, None, None, None, None, [],
+        None, None, None, raw_events_path, None, None, None, [],
         metrics_path, _movement_metric_summary_rows(metrics), metrics,
         None, _body_profile_rows_from_metrics(metrics_path), stream_result.get("analysis_output_dir"), status, status,
         gallery or None, player_rows, {
@@ -1030,6 +1059,7 @@ def run_analysis_with_upload_mode(
     show_player_stats, show_pose_roi, visualize_positions,
     yolo_pose_model, ball_model, gpu_base_url, two_second_segment_push, expected_player_count,
     sport_id="badminton",
+    generate_promotion_video=False,
     progress=gr.Progress(track_tqdm=False),
 ):
     """Run the selected GPU transport without changing analysis settings.
@@ -1045,6 +1075,10 @@ def run_analysis_with_upload_mode(
     # service accepts only stream sessions, which keeps video interpretation
     # separate from the legacy badminton whole-video business facade.
     if sport_id == "tennis" or bool(two_second_segment_push):
+        if generate_promotion_video:
+            raise gr.Error(
+                "宣传视频需要完整的标注视频作为中央画面；当前直连分片流服务尚未导出该成片。"
+            )
         if not analysis_ready:
             raise gr.Error("请先自动检测或手动确认四个球场角点，再启动 GPU 分片推送。")
         if video_file is None:
@@ -1055,9 +1089,10 @@ def run_analysis_with_upload_mode(
         stream_options = {
             "analysis_sample_hz": int(analysis_sample_hz),
             "pose_imgsz": int(pose_imgsz),
-            # stream-session.v1 keeps this legacy wire name.  The fixed
-            # tennis GPU profile interprets ``yolo`` as tennis-ball-only.
-            "shuttle_detector": "yolo" if sport_id == "tennis" else shuttle_detector,
+            # ``none`` keeps tennis pose-only. Its explicit ``yolo`` choice
+            # selects dedicated tennis weights when configured, otherwise the
+            # separately labelled current-checkpoint experiment.
+            "shuttle_detector": str(shuttle_detector),
             "tracker_backend": tracker_backend,
             "far_player_enhancement": bool(far_player_enhancement),
             "far_pose_roi": tuple(float(item.strip()) for item in far_pose_roi.split(',')),
@@ -1118,9 +1153,44 @@ def run_analysis_with_upload_mode(
         yolo_pose_model,
         ball_model,
         gpu_base_url,
+        generate_promotion_video,
         progress=progress,
     ):
         yield _full_video_upload_update(update)
+
+
+def generate_promotion_video_for_webui(
+    enabled,
+    analysis_output_dir,
+    annotated_video,
+    sport_id="badminton",
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Run the retryable business-side promotion renderer after analysis.
+
+    A promotion export failure must not turn a successful GPU analysis into a
+    failed task.  The timeline and video live below the existing result folder
+    so the operation can be retried later without an upload or a GPU rerun.
+    """
+    if not enabled:
+        return None, None, {"status": "not_requested"}
+    if not analysis_output_dir or not annotated_video:
+        return None, None, {
+            "status": "blocked",
+            "reason": "本次没有可用的标注视频；请确认生成标注视频成功后重试。",
+        }
+    try:
+        result = generate_promotion_video(
+            analysis_output_dir,
+            annotated_video,
+            sport_id="tennis" if sport_id == "tennis" else "badminton",
+            progress_cb=lambda processed, total: progress(
+                processed / max(1, total), desc="正在编排 AI 宣传视频"
+            ),
+        )
+    except PromotionVideoError as exc:
+        return None, None, {"status": "failed", "reason": str(exc), "retryable_without_gpu": True}
+    return result["video_path"], result["timeline_path"], result
 
 
 def load_local_stream_replay_result(business_task_id: str, sport_id="badminton"):
@@ -1812,7 +1882,6 @@ _APP_CSS = """
  * badminton detector, legacy business-stream restore, or post-match body
  * workflow.  The Python callbacks still enforce the same boundary server-side.
  */
-html[data-good-sport-mode="tennis"] #badminton-shuttle-detector,
 html[data-good-sport-mode="tennis"] #badminton-annotated-video,
 html[data-good-sport-mode="tennis"] #badminton-legacy-stream-button,
 html[data-good-sport-mode="tennis"] #badminton-legacy-stream-restore,
@@ -2876,6 +2945,15 @@ def build_ui():
                         label="生成标注视频（较慢，可用于肉眼复核）",
                         elem_id="badminton-annotated-video",
                     )
+                    generate_promotion_video_toggle = gr.Checkbox(
+                        value=False,
+                        label="生成 AI 宣传视频（复用解析结果，较慢）",
+                        info=(
+                            "中央展示人物骨架和球体检测视频；两侧展示匿名运动员的距离、"
+                            "速度与随时间更新的 AI 观察。开启后会自动生成中央标注视频。"
+                        ),
+                        elem_id="ai-promotion-video-toggle",
+                    )
                     two_second_segment_push = gr.Checkbox(
                         value=False,
                         label="每 2 秒直接分片推送到 GPU（开发测试）",
@@ -2976,6 +3054,12 @@ def build_ui():
                         },
                     )
                     output_video = gr.Video(label=t["out_video"])
+                    output_promotion_video = gr.Video(label="AI 宣传视频（赛后异步编排）")
+                    output_promotion_timeline = gr.File(label="AI 宣传视频时间轴与点评证据")
+                    output_promotion_status = gr.JSON(
+                        label="AI 宣传视频状态",
+                        value={"status": "not_requested"},
+                    )
                     output_gallery = gr.Gallery(label=t["out_gallery"], columns=2, height="auto")
                     gr.Markdown(
                         "### 人物截图与逐人数据\n"
@@ -3582,6 +3666,7 @@ def build_ui():
                 output_performance_report,
                 badminton_business_results,
                 generate_annotated_video,
+                generate_promotion_video_toggle,
             ],
             js=_SPORT_MODE_CLIENT_SYNC,
             show_progress="hidden",
@@ -3612,6 +3697,11 @@ def build_ui():
                 stream_replay_status,
                 output_player_gallery, output_player_result_table, output_player_result_detail,
             ],
+            show_progress="hidden",
+        )
+        sport_mode_change.then(
+            fn=lambda: (None, None, {"status": "not_requested"}),
+            outputs=[output_promotion_video, output_promotion_timeline, output_promotion_status],
             show_progress="hidden",
         )
         sport_mode_change.then(
@@ -3679,7 +3769,7 @@ def build_ui():
                 template_path_state, corner_status, analysis_ready_state,
             ],
         )
-        run_preflight.then(
+        analysis_run = run_preflight.then(
             fn=run_analysis_with_upload_mode,
             inputs=[
                  analysis_ready_state, video_input, template_path_state, corners_state,
@@ -3691,7 +3781,7 @@ def build_ui():
                 show_court_trajectory, show_shuttlecock_trajectory,
                 show_player_stats, show_pose_roi, visualize_positions,
                 yolo_pose_model, ball_model, gpu_base_url, two_second_segment_push, expected_player_count,
-                sport_mode,
+                sport_mode, generate_promotion_video_toggle,
             ],
             outputs=[
                 output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,
@@ -3703,6 +3793,17 @@ def build_ui():
                 stream_replay_status,
                 output_player_gallery, output_player_result_table, output_player_result_detail,
             ],
+        )
+        analysis_run.then(
+            fn=generate_promotion_video_for_webui,
+            inputs=[
+                generate_promotion_video_toggle,
+                analysis_output_dir_state,
+                output_video,
+                sport_mode,
+            ],
+            outputs=[output_promotion_video, output_promotion_timeline, output_promotion_status],
+            show_progress="minimal",
         )
         stream_preflight = stream_replay_btn.click(
             fn=ensure_court_for_analysis,

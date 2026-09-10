@@ -1,29 +1,35 @@
 # Tennis YOLO Ball Model Contract
 
-The tennis GPU image must contain a dedicated YOLO checkpoint.  Configure it
-only on the tennis GPU service:
+The tennis GPU service can start in pose-only mode. In WebUI, select **only
+person pose** when no ball model is required. Selecting YOLO ball detection
+uses one of the following explicitly separated modes:
+
+1. **Dedicated tennis mode**: configure a dedicated checkpoint only on the
+   tennis GPU service:
 
 ```bash
-GOOD_TENNIS_STREAM_BALL_MODEL=/opt/good-tennis/weights/tennis-ball-yolo.pt
+GOOD_TENNIS_STREAM_BALL_MODEL=/root/good-tennis-gpu-api-state/weights/tennis-ball-yolo.pt
 ```
 
-Build the separately deployable archive on Windows with:
+2. **Current-checkpoint experiment**: build the tennis package with the
+   existing `yolo11s-ball.pt` included:
 
 ```powershell
-.\deploy\package_gpu_api.ps1 -Sport tennis
+.\deploy\package_gpu_api.ps1 -Sport tennis -IncludeExperimentalTennisBallModel
 ```
 
-It creates `deploy/good-tennis-gpu-api-upload.zip`. Upload that file to
-`/root/good-tennis-gpu-api-upload.zip`; before refreshing, configure the same
-checkpoint path and `GOOD_SPORT_VISION_PROFILE=tennis` in the tennis server's
-`/root/good-tennis-gpu-api-state/.gpu-api.env`.
+It creates `deploy/good-tennis-gpu-api-upload.zip` and places the current Pose
+and experimental ball checkpoints into persistent `weights/` during refresh. The fixed tennis launcher
+already selects the sport; `GOOD_SPORT_VISION_PROFILE` is optional and must
+only be absent or equal to `tennis`.
 
-The checkpoint's `names` metadata must contain the exact label
-`tennis_ball`. The runtime rejects a badminton-only checkpoint, a generic
-model without labels, and detections from all non-`tennis_ball` classes.
-`deploy/start_tennis_gpu_container.sh` also refuses to start until the configured
-checkpoint path exists, so a tennis server cannot silently run with only the
-bundled badminton weights.
+The dedicated checkpoint's `names` metadata must contain the exact label
+`tennis_ball`; detections use `ball_kind=tennis_ball`. The optional experiment
+accepts only the existing `badminton` label and emits
+`ball_kind=experimental_badminton_ball_candidate` plus `experimental=true`.
+It is not a tennis accuracy claim. The WebUI reports detected/missing counts
+and detection rate; precision and recall require manually labelled tennis-ball
+positions from the same video.
 
 The GPU emits `ball_observation` as raw image-space evidence only. It does not
 derive shots, hits, rallies, scores, player ownership, or a filled-in ball

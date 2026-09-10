@@ -22,7 +22,10 @@ from ..streaming.models import FinalizationContext, FrameContext, ProcessorEvent
 from .bytetrack_adapter import ByteTrackAdapter
 
 
-PERSON_ONLY_SCHEMA_VERSION = "person-only.v2"
+# v3 adds independent sideline and baseline observation margins.  A resumed
+# worker must not silently reinterpret a v2 checkpoint that used one uniform
+# margin for both axes.
+PERSON_ONLY_SCHEMA_VERSION = "person-only.v3"
 PERSON_ONLY_STATES = {
     "candidate",
     "active",
@@ -60,6 +63,8 @@ class PersonOnlyTracker:
         calibration_world_points_m=None,
         athlete_observation_region: str = "full_court_athletes",
         athlete_observation_margin_m: float = 0.35,
+        athlete_observation_lateral_margin_m: Optional[float] = None,
+        athlete_observation_baseline_margin_m: Optional[float] = None,
         sport_id: str = "badminton",
         session_mode: str = "match",
         calibration_scope: str = "full_court",
@@ -91,6 +96,22 @@ class PersonOnlyTracker:
         self.athlete_observation_margin_m = max(
             0.0,
             float(athlete_observation_margin_m),
+        )
+        self.athlete_observation_lateral_margin_m = max(
+            0.0,
+            float(
+                athlete_observation_margin_m
+                if athlete_observation_lateral_margin_m is None
+                else athlete_observation_lateral_margin_m
+            ),
+        )
+        self.athlete_observation_baseline_margin_m = max(
+            0.0,
+            float(
+                athlete_observation_margin_m
+                if athlete_observation_baseline_margin_m is None
+                else athlete_observation_baseline_margin_m
+            ),
         )
         self.sport_id = str(sport_id)
         self.session_mode = str(session_mode)
@@ -144,6 +165,21 @@ class PersonOnlyTracker:
         self._last_frame_index = -1
         self._last_source_time_sec = 0.0
 
+    def contains_athlete(self, court_xy) -> bool:
+        """Apply the selected sport profile's roster-observation boundary.
+
+        Tennis keeps a deliberately larger *baseline* allowance because a
+        player can hit from beyond either baseline.  It does not loosen the
+        sideline boundary by the same amount, so spectators beside the court
+        do not become anonymous player tracks.
+        """
+        return self.court_space.contains_athlete(
+            court_xy,
+            margin_m=self.athlete_observation_margin_m,
+            lateral_margin_m=self.athlete_observation_lateral_margin_m,
+            baseline_margin_m=self.athlete_observation_baseline_margin_m,
+        )
+
     def update(
         self,
         frame_index: int,
@@ -179,10 +215,7 @@ class PersonOnlyTracker:
         normalized = [
             dict(item)
             for item in (observations if observations is not None else ())
-            if self.court_space.contains_athlete(
-                item.get("court_xy"),
-                margin_m=self.athlete_observation_margin_m,
-            )
+            if self.contains_athlete(item.get("court_xy"))
         ]
         if self._byte_tracker is not None:
             association_keys = self._byte_tracker.update(normalized)
@@ -225,10 +258,7 @@ class PersonOnlyTracker:
         output = []
         for index, observation in enumerate(observations):
             court_xy = observation.get("court_xy")
-            if court_xy is None or not self.court_space.contains_athlete(
-                court_xy,
-                margin_m=self.athlete_observation_margin_m,
-            ):
+            if court_xy is None or not self.contains_athlete(court_xy):
                 continue
             association_key = str(observation.get("association_key") or "")
             safe_key = "".join(
@@ -405,6 +435,8 @@ class PersonOnlyTracker:
             "calibration_world_points_m": deepcopy(self.calibration_world_points_m),
             "athlete_observation_region": self.athlete_observation_region,
             "athlete_observation_margin_m": self.athlete_observation_margin_m,
+            "athlete_observation_lateral_margin_m": self.athlete_observation_lateral_margin_m,
+            "athlete_observation_baseline_margin_m": self.athlete_observation_baseline_margin_m,
             "lock_match_roster": self.lock_match_roster,
             "expected_roster_count": self._tracker.expected_roster_count,
             "roster_stable_frames": self.roster_stable_frames,
@@ -434,6 +466,8 @@ class PersonOnlyTracker:
             "calibration_world_points_m": self.calibration_world_points_m,
             "athlete_observation_region": self.athlete_observation_region,
             "athlete_observation_margin_m": self.athlete_observation_margin_m,
+            "athlete_observation_lateral_margin_m": self.athlete_observation_lateral_margin_m,
+            "athlete_observation_baseline_margin_m": self.athlete_observation_baseline_margin_m,
         }
         restored_geometry = {
             key: state.get(key)

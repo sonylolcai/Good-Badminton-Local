@@ -39,20 +39,10 @@ if [[ -n "${GOOD_SPORT_VISION_PROFILE:-}" && "${GOOD_SPORT_VISION_PROFILE}" != "
   exit 64
 fi
 
-# A tennis server must never appear healthy while it can only load the legacy
-# badminton shuttle checkpoint.  The model label itself is checked by the
-# Python adapter at first construction; this launcher check catches the more
-# common missing/mis-mounted checkpoint before accepting any video.
-if [[ "$SPORT_ID" == "tennis" ]]; then
-  [[ -n "${GOOD_TENNIS_STREAM_BALL_MODEL:-}" ]] || {
-    echo "GOOD_TENNIS_STREAM_BALL_MODEL is required for the tennis GPU service" >&2
-    exit 64
-  }
-  [[ -f "$GOOD_TENNIS_STREAM_BALL_MODEL" ]] || {
-    echo "Tennis YOLO checkpoint not found: $GOOD_TENNIS_STREAM_BALL_MODEL" >&2
-    exit 64
-  }
-fi
+# Tennis may run in pose-only mode before any ball checkpoint is available.
+# A session that explicitly enables YOLO performs its own model-path and label
+# check. This lets WebUI operators validate player tracking first, while still
+# rejecting an unavailable ball model at the request boundary.
 
 if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   if curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/api/v1/health" >/dev/null; then

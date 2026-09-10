@@ -12,7 +12,13 @@ param(
     # Adds extended annotation and benchmark tooling.  The primary TrackNet
     # runtime adapters are always included below; no upstream source or model
     # weights are ever placed in this package.
-    [switch]$IncludeTrackNetABTools
+    [switch]$IncludeTrackNetABTools,
+
+    # Include the repository's current pose and badminton YOLO-ball checkpoints
+    # only for an explicitly labelled tennis trial. The ball model is never
+    # presented as trained tennis evidence. Both files are copied to persistent
+    # server weights on refresh; normal source packages exclude model weights.
+    [switch]$IncludeExperimentalTennisBallModel
 )
 
 $ErrorActionPreference = 'Stop'
@@ -127,6 +133,14 @@ try {
         Copy-SourceFile -RelativePath $relativePath
     }
 
+    if ($IncludeExperimentalTennisBallModel) {
+        if ($Sport -ne 'tennis') {
+            throw 'IncludeExperimentalTennisBallModel is only valid with -Sport tennis.'
+        }
+        Copy-SourceFile -RelativePath 'weights/yolo11n-pose.pt'
+        Copy-SourceFile -RelativePath 'weights/yolo11s-ball.pt'
+    }
+
     # The GPU package is intentionally created from the working tree: during
     # a staged multi-agent rollout, a newly added runtime module might not yet
     # be in Git's index.  Include only untracked *application-source* files
@@ -211,6 +225,9 @@ try {
     Write-Host "bash /root/$packageName/deploy/refresh_gpu_api_from_zip.sh /root/$packageName-upload.zip /root/$packageName $Sport"
     if ($IncludeTrackNetABTools) {
         Write-Host 'TrackNet A/B tools are included; source code and checkpoint ZIPs remain separate uploads.'
+    }
+    if ($IncludeExperimentalTennisBallModel) {
+        Write-Host 'Included yolo11n-pose.pt and yolo11s-ball.pt for the tennis pose and experimental ball-detection modes.'
     }
     Write-Host 'First deployment only (when that fixed directory does not yet exist):'
     Write-Host "unzip -p /root/$packageName-upload.zip $packageName/deploy/refresh_gpu_api_from_zip.sh | bash -s -- /root/$packageName-upload.zip /root/$packageName $Sport"

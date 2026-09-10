@@ -225,7 +225,7 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual(ball.data["model_required_class"], "tennis_ball")
         self.assertNotIn("shuttle_observation", [event.event_type for event in events])
 
-    def test_tennis_yolo_rejects_a_badminton_labelled_checkpoint(self):
+    def test_tennis_yolo_uses_badminton_label_only_as_explicit_experiment(self):
         checkpoint = self.root / "tennis-ball-yolo.pt"
         checkpoint.write_bytes(b"test checkpoint")
         session = create_request()
@@ -234,10 +234,23 @@ class StreamRuntimeTests(unittest.TestCase):
         )
         factory = self.factory(vision_profile=TENNIS_PROFILE)
         with patch.dict(
-            "os.environ", {"GOOD_TENNIS_STREAM_BALL_MODEL": str(checkpoint)}, clear=False
+            "os.environ",
+            {
+                "GOOD_TENNIS_STREAM_BALL_MODEL": "",
+                "GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL": str(checkpoint),
+            },
+            clear=False,
         ):
-            with self.assertRaisesRegex(ValueError, "missing required class"):
-                factory(session)
+            measurement, _ = factory(session)
+            events = list(measurement.process_frame(
+                np.zeros((64, 64, 3), dtype=np.uint8), self.context()
+            ))
+
+        ball = next(event for event in events if event.event_type == "ball_observation")
+        self.assertEqual(ball.evidence_state, "detected")
+        self.assertEqual(ball.data["ball_kind"], "experimental_badminton_ball_candidate")
+        self.assertEqual(ball.data["model_required_class"], "badminton")
+        self.assertTrue(ball.data["experimental"])
 
     def test_tennis_yolo_rejects_missing_checkpoint_before_session_runs(self):
         session = create_request()
@@ -245,8 +258,15 @@ class StreamRuntimeTests(unittest.TestCase):
             {"sport_id": "tennis", "session_mode": "singles_match", "shuttle_detector": "yolo"}
         )
         factory = self.factory(vision_profile=TENNIS_PROFILE)
-        with patch.dict("os.environ", {"GOOD_TENNIS_STREAM_BALL_MODEL": ""}, clear=False):
-            with self.assertRaisesRegex(ValueError, "requires GOOD_TENNIS_STREAM_BALL_MODEL"):
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOD_TENNIS_STREAM_BALL_MODEL": "",
+                "GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL": str(self.root / "missing.pt"),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "experimental YOLO ball detection requires"):
                 factory.validate_session_request(session)
 
     def test_tennis_yolo_discards_non_tennis_detection_classes(self):

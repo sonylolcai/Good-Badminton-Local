@@ -123,10 +123,13 @@ person, make a score decision or change the process to another sport.
 The server derives `expected_player_count` and `max_roster_count` from a fixed
 tennis mode: 2 for `singles_match`, 1 for `single_player_training`. A caller
 cannot override those values. `shuttle_detector` is retained as a v1 wire-name:
-the tennis deployment accepts `none` or `yolo`, and its `yolo` value selects
-only the configured `GOOD_TENNIS_STREAM_BALL_MODEL`. That checkpoint must
-contain the exact class name `tennis_ball`; a missing path or mismatched label
-fails the session instead of falling back to the badminton shuttle model.
+the tennis deployment accepts `none` or `yolo`. `none` is pose-only. `yolo`
+uses a configured `GOOD_TENNIS_STREAM_BALL_MODEL` when present, requiring the
+exact class name `tennis_ball`. If absent, the explicitly packaged current
+`yolo11s-ball.pt` may be used only as an experimental `badminton`-labelled
+ball candidate; its event has `experimental=true` and never claims tennis
+accuracy. If neither model is available, only a `yolo` request fails; the
+pose-only service remains usable.
 
 If `shuttle_detector=tracknet_v3`, `tracknet_overlap_frames` MUST be 7 when present,
 because the verified temporal window length is 8. This contract does not claim that
@@ -194,7 +197,7 @@ Minimum event data:
 |---|---|
 | `person_observation` | Anonymous `track_id`, lifecycle state, measurement frame, bbox/court position/keypoints when evidence exists. |
 | `shuttle_observation` | Anonymous shuttle track, image/court position when available, detector source and measurement quality. |
-| `ball_observation` | Tennis-only raw `tennis_ball` image measurement, model label and detector quality. A missing frame remains missing; this event does not assert a hit, rally, score or trajectory. |
+| `ball_observation` | Tennis raw image measurement, model label and detector quality. It is either dedicated `tennis_ball` evidence or explicitly experimental `badminton`-model evidence. A missing frame remains missing; this event does not assert a hit, rally, score or trajectory. |
 | `interaction_candidate` | Candidate ID/type, related anonymous track IDs, evidence references and `review_required`; never forced fact. |
 | `session_status` | State/stage transition and progress snapshot. |
 | `session_finalized` | Final state, evidence gaps and artifact manifest. |
