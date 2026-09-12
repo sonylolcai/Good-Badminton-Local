@@ -41,6 +41,18 @@ class WebUiUploadModeTests(unittest.TestCase):
         self.assertEqual(mapped[17], [])
         self.assertEqual(mapped[18]["schema_version"], "webui-player-result.v1")
 
+    def test_two_second_segments_expose_raw_stream_evidence_when_materialized(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_events = Path(temporary) / "stream_events.jsonl"
+            raw_events.write_text('{"event_type":"ball_observation"}\n', encoding="utf-8")
+            mapped = _two_second_segment_upload_update({
+                "phase": "finalized",
+                "webui_result": {
+                    "derivation": {"raw_events_path": str(raw_events)},
+                },
+            })
+        self.assertEqual(mapped[3], str(raw_events))
+
     def test_find_remote_stream_session_workdir_requires_matching_local_ledger(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -30,6 +30,19 @@ PLAYER_RESULT_HEADERS = [
     "数据质量",
 ]
 
+TENNIS_PLAYER_RESULT_HEADERS = [
+    "匿名视觉 Track ID",
+    "追踪状态",
+    "截图证据",
+    "截图时刻(s)",
+    "检测覆盖率(%)",
+    "距离(m)",
+    "平均速度(m/s)",
+    "峰值速度(m/s)",
+    "有效移动(s)",
+    "数据质量",
+]
+
 
 def build_player_result_display(
     metrics: Mapping[str, Any] | None,
@@ -45,6 +58,7 @@ def build_player_result_display(
     """
 
     metrics = dict(metrics or {})
+    tennis_visual_only = metrics.get("sport_id") == "tennis"
     candidates = {
         str(item.get("track_id")): dict(item)
         for item in (track_candidates or [])
@@ -89,26 +103,42 @@ def build_player_result_display(
         detected_ratio = _number(candidate.get("detected_coverage"))
         coverage_percent = usable_ratio if usable_ratio is not None else detected_ratio
         unconfirmed_roster = candidate.get("state") == "unconfirmed_roster"
-        rows.append([
-            track_id,
-            "名单待确认" if unconfirmed_roster else candidate.get("state") or "已完成",
-            photo_state,
-            _round(capture_time),
-            _percent(coverage_percent),
-            _round(candidate.get("confidence")),
-            _round(movement.get("distance_m")),
-            _round(movement.get("mean_speed_mps")),
-            _round(movement.get("peak_speed_mps")),
-            _round(movement.get("moving_time_sec")),
-            _round(movement.get("high_intensity_movement_time_sec")),
-            f"{movement.get('acceleration_event_count') or 0} / {movement.get('deceleration_event_count') or 0}",
-            movement.get("direction_change_count") or 0,
-            (
-                "名单未确认；不生成速度、距离等正式指标"
-                if unconfirmed_roster
-                else quality.get("status") or "证据待汇总"
-            ),
-        ])
+        state = "名单待确认" if unconfirmed_roster else candidate.get("state") or "已完成"
+        quality_status = (
+            "名单未确认；不生成速度、距离等正式指标"
+            if unconfirmed_roster
+            else quality.get("status") or "证据待汇总"
+        )
+        if tennis_visual_only:
+            rows.append([
+                track_id,
+                state,
+                photo_state,
+                _round(capture_time),
+                _percent(coverage_percent),
+                _round(movement.get("distance_m")),
+                _round(movement.get("mean_speed_mps")),
+                _round(movement.get("peak_speed_mps")),
+                _round(movement.get("moving_time_sec")),
+                quality_status,
+            ])
+        else:
+            rows.append([
+                track_id,
+                state,
+                photo_state,
+                _round(capture_time),
+                _percent(coverage_percent),
+                _round(candidate.get("confidence")),
+                _round(movement.get("distance_m")),
+                _round(movement.get("mean_speed_mps")),
+                _round(movement.get("peak_speed_mps")),
+                _round(movement.get("moving_time_sec")),
+                _round(movement.get("high_intensity_movement_time_sec")),
+                f"{movement.get('acceleration_event_count') or 0} / {movement.get('deceleration_event_count') or 0}",
+                movement.get("direction_change_count") or 0,
+                quality_status,
+            ])
         details.append({
             "track_id": track_id,
             "candidate": candidate,

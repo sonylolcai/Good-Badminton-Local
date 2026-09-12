@@ -18,6 +18,7 @@ class PlayerPoseVisualizer:
         court_filter_margin=0.75,
         far_baseline_margin=3.0,
         near_baseline_margin=None,
+        court_dimensions=(6.1, 13.4),
         keypoint_conf_threshold=0.25,
     ):
         self.rtmpose_processor = rtmpose_processor or RTMPoseProcessor()
@@ -32,6 +33,9 @@ class PlayerPoseVisualizer:
             self.court_filter_margin
             if near_baseline_margin is None
             else float(near_baseline_margin)
+        )
+        self.court_width_m, self.court_length_m = (
+            float(value) for value in court_dimensions
         )
         self.keypoint_conf_threshold = float(keypoint_conf_threshold)
 
@@ -250,8 +254,8 @@ class PlayerPoseVisualizer:
         x, y = float(court_position[0]), float(court_position[1])
         lateral_margin = self.court_filter_margin
         return (
-            -lateral_margin <= x <= 6.1 + lateral_margin
-            and -self.far_baseline_margin <= y <= 13.4 + self.near_baseline_margin
+            -lateral_margin <= x <= self.court_width_m + lateral_margin
+            and -self.far_baseline_margin <= y <= self.court_length_m + self.near_baseline_margin
         )
 
     def draw_players(

@@ -10,6 +10,7 @@ from unittest.mock import patch
 import numpy as np
 
 from api.stream_runtime import StreamProcessorFactory
+from api.vision_profiles import TENNIS_PROFILE
 from badminton_analysis.streaming import FinalizationContext, FrameContext
 from tests.stream_test_utils import create_request
 
@@ -53,12 +54,17 @@ class _ArrayView:
 
 
 class _BallModel:
+    def __init__(self, *, names=None, class_ids=None):
+        self.names = names or {0: "badminton"}
+        self.class_ids = class_ids if class_ids is not None else [0]
+
     def __call__(self, _frame, **_kwargs):
         return [
             SimpleNamespace(
                 boxes=SimpleNamespace(
                     xywh=_ArrayView([[32.0, 30.0, 3.0, 3.0]]),
                     conf=_ArrayView([0.8]),
+                    cls=_ArrayView(self.class_ids),
                 )
             )
         ]
@@ -125,10 +131,10 @@ class StreamRuntimeTests(unittest.TestCase):
         )
 
     def factory(self, **kwargs):
+        kwargs.setdefault("ball_model_factory", lambda _path: _BallModel())
         return StreamProcessorFactory(
             self.root,
             pose_model_factory=lambda _path: _PoseModel(),
-            ball_model_factory=lambda _path: _BallModel(),
             **kwargs,
         )
 
@@ -181,6 +187,114 @@ class StreamRuntimeTests(unittest.TestCase):
         measurement, temporal = configured(session)
         self.assertIsNotNone(measurement)
         self.assertIsInstance(temporal, _TemporalProcessor)
+
+    def test_tennis_yolo_requires_tennis_checkpoint_and_emits_ball_observation(self):
+        checkpoint = self.root / "tennis-ball-yolo.pt"
+        checkpoint.write_bytes(b"test checkpoint")
+        session = create_request()
+        session["configuration"].update(
+            {
+                "sport_id": "tennis",
+                "session_mode": "singles_match",
+                "shuttle_detector": "yolo",
+                "roster_stable_frames": 1,
+            }
+        )
+        factory = self.factory(
+            vision_profile=TENNIS_PROFILE,
+            ball_model_factory=lambda _path: _BallModel(names={0: "tennis_ball"}),
+        )
+        with patch.dict(
+            "os.environ", {"GOOD_TENNIS_STREAM_BALL_MODEL": str(checkpoint)}, clear=False
+        ):
+            measurement, temporal = factory(session)
+            events = list(
+                measurement.process_frame(
+                    np.zeros((64, 64, 3), dtype=np.uint8), self.context()
+                )
+            )
+            state = measurement.snapshot_state()
+            restored, _ = factory(session)
+            restored.restore_state(state)
+
+        self.assertIsNone(temporal)
+        ball = next(event for event in events if event.event_type == "ball_observation")
+        self.assertEqual(ball.evidence_state, "detected")
+        self.assertEqual(ball.data["sport_id"], "tennis")
+        self.assertEqual(ball.data["ball_kind"], "tennis_ball")
+        self.assertEqual(ball.data["model_required_class"], "tennis_ball")
+        self.assertNotIn("shuttle_observation", [event.event_type for event in events])
+
+    def test_tennis_yolo_uses_badminton_label_only_as_explicit_experiment(self):
+        checkpoint = self.root / "tennis-ball-yolo.pt"
+        checkpoint.write_bytes(b"test checkpoint")
+        session = create_request()
+        session["configuration"].update(
+            {"sport_id": "tennis", "session_mode": "singles_match", "shuttle_detector": "yolo"}
+        )
+        factory = self.factory(vision_profile=TENNIS_PROFILE)
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOD_TENNIS_STREAM_BALL_MODEL": "",
+                "GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL": str(checkpoint),
+            },
+            clear=False,
+        ):
+            measurement, _ = factory(session)
+            events = list(measurement.process_frame(
+                np.zeros((64, 64, 3), dtype=np.uint8), self.context()
+            ))
+
+        ball = next(event for event in events if event.event_type == "ball_observation")
+        self.assertEqual(ball.evidence_state, "detected")
+        self.assertEqual(ball.data["ball_kind"], "experimental_badminton_ball_candidate")
+        self.assertEqual(ball.data["model_required_class"], "badminton")
+        self.assertTrue(ball.data["experimental"])
+
+    def test_tennis_yolo_rejects_missing_checkpoint_before_session_runs(self):
+        session = create_request()
+        session["configuration"].update(
+            {"sport_id": "tennis", "session_mode": "singles_match", "shuttle_detector": "yolo"}
+        )
+        factory = self.factory(vision_profile=TENNIS_PROFILE)
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOD_TENNIS_STREAM_BALL_MODEL": "",
+                "GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL": str(self.root / "missing.pt"),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "experimental YOLO ball detection requires"):
+                factory.validate_session_request(session)
+
+    def test_tennis_yolo_discards_non_tennis_detection_classes(self):
+        checkpoint = self.root / "tennis-ball-yolo.pt"
+        checkpoint.write_bytes(b"test checkpoint")
+        session = create_request()
+        session["configuration"].update(
+            {"sport_id": "tennis", "session_mode": "singles_match", "shuttle_detector": "yolo"}
+        )
+        factory = self.factory(
+            vision_profile=TENNIS_PROFILE,
+            ball_model_factory=lambda _path: _BallModel(
+                names={0: "tennis_ball", 1: "person"}, class_ids=[1]
+            ),
+        )
+        with patch.dict(
+            "os.environ", {"GOOD_TENNIS_STREAM_BALL_MODEL": str(checkpoint)}, clear=False
+        ):
+            measurement, _ = factory(session)
+            events = list(
+                measurement.process_frame(
+                    np.zeros((64, 64, 3), dtype=np.uint8), self.context()
+                )
+            )
+
+        ball = next(event for event in events if event.event_type == "ball_observation")
+        self.assertEqual(ball.evidence_state, "missing")
+        self.assertEqual(ball.data["measurement"]["filtered_rejections"], {"unexpected_class": 1})
 
     def test_session_selected_bytetrack_overrides_process_default_and_locks_roster(self):
         session = create_request()

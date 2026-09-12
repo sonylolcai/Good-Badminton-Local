@@ -121,7 +121,7 @@ else
     # shellcheck disable=SC1091
     source "$APP_DIR/.gpu-api.env"
     set +a
-    nohup "$PYTHON_BIN" -m uvicorn api.app:app --host 0.0.0.0 --port "${PORT:-8080}" \
+    nohup "$PYTHON_BIN" -m uvicorn apps.badminton_gpu.app:app --host 0.0.0.0 --port "${PORT:-8080}" \
       > "$APP_DIR/gpu-api.log" 2>&1 &
     echo $! > "$pid_file"
   )

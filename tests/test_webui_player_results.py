@@ -58,6 +58,28 @@ class PlayerResultDisplayTests(unittest.TestCase):
         self.assertIsNone(rows[0][4])
         self.assertEqual(rows[0][-1], "名单未确认；不生成速度、距离等正式指标")
 
+    def test_tennis_rows_contain_only_visual_speed_evidence(self):
+        _gallery, rows, _detail = build_player_result_display(
+            {
+                "sport_id": "tennis",
+                "players": [{
+                    "track_id": "track_001",
+                    "movement": {
+                        "distance_m": 12.3,
+                        "mean_speed_mps": 1.2,
+                        "peak_speed_mps": 3.4,
+                        "moving_time_sec": 8.0,
+                    },
+                    "measurement_coverage": {"usable_measurement_ratio": 0.625},
+                    "quality": {"status": "measured"},
+                }],
+            }
+        )
+
+        self.assertEqual(len(rows[0]), 10)
+        self.assertEqual(rows[0][5:9], [12.3, 1.2, 3.4, 8.0])
+        self.assertEqual(rows[0][-1], "measured")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -105,6 +105,32 @@ Required configuration:
 - `shuttle_detector`: `none`, `yolo` or explicitly enabled `tracknet_v3`.
 - `generate_annotated_video`: production default is `false`.
 
+Fixed-sport GPU deployments may additionally accept these optional anonymous
+vision fields. They select visual constraints only; they never identify a
+person, make a score decision or change the process to another sport.
+
+- `sport_id`: an optional identity assertion. It must match the deployment's
+  fixed profile (`badminton` or `tennis`).
+- `session_mode`: required by the tennis deployment. It accepts only
+  `singles_match` (two anonymous athletes) or `single_player_training` (one
+  near-side anonymous athlete). The badminton compatibility deployment keeps
+  `match` and its existing 2/4-person roster policy.
+- `calibration_scope`: `full_court` or, only for tennis single-player training,
+  `near_half_court`. In the latter case the four `court_corners` represent the
+  near net-line corners followed by the near baseline corners, and map to the
+  global near half of `tennis_singles_court_m_v1`.
+
+The server derives `expected_player_count` and `max_roster_count` from a fixed
+tennis mode: 2 for `singles_match`, 1 for `single_player_training`. A caller
+cannot override those values. `shuttle_detector` is retained as a v1 wire-name:
+the tennis deployment accepts `none` or `yolo`. `none` is pose-only. `yolo`
+uses a configured `GOOD_TENNIS_STREAM_BALL_MODEL` when present, requiring the
+exact class name `tennis_ball`. If absent, the explicitly packaged current
+`yolo11s-ball.pt` may be used only as an experimental `badminton`-labelled
+ball candidate; its event has `experimental=true` and never claims tennis
+accuracy. If neither model is available, only a `yolo` request fails; the
+pose-only service remains usable.
+
 If `shuttle_detector=tracknet_v3`, `tracknet_overlap_frames` MUST be 7 when present,
 because the verified temporal window length is 8. This contract does not claim that
 TrackNet can use the common 10Hz sampling without changing model semantics.
@@ -171,6 +197,7 @@ Minimum event data:
 |---|---|
 | `person_observation` | Anonymous `track_id`, lifecycle state, measurement frame, bbox/court position/keypoints when evidence exists. |
 | `shuttle_observation` | Anonymous shuttle track, image/court position when available, detector source and measurement quality. |
+| `ball_observation` | Tennis raw image measurement, model label and detector quality. It is either dedicated `tennis_ball` evidence or explicitly experimental `badminton`-model evidence. A missing frame remains missing; this event does not assert a hit, rally, score or trajectory. |
 | `interaction_candidate` | Candidate ID/type, related anonymous track IDs, evidence references and `review_required`; never forced fact. |
 | `session_status` | State/stage transition and progress snapshot. |
 | `session_finalized` | Final state, evidence gaps and artifact manifest. |

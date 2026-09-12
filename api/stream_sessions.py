@@ -799,6 +799,15 @@ class StreamSessionManager:
             request = validate_create_request(body)
         except ValueError as exc:
             raise validation_error(str(exc))
+        # A processor factory may own a fixed sport profile.  Resolve it before
+        # durable persistence so retries, checkpoints and workers all see the
+        # same roster and calibration semantics.
+        validator = getattr(self.processor_factory, "validate_session_request", None)
+        if callable(validator):
+            try:
+                validator(request)
+            except (FileNotFoundError, ValueError, RuntimeError) as exc:
+                raise validation_error(str(exc))
         with self._lock:
             existing = self._find_by_idempotency_key(idempotency_key)
             if existing is not None:
@@ -1152,6 +1161,11 @@ class StreamSessionManager:
             daemon=True,
         )
         self._watchdog.start()
+        # A process may have exited after durably accepting segments.  Recovery
+        # reconstructs its engines before the worker exists, so it cannot call
+        # ``_notify`` itself. Wake the fresh worker once to resume that durable
+        # backlog instead of waiting for a new upload or completion request.
+        self._notify()
 
     @property
     def worker_running(self):

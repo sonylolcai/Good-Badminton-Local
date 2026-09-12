@@ -37,7 +37,7 @@ EVIDENCE_STATES = {
     "detected", "predicted", "missing", "derived", "candidate", "finalized",
 }
 EVENT_TYPES = {
-    "person_observation", "roster_candidate_observation", "shuttle_observation", "interaction_candidate",
+    "person_observation", "roster_candidate_observation", "shuttle_observation", "ball_observation", "interaction_candidate",
     "session_status", "session_finalized",
 }
 PROCESSING_DISPOSITIONS = {
@@ -195,6 +195,12 @@ def validate_configuration(configuration):
         "roster_discovery_seconds",
         "far_player_enhancement",
         "far_pose_roi",
+        # These fields describe an anonymous visual mode.  They never carry
+        # business identity, scoring or participant claims.  A fixed process
+        # profile validates their allowed values and derives the real roster.
+        "sport_id",
+        "session_mode",
+        "calibration_scope",
     }
     extras = set(configuration).difference(allowed)
     if extras:
@@ -216,19 +222,17 @@ def validate_configuration(configuration):
         "pose_imgsz": int(pose_imgsz),
         "shuttle_detector": shuttle_detector,
         "generate_annotated_video": generate_annotated_video,
-        # The visual service remains mode-free.  The source may be singles,
-        # doubles, or an informal uneven game; a fixed anonymous roster merely
-        # says that no new people should be created after stable on-court
-        # evidence has been observed.
+        # The shared contract carries roster inputs but does not decide which
+        # sport/mode may use them.  The process profile owns that decision.
         "tracker_backend": configuration.get("tracker_backend", "court_association"),
         "lock_match_roster": configuration.get("lock_match_roster", True),
         "roster_stable_frames": configuration.get("roster_stable_frames", 3),
-        # The stream never asks for singles/doubles. It begins after two real
-        # people are stable, can expand through the discovery window, and caps
-        # the anonymous on-court roster at four.
+        # Generic validation only protects the tracker from impossible counts.
+        # A SportVisionProfile later determines which count belongs to the
+        # fixed process and selected visual session mode.
         "max_roster_count": configuration.get("max_roster_count", 4),
-        # Fixed MVP roster policy: the business registers exactly two or four
-        # players and the tracker locks to that roster target.
+        # The shared tracker can represent a one-person training roster.  The
+        # per-sport profile rejects counts its mode does not support.
         "expected_player_count": configuration.get("expected_player_count"),
         "roster_discovery_seconds": configuration.get("roster_discovery_seconds", 8.0),
         # Fixed-camera far-half inference is an optional detection aid, not a
@@ -246,13 +250,13 @@ def validate_configuration(configuration):
         raise ValueError("roster_stable_frames must be an integer from 1 to 10")
     normalized["roster_stable_frames"] = int(stable_frames)
     max_roster_count = normalized["max_roster_count"]
-    if isinstance(max_roster_count, bool) or not 2 <= max_roster_count <= 4:
-        raise ValueError("max_roster_count must be an integer from 2 to 4")
+    if isinstance(max_roster_count, bool) or not 1 <= max_roster_count <= 4:
+        raise ValueError("max_roster_count must be an integer from 1 to 4")
     normalized["max_roster_count"] = int(max_roster_count)
     expected_player_count = normalized["expected_player_count"]
     if expected_player_count is not None:
-        if isinstance(expected_player_count, bool) or expected_player_count not in {2, 4}:
-            raise ValueError("expected_player_count must be 2, 4, or null")
+        if isinstance(expected_player_count, bool) or expected_player_count not in {1, 2, 4}:
+            raise ValueError("expected_player_count must be 1, 2, 4, or null")
         normalized["expected_player_count"] = int(expected_player_count)
     discovery_seconds = normalized["roster_discovery_seconds"]
     if isinstance(discovery_seconds, bool) or not 1.0 <= float(discovery_seconds) <= 15.0:
@@ -269,6 +273,9 @@ def validate_configuration(configuration):
         if not all(0.0 <= value <= 1.0 for value in values) or values[0] >= values[2] or values[1] >= values[3]:
             raise ValueError("far_pose_roi must be an ordered normalized rectangle")
         normalized["far_pose_roi"] = values
+    for field in ("sport_id", "session_mode", "calibration_scope"):
+        if field in configuration:
+            normalized[field] = _opaque_id(configuration[field], field)
     if "preserve_audio" in configuration:
         normalized["preserve_audio"] = _bool(configuration["preserve_audio"], "preserve_audio")
     if "court_health_check_hz" in configuration:

@@ -59,10 +59,22 @@ COCO17_KEYPOINT_NAMES = [
 class CourtSpace:
     """A standard-court coordinate system independent of image orientation."""
 
-    def __init__(self, image_corners, court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH)):
+    def __init__(
+        self,
+        image_corners,
+        court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH),
+        *,
+        world_points_m=None,
+        athlete_observation_region="full_court_athletes",
+    ):
         self.width_m, self.length_m = (float(value) for value in court_dimensions)
-        self.mapper = CourtMapper(image_corners, court_dimensions=court_dimensions)
+        self.mapper = CourtMapper(
+            image_corners,
+            court_dimensions=court_dimensions,
+            world_points_m=world_points_m,
+        )
         self.net_y_m = self.length_m / 2.0
+        self.athlete_observation_region = str(athlete_observation_region)
 
     def image_to_court(self, image_xy):
         point = self.mapper.image_to_court(image_xy)
@@ -86,6 +98,41 @@ class CourtSpace:
             return False
         x, y = (float(value) for value in court_xy)
         return -margin_m <= x <= self.width_m + margin_m and -margin_m <= y <= self.length_m + margin_m
+
+    def contains_athlete(
+        self,
+        court_xy,
+        margin_m=0.0,
+        *,
+        lateral_margin_m=None,
+        baseline_margin_m=None,
+    ):
+        """Return whether a pose may enter the anonymous roster.
+
+        The map itself stays a full sport coordinate system.  A training mode
+        can therefore map a near half-court to its true global coordinates
+        while excluding people on the far side from tracker bootstrap.
+        """
+        if court_xy is None:
+            return False
+        lateral_margin = float(
+            margin_m if lateral_margin_m is None else lateral_margin_m
+        )
+        baseline_margin = float(
+            margin_m if baseline_margin_m is None else baseline_margin_m
+        )
+        x, y = (float(value) for value in court_xy)
+        if not (
+            -lateral_margin <= x <= self.width_m + lateral_margin
+            and -baseline_margin <= y <= self.length_m + baseline_margin
+        ):
+            return False
+        if self.athlete_observation_region == "near_court_athlete":
+            # The baseline allowance is for the player's own baseline.  It
+            # must not turn a near-half training session into a far-side
+            # observer zone around the net.
+            return y >= self.net_y_m - float(margin_m)
+        return True
 
 
 @dataclass
@@ -1521,6 +1568,9 @@ class FixedCameraMatchPipeline:
         roster_stable_frames=2,
         shuttle_enabled=True,
         movement_rally_settle_seconds=0.7,
+        court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH),
+        world_points_m=None,
+        coordinate_system_id="standard_badminton_court_m",
     ):
         if match_mode not in {"singles", "doubles"}:
             raise ValueError(
@@ -1533,7 +1583,12 @@ class FixedCameraMatchPipeline:
             raise ValueError(
                 "ByteTrack is evaluation-gated. Set enable_bytetrack=True only for a recorded tracker evaluation."
             )
-        self.court_space = CourtSpace(image_corners)
+        self.court_space = CourtSpace(
+            image_corners,
+            court_dimensions=tuple(float(value) for value in court_dimensions),
+            world_points_m=world_points_m,
+        )
+        self.coordinate_system_id = str(coordinate_system_id)
         self.net_image_line = net_image_line or [
             self.court_space.court_to_image((0.0, self.court_space.net_y_m)),
             self.court_space.court_to_image((self.court_space.width_m, self.court_space.net_y_m)),
@@ -1584,7 +1639,7 @@ class FixedCameraMatchPipeline:
         rally = self.rallies.update(frame_index, tracks, shuttle, hit_events)
         return {
             "schema_version": SCHEMA_VERSION,
-            "coordinate_system": "standard_badminton_court_m",
+            "coordinate_system": self.coordinate_system_id,
             "match": {
                 "mode": self.match_mode,
                 "max_players_per_team": self.tracker.max_players_per_team,

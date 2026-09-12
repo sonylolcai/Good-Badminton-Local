@@ -3,10 +3,22 @@ param(
     # The file to upload through the GPU provider's browser upload page.
     [string]$OutputPath = '',
 
+    # Produce an independently deployable, fixed-sport package. The source
+    # core is shared, but the archive name and server-side refresh target are
+    # never interchangeable.
+    [ValidateSet('badminton', 'tennis')]
+    [string]$Sport = 'badminton',
+
     # Adds extended annotation and benchmark tooling.  The primary TrackNet
     # runtime adapters are always included below; no upstream source or model
     # weights are ever placed in this package.
-    [switch]$IncludeTrackNetABTools
+    [switch]$IncludeTrackNetABTools,
+
+    # Include the repository's current pose and badminton YOLO-ball checkpoints
+    # only for an explicitly labelled tennis trial. The ball model is never
+    # presented as trained tennis evidence. Both files are copied to persistent
+    # server weights on refresh; normal source packages exclude model weights.
+    [switch]$IncludeExperimentalTennisBallModel
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,10 +28,11 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     # $PSScriptRoot for this script. Resolve the conventional output path only
     # after entering the script body so the documented no-argument command
     # works in both Windows PowerShell 5.1 and PowerShell 7.
-    $OutputPath = Join-Path $PSScriptRoot 'good-badminton-gpu-api-upload.zip'
+    $OutputPath = Join-Path $PSScriptRoot ("good-$Sport-gpu-api-upload.zip")
 }
 $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("good-badminton-gpu-package-" + [guid]::NewGuid().ToString('N'))
-$packageRoot = Join-Path $stagingRoot 'good-badminton-gpu-api'
+$packageName = "good-$Sport-gpu-api"
+$packageRoot = Join-Path $stagingRoot $packageName
 
 # The GPU instance has no reliable public egress.  This archive is therefore
 # built from the *current working tree*, including tracked local modifications,
@@ -28,6 +41,11 @@ $packageRoot = Join-Path $stagingRoot 'good-badminton-gpu-api'
 # experiments.  We only need source code and deployment files for an upgrade.
 $requiredExtraFiles = @(
     'deploy/refresh_gpu_api_from_zip.sh',
+    # Fixed-sport pure GPU launchers must be present even when this archive is
+    # built before the current working tree has been committed.
+    'deploy/start_sport_gpu_container.sh',
+    'deploy/start_badminton_gpu_container.sh',
+    'deploy/start_tennis_gpu_container.sh',
     'deploy/install_lap.sh',
     'deploy/package_gpu_api.ps1',
     'deploy/run_performance_gate.sh',
@@ -115,6 +133,14 @@ try {
         Copy-SourceFile -RelativePath $relativePath
     }
 
+    if ($IncludeExperimentalTennisBallModel) {
+        if ($Sport -ne 'tennis') {
+            throw 'IncludeExperimentalTennisBallModel is only valid with -Sport tennis.'
+        }
+        Copy-SourceFile -RelativePath 'weights/yolo11n-pose.pt'
+        Copy-SourceFile -RelativePath 'weights/yolo11s-ball.pt'
+    }
+
     # The GPU package is intentionally created from the working tree: during
     # a staged multi-agent rollout, a newly added runtime module might not yet
     # be in Git's index.  Include only untracked *application-source* files
@@ -122,6 +148,7 @@ try {
     # weights and virtual environments remain excluded by construction.
     $deployableUntrackedPrefixes = @(
         'api/',
+        'apps/',
         'badminton_analysis/',
         'business_gateway/',
         'good_badminton_contracts/',
@@ -148,10 +175,12 @@ try {
     }
 
     $apiEntry = Join-Path $packageRoot 'api/app.py'
+    $pureStreamEntry = Join-Path $packageRoot 'api/gpu_stream_app.py'
     $launcher = Join-Path $packageRoot 'deploy/start_gpu_api_container.sh'
+    $sportLauncher = Join-Path $packageRoot 'deploy/start_sport_gpu_container.sh'
     $analysisPipeline = Join-Path $packageRoot 'webui/pipeline.py'
-    if (-not (Test-Path -LiteralPath $apiEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or -not (Test-Path -LiteralPath $analysisPipeline -PathType Leaf)) {
-        throw 'Package validation failed: api/app.py, the API launcher, or webui/pipeline.py is missing.'
+    if (-not (Test-Path -LiteralPath $apiEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $pureStreamEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or -not (Test-Path -LiteralPath $sportLauncher -PathType Leaf) -or -not (Test-Path -LiteralPath $analysisPipeline -PathType Leaf)) {
+        throw 'Package validation failed: legacy API, pure stream API, launchers, or legacy pipeline is missing.'
     }
 
     $absoluteOutputPath = [System.IO.Path]::GetFullPath($OutputPath)
@@ -176,7 +205,7 @@ try {
             # System.IO.Path.GetRelativePath, so calculate it without relying
             # on PowerShell 7/.NET 6 APIs.
             $relativePath = $_.FullName.Substring($packageRoot.Length).TrimStart('\', '/').Replace('\', '/')
-            $entryPath = "good-badminton-gpu-api/$relativePath"
+            $entryPath = "$packageName/$relativePath"
             [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                 $zip,
                 $_.FullName,
@@ -192,13 +221,16 @@ try {
     $item = Get-Item -LiteralPath $absoluteOutputPath
     Write-Host "Created GPU deployment package: $($item.FullName)"
     Write-Host "Size: $([math]::Round($item.Length / 1MB, 2)) MiB"
-    Write-Host 'Upload it to /root/good-badminton-gpu-api-upload.zip, then run:'
-    Write-Host 'bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh'
+    Write-Host "Upload it to /root/$packageName-upload.zip, then run:"
+    Write-Host "bash /root/$packageName/deploy/refresh_gpu_api_from_zip.sh /root/$packageName-upload.zip /root/$packageName $Sport"
     if ($IncludeTrackNetABTools) {
         Write-Host 'TrackNet A/B tools are included; source code and checkpoint ZIPs remain separate uploads.'
     }
+    if ($IncludeExperimentalTennisBallModel) {
+        Write-Host 'Included yolo11n-pose.pt and yolo11s-ball.pt for the tennis pose and experimental ball-detection modes.'
+    }
     Write-Host 'First deployment only (when that fixed directory does not yet exist):'
-    Write-Host "unzip -p /root/good-badminton-gpu-api-upload.zip good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash"
+    Write-Host "unzip -p /root/$packageName-upload.zip $packageName/deploy/refresh_gpu_api_from_zip.sh | bash -s -- /root/$packageName-upload.zip /root/$packageName $Sport"
 }
 finally {
     if (Test-Path -LiteralPath $stagingRoot) {

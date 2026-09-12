@@ -15,6 +15,7 @@ from webui.remote_gpu import (
     _submit_multipart,
     remote_gpu_config,
     stream_roster_configuration,
+    verify_remote_gpu_sport,
 )
 from business_gateway.dev_api import LocalReplayManager
 
@@ -49,6 +50,49 @@ class RemoteGpuTests(unittest.TestCase):
         self.assertEqual(stream_roster_configuration(4)["max_roster_count"], 4)
         with self.assertRaisesRegex(RemoteAnalysisError, "2 人或 4 人"):
             stream_roster_configuration(3)
+
+    def test_tennis_stream_roster_is_fixed_to_two_player_singles(self):
+        self.assertEqual(
+            stream_roster_configuration(
+                2, sport_id="tennis", session_mode="singles_match"
+            )["max_roster_count"],
+            2,
+        )
+        with self.assertRaisesRegex(RemoteAnalysisError, "固定 2 名运动员"):
+            stream_roster_configuration(1, sport_id="tennis", session_mode="singles_match")
+
+    def test_tennis_uses_its_own_endpoint_and_rejects_wrong_gpu_identity(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOD_TENNIS_GPU_API_URL": "http://tennis.example:8080",
+                "GOOD_TENNIS_GPU_API_KEY": "tennis-key",
+                "GOOD_TENNIS_GPU_API_TIMEOUT": "17",
+                "GOOD_TENNIS_GPU_API_POLL_SECONDS": "3",
+            },
+            clear=False,
+        ):
+            config = remote_gpu_config(sport_id="tennis")
+            self.assertEqual(config["base_url"], "http://tennis.example:8080")
+            self.assertEqual(config["api_key"], "tennis-key")
+            self.assertEqual(config["timeout_seconds"], 17.0)
+            self.assertEqual(config["poll_seconds"], 3.0)
+            with patch("webui.remote_gpu._json_request", return_value={"sport_id": "badminton"}):
+                with self.assertRaisesRegex(RemoteAnalysisError, "已阻止上传"):
+                    verify_remote_gpu_sport("tennis")
+
+    def test_local_cpu_config_prefers_loopback_url_and_local_key(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOD_LOCAL_CPU_GPU_API_URL": "http://127.0.0.1:18080",
+                "GOOD_LOCAL_CPU_GPU_API_KEY": "local-key",
+            },
+            clear=False,
+        ):
+            config = remote_gpu_config(sport_id="tennis", local_cpu=True)
+        self.assertEqual(config["base_url"], "http://127.0.0.1:18080")
+        self.assertEqual(config["api_key"], "local-key")
 
     def test_cancelled_local_pipeline_exits_before_loading_models(self):
         with self.assertRaises(AnalysisCancelled):

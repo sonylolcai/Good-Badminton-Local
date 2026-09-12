@@ -25,14 +25,42 @@ from business_gateway.streaming.segmenter import GrowingVideoSegmenter
 
 
 DEFAULT_GPU_API_URL = "http://xn-g.suanjiayun.com:52028"
+DEFAULT_LOCAL_CPU_GPU_API_URL = "http://127.0.0.1:18080"
 CHUNK_BYTES = 1024 * 1024
+SUPPORTED_SPORT_IDS = {"badminton", "tennis"}
 
 
 class RemoteAnalysisError(RuntimeError):
     """The remote service cannot be used safely for this WebUI run."""
 
 
-def remote_gpu_config(base_url_override=None):
+def _normalize_sport_id(sport_id):
+    normalized = str(sport_id or "badminton").strip().lower()
+    if normalized not in SUPPORTED_SPORT_IDS:
+        allowed = ", ".join(sorted(SUPPORTED_SPORT_IDS))
+        raise RemoteAnalysisError(f"运动模式必须是 [{allowed}] 之一")
+    return normalized
+
+
+def configured_gpu_base_url(sport_id="badminton"):
+    """Return the configured fixed-sport URL without performing network I/O."""
+    _load_local_config_file()
+    sport_id = _normalize_sport_id(sport_id)
+    configured = os.environ.get(f"GOOD_{sport_id.upper()}_GPU_API_URL", "").strip()
+    if configured:
+        return configured
+    return DEFAULT_GPU_API_URL if sport_id == "badminton" else ""
+
+
+def configured_local_cpu_gpu_base_url():
+    """Return the loopback-only API address used for local CPU experiments."""
+    _load_local_config_file()
+    return os.environ.get(
+        "GOOD_LOCAL_CPU_GPU_API_URL", DEFAULT_LOCAL_CPU_GPU_API_URL
+    ).strip().rstrip("/")
+
+
+def remote_gpu_config(base_url_override=None, *, sport_id="badminton", local_cpu=False):
     """Read server-side configuration; secrets never enter browser state.
 
     ``base_url_override`` is an operator-only WebUI development convenience.
@@ -40,12 +68,19 @@ def remote_gpu_config(base_url_override=None):
     the process environment, so concurrent submissions cannot accidentally
     redirect one another.  API credentials remain server-side configuration.
     """
+    sport_id = _normalize_sport_id(sport_id)
     _load_local_config_file()
     configured_base_url = (
         str(base_url_override).strip()
         if base_url_override is not None and str(base_url_override).strip()
-        else os.environ.get("GOOD_BADMINTON_GPU_API_URL", DEFAULT_GPU_API_URL).strip()
+        else (
+            configured_local_cpu_gpu_base_url()
+            if local_cpu else configured_gpu_base_url(sport_id)
+        )
     )
+    if not configured_base_url:
+        env_name = f"GOOD_{sport_id.upper()}_GPU_API_URL"
+        raise RemoteAnalysisError(f"请在 WebUI 服务器配置 {env_name}，或在页面填写 {sport_id} GPU 服务地址")
     parsed = urlparse(configured_base_url)
     if (
         parsed.scheme not in {"http", "https"}
@@ -58,10 +93,48 @@ def remote_gpu_config(base_url_override=None):
         raise RemoteAnalysisError("GPU 服务地址必须是无账号、无查询参数的 http(s) 基础地址")
     return {
         "base_url": configured_base_url.rstrip("/"),
-        "api_key": os.environ.get("GOOD_BADMINTON_GPU_API_KEY", ""),
-        "timeout_seconds": float(os.environ.get("GOOD_BADMINTON_GPU_API_TIMEOUT", "30")),
-        "poll_seconds": float(os.environ.get("GOOD_BADMINTON_GPU_API_POLL_SECONDS", "2")),
+        # Separate service credentials are preferred. The old badminton key is
+        # a compatibility fallback only, useful while both test services share
+        # one reverse-proxy credential.
+        "api_key": (
+            (
+                os.environ.get("GOOD_LOCAL_CPU_GPU_API_KEY", "")
+                or os.environ.get("GOOD_BADMINTON_GPU_API_KEY", "")
+            )
+            if local_cpu else (
+                os.environ.get(f"GOOD_{sport_id.upper()}_GPU_API_KEY", "")
+                or os.environ.get("GOOD_BADMINTON_GPU_API_KEY", "")
+            )
+        ),
+        "timeout_seconds": float(
+            os.environ.get(
+                f"GOOD_{sport_id.upper()}_GPU_API_TIMEOUT",
+                os.environ.get("GOOD_BADMINTON_GPU_API_TIMEOUT", "30"),
+            )
+        ),
+        "poll_seconds": float(
+            os.environ.get(
+                f"GOOD_{sport_id.upper()}_GPU_API_POLL_SECONDS",
+                os.environ.get("GOOD_BADMINTON_GPU_API_POLL_SECONDS", "2"),
+            )
+        ),
+        "sport_id": sport_id,
     }
+
+
+def verify_remote_gpu_sport(sport_id, gpu_base_url=None, *, local_cpu=False):
+    """Fail closed when a WebUI mode points at the wrong fixed-sport GPU."""
+    sport_id = _normalize_sport_id(sport_id)
+    config = remote_gpu_config(gpu_base_url, sport_id=sport_id, local_cpu=local_cpu)
+    health = _json_request(config, "/api/v1/health")
+    actual = str(health.get("sport_id") or "").strip().lower()
+    if actual != sport_id:
+        raise RemoteAnalysisError(
+            f"当前选择的是{sport_id}，但 GPU 服务返回 sport_id={actual or 'missing'}；已阻止上传。"
+        )
+    if health.get("service_kind") not in {None, "pure_gpu_visual_observation"}:
+        raise RemoteAnalysisError("GPU 服务不是纯视觉流式入口；已阻止将视频发送到整文件业务接口。")
+    return health
 
 
 def _load_local_config_file():
@@ -145,7 +218,7 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
     return downloaded
 
 
-def stream_roster_configuration(expected_player_count):
+def stream_roster_configuration(expected_player_count, *, sport_id="badminton", session_mode=None):
     """Return the fixed anonymous roster policy for one continuous match.
 
     Track IDs are runtime implementation details, not the number of people in
@@ -155,8 +228,12 @@ def stream_roster_configuration(expected_player_count):
     across its contiguous two-second segments; separate matches get separate
     sessions and never inherit an anonymous ID by accident.
     """
-    if expected_player_count not in {2, 4}:
-        raise RemoteAnalysisError("场上人数只能选择 2 人或 4 人")
+    sport_id = _normalize_sport_id(sport_id)
+    if sport_id == "tennis":
+        if session_mode != "singles_match" or expected_player_count != 2:
+            raise RemoteAnalysisError("网球当前只支持单打对打：固定 2 名运动员")
+    elif expected_player_count not in {2, 4}:
+        raise RemoteAnalysisError("羽毛球场上人数只能选择 2 人或 4 人")
     return {
         "lock_match_roster": True,
         "expected_player_count": expected_player_count,
@@ -166,7 +243,17 @@ def stream_roster_configuration(expected_player_count):
     }
 
 
-def iter_remote_two_second_stream(video_path, corners, options, output_dir, gpu_base_url=None):
+def iter_remote_two_second_stream(
+    video_path,
+    corners,
+    options,
+    output_dir,
+    gpu_base_url=None,
+    *,
+    sport_id="badminton",
+    session_mode=None,
+    local_cpu=False,
+):
     """Send independently decodable two-second MP4 fragments directly to GPU.
 
     This is intentionally separate from :mod:`webui.stream_replay`: that
@@ -181,9 +268,13 @@ def iter_remote_two_second_stream(video_path, corners, options, output_dir, gpu_
         raise RemoteAnalysisError("请先上传可读取的视频文件")
     if not corners or len(corners) != 4:
         raise RemoteAnalysisError("请先确认四个球场角点")
-    config = remote_gpu_config(gpu_base_url)
+    sport_id = _normalize_sport_id(sport_id)
+    if sport_id == "tennis" and session_mode != "singles_match":
+        raise RemoteAnalysisError("网球上传当前只支持 singles_match（单打对打）")
+    config = remote_gpu_config(gpu_base_url, sport_id=sport_id, local_cpu=local_cpu)
     if not config["api_key"]:
-        raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured in the WebUI process")
+        raise RemoteAnalysisError(f"GOOD_{sport_id.upper()}_GPU_API_KEY is not configured in the WebUI process")
+    health = verify_remote_gpu_sport(sport_id, gpu_base_url, local_cpu=local_cpu)
 
     target = Path(output_dir)
     target.mkdir(parents=True, exist_ok=True)
@@ -210,8 +301,19 @@ def iter_remote_two_second_stream(video_path, corners, options, output_dir, gpu_
         "tracker_backend": str(options["tracker_backend"]),
         "far_player_enhancement": bool(options.get("far_player_enhancement", False)),
     }
+    if sport_id != "badminton":
+        stream_configuration.update(
+            {
+                "sport_id": sport_id,
+                "session_mode": session_mode,
+            }
+        )
     stream_configuration.update(
-        stream_roster_configuration(int(options["expected_player_count"]))
+        stream_roster_configuration(
+            int(options["expected_player_count"]),
+            sport_id=sport_id,
+            session_mode=session_mode,
+        )
     )
     if far_roi is not None:
         stream_configuration["far_pose_roi"] = [float(value) for value in far_roi]
@@ -232,6 +334,8 @@ def iter_remote_two_second_stream(video_path, corners, options, output_dir, gpu_
             "phase": "session_accepted",
             "analysis_session_id": session_id,
             "remote_base_url": config["base_url"],
+            "sport_id": sport_id,
+            "gpu_health": health,
             "segment_seconds": 2.0,
         }
         segmenter = GrowingVideoSegmenter(
@@ -278,7 +382,12 @@ def iter_remote_two_second_stream(video_path, corners, options, output_dir, gpu_
         }
         terminal = client.wait_for_terminal(
             poll_interval_seconds=config["poll_seconds"],
-            timeout_seconds=float(os.environ.get("GOOD_BADMINTON_STREAM_JOB_TIMEOUT", "43200")),
+            timeout_seconds=float(
+                os.environ.get(
+                    f"GOOD_{sport_id.upper()}_STREAM_JOB_TIMEOUT",
+                    os.environ.get("GOOD_BADMINTON_STREAM_JOB_TIMEOUT", "43200"),
+                )
+            ),
         )
         # A stream session returns lightweight terminal status only.  Materialise
         # its immutable events on the WebUI host so the same per-track movement
@@ -309,7 +418,14 @@ def iter_remote_two_second_stream(video_path, corners, options, output_dir, gpu_
         raise RemoteAnalysisError(f"远端 GPU 的 2 秒分片推送失败：{exc}") from exc
 
 
-def recover_remote_two_second_stream(analysis_session_id, output_dir, gpu_base_url=None):
+def recover_remote_two_second_stream(
+    analysis_session_id,
+    output_dir,
+    gpu_base_url=None,
+    *,
+    sport_id="badminton",
+    local_cpu=False,
+):
     """Recover a completed direct-GPU session without uploading video again.
 
     A browser refresh loses Gradio's in-memory result values, but the local
@@ -325,9 +441,11 @@ def recover_remote_two_second_stream(analysis_session_id, output_dir, gpu_base_u
     ledger_path = target / "delivery-ledger.json"
     if not ledger_path.is_file():
         raise RemoteAnalysisError("本机未找到该流会话的上传台账，无法安全恢复结果")
-    config = remote_gpu_config(gpu_base_url)
+    sport_id = _normalize_sport_id(sport_id)
+    config = remote_gpu_config(gpu_base_url, sport_id=sport_id, local_cpu=local_cpu)
     if not config["api_key"]:
-        raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured in the WebUI process")
+        raise RemoteAnalysisError(f"GOOD_{sport_id.upper()}_GPU_API_KEY is not configured in the WebUI process")
+    verify_remote_gpu_sport(sport_id, gpu_base_url, local_cpu=local_cpu)
     ledger = DeliveryLedger(ledger_path)
     if ledger.analysis_session_id != session_id:
         raise RemoteAnalysisError("会话 ID 与本机上传台账不匹配")
@@ -352,15 +470,29 @@ def recover_remote_two_second_stream(analysis_session_id, output_dir, gpu_base_u
 def _materialize_stream_webui_result(client, config, target, terminal):
     """Create browser-ready evidence files from an immutable stream session."""
 
+    create_request = (client.ledger.snapshot().get("create") or {}).get("request") or {}
+    sport_id = str(((create_request.get("configuration") or {}).get("sport_id") or "badminton")).lower()
     try:
-        from business_gateway.streaming.derivation import derive_stream_movement_metrics
+        if sport_id == "tennis":
+            # Tennis first phase exposes only visual person evidence.  Do not
+            # call the badminton business metrics / energy / ability module.
+            from webui.stream_speed_summary import summarize_stream_player_speeds
 
-        derivation = derive_stream_movement_metrics(
-            target,
-            client=client,
-            terminal_status=terminal,
-            create_request=(client.ledger.snapshot().get("create") or {}).get("request") or {},
-        )
+            derivation = summarize_stream_player_speeds(
+                target,
+                client=client,
+                terminal_status=terminal,
+                create_request=create_request,
+            )
+        else:
+            from business_gateway.streaming.derivation import derive_stream_movement_metrics
+
+            derivation = derive_stream_movement_metrics(
+                target,
+                client=client,
+                terminal_status=terminal,
+                create_request=create_request,
+            )
         movement_metrics_path = derivation.get("movement_metrics_path")
     except (OSError, RuntimeError, StreamAPIError, ValueError) as exc:
         derivation = {"status": "failed", "reason": str(exc)}
