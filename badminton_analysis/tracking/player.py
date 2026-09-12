@@ -14,7 +14,8 @@ class PlayerTracker:
     one structured detection record per processed court frame.
     """
 
-    def __init__(self, corners, threshold=680, history_size=50, detection_writer=None, fps=30):
+    def __init__(self, corners, threshold=680, history_size=50, detection_writer=None, fps=30,
+                 court_dimensions=(6.1, 13.4), world_points_m=None):
         self.threshold = threshold
         self.fps = fps
         self.detection_writer = detection_writer
@@ -46,7 +47,11 @@ class PlayerTracker:
             "lower": 0,
         }
 
-        self.court_mapper = CourtMapper(corners)
+        self.court_mapper = CourtMapper(
+            corners,
+            court_dimensions=tuple(float(value) for value in court_dimensions),
+            world_points_m=world_points_m,
+        )
         self.last_update_timing = {
             "player_tracking_seconds": 0.0,
             "jsonl_write_seconds": 0.0,

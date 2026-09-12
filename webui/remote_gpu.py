@@ -25,6 +25,7 @@ from business_gateway.streaming.segmenter import GrowingVideoSegmenter
 
 
 DEFAULT_GPU_API_URL = "http://xn-g.suanjiayun.com:52028"
+DEFAULT_LOCAL_CPU_GPU_API_URL = "http://127.0.0.1:18080"
 CHUNK_BYTES = 1024 * 1024
 SUPPORTED_SPORT_IDS = {"badminton", "tennis"}
 
@@ -51,7 +52,15 @@ def configured_gpu_base_url(sport_id="badminton"):
     return DEFAULT_GPU_API_URL if sport_id == "badminton" else ""
 
 
-def remote_gpu_config(base_url_override=None, *, sport_id="badminton"):
+def configured_local_cpu_gpu_base_url():
+    """Return the loopback-only API address used for local CPU experiments."""
+    _load_local_config_file()
+    return os.environ.get(
+        "GOOD_LOCAL_CPU_GPU_API_URL", DEFAULT_LOCAL_CPU_GPU_API_URL
+    ).strip().rstrip("/")
+
+
+def remote_gpu_config(base_url_override=None, *, sport_id="badminton", local_cpu=False):
     """Read server-side configuration; secrets never enter browser state.
 
     ``base_url_override`` is an operator-only WebUI development convenience.
@@ -64,7 +73,10 @@ def remote_gpu_config(base_url_override=None, *, sport_id="badminton"):
     configured_base_url = (
         str(base_url_override).strip()
         if base_url_override is not None and str(base_url_override).strip()
-        else configured_gpu_base_url(sport_id)
+        else (
+            configured_local_cpu_gpu_base_url()
+            if local_cpu else configured_gpu_base_url(sport_id)
+        )
     )
     if not configured_base_url:
         env_name = f"GOOD_{sport_id.upper()}_GPU_API_URL"
@@ -85,8 +97,14 @@ def remote_gpu_config(base_url_override=None, *, sport_id="badminton"):
         # a compatibility fallback only, useful while both test services share
         # one reverse-proxy credential.
         "api_key": (
-            os.environ.get(f"GOOD_{sport_id.upper()}_GPU_API_KEY", "")
-            or os.environ.get("GOOD_BADMINTON_GPU_API_KEY", "")
+            (
+                os.environ.get("GOOD_LOCAL_CPU_GPU_API_KEY", "")
+                or os.environ.get("GOOD_BADMINTON_GPU_API_KEY", "")
+            )
+            if local_cpu else (
+                os.environ.get(f"GOOD_{sport_id.upper()}_GPU_API_KEY", "")
+                or os.environ.get("GOOD_BADMINTON_GPU_API_KEY", "")
+            )
         ),
         "timeout_seconds": float(
             os.environ.get(
@@ -104,10 +122,10 @@ def remote_gpu_config(base_url_override=None, *, sport_id="badminton"):
     }
 
 
-def verify_remote_gpu_sport(sport_id, gpu_base_url=None):
+def verify_remote_gpu_sport(sport_id, gpu_base_url=None, *, local_cpu=False):
     """Fail closed when a WebUI mode points at the wrong fixed-sport GPU."""
     sport_id = _normalize_sport_id(sport_id)
-    config = remote_gpu_config(gpu_base_url, sport_id=sport_id)
+    config = remote_gpu_config(gpu_base_url, sport_id=sport_id, local_cpu=local_cpu)
     health = _json_request(config, "/api/v1/health")
     actual = str(health.get("sport_id") or "").strip().lower()
     if actual != sport_id:
@@ -234,6 +252,7 @@ def iter_remote_two_second_stream(
     *,
     sport_id="badminton",
     session_mode=None,
+    local_cpu=False,
 ):
     """Send independently decodable two-second MP4 fragments directly to GPU.
 
@@ -252,10 +271,10 @@ def iter_remote_two_second_stream(
     sport_id = _normalize_sport_id(sport_id)
     if sport_id == "tennis" and session_mode != "singles_match":
         raise RemoteAnalysisError("网球上传当前只支持 singles_match（单打对打）")
-    config = remote_gpu_config(gpu_base_url, sport_id=sport_id)
+    config = remote_gpu_config(gpu_base_url, sport_id=sport_id, local_cpu=local_cpu)
     if not config["api_key"]:
         raise RemoteAnalysisError(f"GOOD_{sport_id.upper()}_GPU_API_KEY is not configured in the WebUI process")
-    health = verify_remote_gpu_sport(sport_id, gpu_base_url)
+    health = verify_remote_gpu_sport(sport_id, gpu_base_url, local_cpu=local_cpu)
 
     target = Path(output_dir)
     target.mkdir(parents=True, exist_ok=True)
@@ -405,6 +424,7 @@ def recover_remote_two_second_stream(
     gpu_base_url=None,
     *,
     sport_id="badminton",
+    local_cpu=False,
 ):
     """Recover a completed direct-GPU session without uploading video again.
 
@@ -422,10 +442,10 @@ def recover_remote_two_second_stream(
     if not ledger_path.is_file():
         raise RemoteAnalysisError("本机未找到该流会话的上传台账，无法安全恢复结果")
     sport_id = _normalize_sport_id(sport_id)
-    config = remote_gpu_config(gpu_base_url, sport_id=sport_id)
+    config = remote_gpu_config(gpu_base_url, sport_id=sport_id, local_cpu=local_cpu)
     if not config["api_key"]:
         raise RemoteAnalysisError(f"GOOD_{sport_id.upper()}_GPU_API_KEY is not configured in the WebUI process")
-    verify_remote_gpu_sport(sport_id, gpu_base_url)
+    verify_remote_gpu_sport(sport_id, gpu_base_url, local_cpu=local_cpu)
     ledger = DeliveryLedger(ledger_path)
     if ledger.analysis_session_id != session_id:
         raise RemoteAnalysisError("会话 ID 与本机上传台账不匹配")

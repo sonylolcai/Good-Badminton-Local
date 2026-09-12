@@ -643,7 +643,19 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     cap.release()
 
     roi_corners = compute_expanded_roi(corners, (frame_h, frame_w, 3))
-    mapper = CourtMapper(corners)
+    sport_id = "tennis" if options.get("sport_id") == "tennis" else "badminton"
+    from api.vision_profiles import get_vision_profile
+    vision_profile = get_vision_profile(sport_id)
+    court_dimensions = tuple(float(value) for value in vision_profile.court_dimensions_m)
+    calibration_world_points_m = [
+        [0.0, 0.0], [court_dimensions[0], 0.0],
+        [court_dimensions[0], court_dimensions[1]], [0.0, court_dimensions[1]],
+    ]
+    mapper = CourtMapper(
+        corners,
+        court_dimensions=court_dimensions,
+        world_points_m=calibration_world_points_m,
+    )
     mid_height = mapper.mid_height
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -744,6 +756,10 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         enable_huji_play_state=enable_huji_play_state,
         generate_annotated_video=generate_annotated_video,
         browser_video_reencode=browser_video_reencode,
+        sport_id=sport_id,
+        court_dimensions=court_dimensions,
+        calibration_world_points_m=calibration_world_points_m,
+        coordinate_system_id=vision_profile.coordinate_system_id,
     )
     system.keep_audio = keep_audio
     execution_metrics = system.process_video(

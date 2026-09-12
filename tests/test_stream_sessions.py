@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -460,6 +461,29 @@ class StreamSessionManagerTests(unittest.TestCase):
         )
         _, terminal = recovered.get_status(session_id)
         self.assertEqual(terminal["status"], "partial")
+
+    def test_restarted_worker_wakes_and_processes_recovered_backlog(self):
+        initial = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=False,
+        )
+        _, created = initial.create_session(create_request(), "business-stream-restart-wake-01")
+        session_id = created["analysis_session_id"]
+        initial.receive_segment(session_id, 0, segment_metadata(0, self.segment_bytes), self.segment_bytes)
+
+        recovered = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=True,
+        )
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            _, status = recovered.get_status(session_id)
+            if status["progress"]["processed_segments"] == 1:
+                break
+            time.sleep(0.01)
+        self.assertEqual(status["progress"]["processed_segments"], 1)
 
     def test_retention_cleanup_is_terminal_only_and_dry_run_by_default(self):
         manager = StreamSessionManager(

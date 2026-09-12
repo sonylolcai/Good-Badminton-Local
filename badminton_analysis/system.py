@@ -86,8 +86,14 @@ class BadmintonAnalysisSystem:
                  tracknet_measurements_path=None, huji_action_model=None,
                  huji_sample_hz=6.0, enable_huji_play_state=True,
                  movement_rally_settle_seconds=0.7, generate_annotated_video=False,
-                 browser_video_reencode=False):
+                 browser_video_reencode=False, sport_id='badminton',
+                 court_dimensions=(6.1, 13.4), calibration_world_points_m=None,
+                 coordinate_system_id='standard_badminton_court_m'):
         self.video_path = video_path
+        self.sport_id = str(sport_id)
+        self.court_dimensions = tuple(float(value) for value in court_dimensions)
+        self.calibration_world_points_m = calibration_world_points_m
+        self.coordinate_system_id = str(coordinate_system_id)
         self.show_display = show_display
         self.language = language
         self.template_path = template_path
@@ -237,7 +243,8 @@ class BadmintonAnalysisSystem:
             rtmpose_processor=self.rtmpose_processor,
             show_skeletons=self.show_skeletons,
             show_player_trajectories=self.show_player_trajectories,
-            show_performance_stats=False
+            show_performance_stats=False,
+            court_dimensions=self.court_dimensions,
         )
         
 
@@ -381,10 +388,18 @@ class BadmintonAnalysisSystem:
         self.detection_writer = JsonlDetectionWriter(self.detections_path)
         
 
-        self.court_mapper = CourtMapper(corners)
+        self.court_mapper = CourtMapper(
+            corners,
+            court_dimensions=self.court_dimensions,
+            world_points_m=self.calibration_world_points_m,
+        )
         self.player_pose_visualizer.court_mapper = self.court_mapper
-        self.player_tracker = PlayerTracker(corners=corners, threshold=mid_height, history_size=30,
-                                          detection_writer=self.detection_writer, fps=fps)
+        self.player_tracker = PlayerTracker(
+            corners=corners, threshold=mid_height, history_size=30,
+            detection_writer=self.detection_writer, fps=fps,
+            court_dimensions=self.court_dimensions,
+            world_points_m=self.calibration_world_points_m,
+        )
         self.fixed_camera_match = FixedCameraMatchPipeline(
             corners,
             fps=fps,
@@ -396,6 +411,9 @@ class BadmintonAnalysisSystem:
             roster_stable_frames=self.roster_stable_frames,
             shuttle_enabled=self.shuttle_detector != 'none',
             movement_rally_settle_seconds=self.movement_rally_settle_seconds,
+            court_dimensions=self.court_dimensions,
+            world_points_m=self.calibration_world_points_m,
+            coordinate_system_id=self.coordinate_system_id,
         )
         self._write_metadata(fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height)
         
@@ -532,8 +550,9 @@ class BadmintonAnalysisSystem:
                 "net_image_line": self.fixed_camera_match.net_image_line if hasattr(self, "fixed_camera_match") else self.net_image_line,
                 "coordinate_system": {
                     "unit": "meter",
-                    "width": 6.1,
-                    "length": 13.4,
+                    "width": self.court_dimensions[0],
+                    "length": self.court_dimensions[1],
+                    "id": self.coordinate_system_id,
                 },
                 "fixed_camera_health_check": {
                     "requested_hz": self.court_health_check_hz,

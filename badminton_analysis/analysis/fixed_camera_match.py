@@ -1568,6 +1568,9 @@ class FixedCameraMatchPipeline:
         roster_stable_frames=2,
         shuttle_enabled=True,
         movement_rally_settle_seconds=0.7,
+        court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH),
+        world_points_m=None,
+        coordinate_system_id="standard_badminton_court_m",
     ):
         if match_mode not in {"singles", "doubles"}:
             raise ValueError(
@@ -1580,7 +1583,12 @@ class FixedCameraMatchPipeline:
             raise ValueError(
                 "ByteTrack is evaluation-gated. Set enable_bytetrack=True only for a recorded tracker evaluation."
             )
-        self.court_space = CourtSpace(image_corners)
+        self.court_space = CourtSpace(
+            image_corners,
+            court_dimensions=tuple(float(value) for value in court_dimensions),
+            world_points_m=world_points_m,
+        )
+        self.coordinate_system_id = str(coordinate_system_id)
         self.net_image_line = net_image_line or [
             self.court_space.court_to_image((0.0, self.court_space.net_y_m)),
             self.court_space.court_to_image((self.court_space.width_m, self.court_space.net_y_m)),
@@ -1631,7 +1639,7 @@ class FixedCameraMatchPipeline:
         rally = self.rallies.update(frame_index, tracks, shuttle, hit_events)
         return {
             "schema_version": SCHEMA_VERSION,
-            "coordinate_system": "standard_badminton_court_m",
+            "coordinate_system": self.coordinate_system_id,
             "match": {
                 "mode": self.match_mode,
                 "max_players_per_team": self.tracker.max_players_per_team,

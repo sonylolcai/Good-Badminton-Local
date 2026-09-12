@@ -40,6 +40,7 @@ from webui.pipeline import (
 )
 from webui.remote_gpu import (
     RemoteAnalysisError,
+    configured_local_cpu_gpu_base_url,
     configured_gpu_base_url,
     iter_remote_two_second_stream,
     recover_remote_two_second_stream,
@@ -327,10 +328,11 @@ def reset_court_selection(language="zh"):
     return None, None, [], None, text["corner_none"], False
 
 
-def configure_sport_mode(sport_id):
+def configure_sport_mode(sport_id, processing_target="local_cpu"):
     """Update only presentation defaults; server-side validation remains final."""
     sport_id = "tennis" if sport_id == "tennis" else "badminton"
     if sport_id == "tennis":
+        use_local_cpu = processing_target == "local_cpu"
         return (
             "## 网球单打视觉分析\n"
             "只上传单打对打视频。服务端固定追踪两名匿名运动员，并输出每人的场地平面速度；"
@@ -340,9 +342,16 @@ def configure_sport_mode(sport_id):
             "请使用完整单打场地画面，手动点击左上、右上、右下、左下四个角点。"
             "不要使用羽毛球自动线检测结果。",
             gr.update(
-                value=configured_gpu_base_url("tennis"),
-                label="网球 GPU 服务地址",
-                info="必须指向 health 返回 sport_id=tennis 的纯视觉流式 GPU 服务。",
+                value=(
+                    configured_local_cpu_gpu_base_url()
+                    if use_local_cpu else configured_gpu_base_url("tennis")
+                ),
+                label="本地 CPU 网球服务地址" if use_local_cpu else "网球 GPU 服务地址",
+                info=(
+                    "本机仅运行 CPU 推理，不会请求远端 GPU。"
+                    if use_local_cpu else "请选择或填写网球远程 GPU 服务地址。"
+                ),
+                visible=not use_local_cpu,
             ),
             gr.update(
                 choices=[
@@ -357,7 +366,7 @@ def configure_sport_mode(sport_id):
                     "只用于观察命中与误检，不代表网球准确率。"
                 ),
             ),
-            gr.update(value=True, visible=False, interactive=False),
+            gr.update(value=False, visible=True, interactive=True),
             gr.update(
                 choices=[("2 人（网球单打，固定）", 2)],
                 value=2,
@@ -371,12 +380,9 @@ def configure_sport_mode(sport_id):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
-            gr.update(value=False, visible=False),
-            # The current tennis stream API returns JSON evidence only.  Do
-            # not leave a previously selected badminton promotion value in
-            # Gradio state: it would be submitted even when the control is
-            # no longer applicable to this transport.
-            gr.update(value=False, visible=False, interactive=False),
+            gr.update(value=False, visible=True, interactive=True),
+            gr.update(value=False, visible=True, interactive=True),
+            gr.update(value=processing_target, visible=True, interactive=True),
         )
     return (
         "## 羽毛球视觉分析\n"
@@ -405,6 +411,37 @@ def configure_sport_mode(sport_id):
         gr.update(visible=True),
         gr.update(visible=True),
         gr.update(visible=True),
+        gr.update(value="local_cpu", visible=False, interactive=False),
+    )
+
+
+def configure_processing_target(processing_target, sport_id):
+    """Route tennis to either loopback CPU or an explicitly configured GPU URL."""
+    if processing_target == "local_cpu" and sport_id == "tennis":
+        return gr.update(
+            value=configured_local_cpu_gpu_base_url(),
+            label="本地 CPU 网球服务地址",
+            info="使用 127.0.0.1:18080 上的网球视觉服务；不会连接远端 GPU。",
+            visible=False,
+        )
+    return gr.update(
+        value=configured_gpu_base_url("tennis" if sport_id == "tennis" else "badminton"),
+        label="网球 GPU 服务地址" if sport_id == "tennis" else "羽毛球 GPU 服务地址（开发用）",
+        info="远程 GPU 模式：请填写当前运动对应的服务地址。",
+        visible=True,
+    )
+
+
+def configure_stream_transport(two_second_segment_push, sport_id):
+    """Keep media-export controls truthful for the selected transport."""
+    if sport_id == "tennis" and bool(two_second_segment_push):
+        return (
+            gr.update(value=False, visible=False, interactive=False),
+            gr.update(value=False, visible=False, interactive=False),
+        )
+    return (
+        gr.update(visible=True, interactive=True),
+        gr.update(visible=True, interactive=True),
     )
 
 
@@ -461,10 +498,12 @@ def configure_sport_presentation(sport_id):
     )
 
 
-def verify_selected_gpu(sport_id, gpu_base_url):
+def verify_selected_gpu(sport_id, gpu_base_url, processing_target="local_cpu"):
     """Expose the same fail-closed health check used immediately before upload."""
     try:
-        health = verify_remote_gpu_sport(sport_id, gpu_base_url)
+        health = verify_remote_gpu_sport(
+            sport_id, gpu_base_url, local_cpu=processing_target == "local_cpu"
+        )
     except RemoteAnalysisError as exc:
         return f"⚠️ GPU 未通过校验：{escape(str(exc))}"
     return (
@@ -556,7 +595,8 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                       show_court_trajectory, show_shuttlecock_trajectory,
                        show_player_stats, show_pose_roi, visualize_positions,
                        yolo_pose_model, ball_model, gpu_base_url,
-                       generate_promotion_video=False,
+                       generate_promotion_video=False, sport_id="badminton",
+                       force_local=False,
                       progress=gr.Progress(track_tqdm=False)):
     if not analysis_ready:
         gr.Warning("已切换到当前视频帧，请在预览图中点击四个球场角点，然后应用手动角点。")
@@ -586,6 +626,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
     # run pose/ball inference again.
     effective_annotated_video = bool(generate_annotated_video or generate_promotion_video)
     options = {
+        "sport_id": "tennis" if sport_id == "tennis" else "badminton",
         "pose_family": pose_family,
         "pose_mode": pose_mode,
         "language": language,
@@ -647,7 +688,10 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
             ledger = BusinessTaskLedger()
             business_task_id = ledger.start_task(
                 output_dir=remote_output_dir,
-                remote_base_url=remote_gpu_config(gpu_base_url)["base_url"],
+                remote_base_url=(
+                    "local://webui-cpu"
+                    if force_local else remote_gpu_config(gpu_base_url)["base_url"]
+                ),
             )
 
             def remote_status(event):
@@ -655,6 +699,34 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                 publish({**event, "business_task_id": business_task_id})
 
             try:
+                if force_local:
+                    def local_progress(frame, total):
+                        publish({
+                            "mode": "local_full_video", "phase": "local_analyzing",
+                            "processed_frames": frame, "total_frames": total,
+                            "ratio": round(frame / total, 4) if total else 0.0,
+                        })
+
+                    result = run_analysis(
+                        video_path=video_file, template_path=template_path,
+                        corners=corners, options=options,
+                        progress_cb=local_progress,
+                        cancel_cb=task_handle.is_cancelled,
+                        output_dir=remote_output_dir,
+                    )
+                    _attach_business_interpretation(result, remote_status)
+                    _write_execution_metadata(result, {
+                        "mode": "local_full_video",
+                        "sport_id": options["sport_id"],
+                        "fallback_used": False,
+                    })
+                    outcome["result"] = result
+                    ledger.record_terminal(business_task_id, status="succeeded")
+                    publish({
+                        "mode": "local_full_video", "phase": "succeeded",
+                        "business_task_id": business_task_id,
+                    })
+                    return
                 result = run_remote_analysis(
                     video_path=video_file, template_path=template_path, corners=corners,
                     options=options, output_dir=remote_output_dir, status_cb=remote_status,
@@ -1060,6 +1132,7 @@ def run_analysis_with_upload_mode(
     yolo_pose_model, ball_model, gpu_base_url, two_second_segment_push, expected_player_count,
     sport_id="badminton",
     generate_promotion_video=False,
+    processing_target="local_cpu",
     progress=gr.Progress(track_tqdm=False),
 ):
     """Run the selected GPU transport without changing analysis settings.
@@ -1071,10 +1144,7 @@ def run_analysis_with_upload_mode(
     """
 
     sport_id = "tennis" if sport_id == "tennis" else "badminton"
-    # Tennis has no legacy full-file or local fallback path. Its fixed sport
-    # service accepts only stream sessions, which keeps video interpretation
-    # separate from the legacy badminton whole-video business facade.
-    if sport_id == "tennis" or bool(two_second_segment_push):
+    if bool(two_second_segment_push):
         if generate_promotion_video:
             raise gr.Error(
                 "宣传视频需要完整的标注视频作为中央画面；当前直连分片流服务尚未导出该成片。"
@@ -1086,6 +1156,7 @@ def run_analysis_with_upload_mode(
         if not corners or len(corners) != 4:
             raise gr.Error("请先确认四个球场角点。")
         _validate_file_size(video_file, _MAX_VIDEO_BYTES, "Video")
+        use_local_cpu = processing_target == "local_cpu" and sport_id == "tennis"
         stream_options = {
             "analysis_sample_hz": int(analysis_sample_hz),
             "pose_imgsz": int(pose_imgsz),
@@ -1093,7 +1164,12 @@ def run_analysis_with_upload_mode(
             # selects dedicated tennis weights when configured, otherwise the
             # separately labelled current-checkpoint experiment.
             "shuttle_detector": str(shuttle_detector),
-            "tracker_backend": tracker_backend,
+            # ByteTrack keeps opaque third-party runtime state and cannot be
+            # restored after a process restart. Local CPU inference is allowed
+            # to run far longer than a GPU segment, so use the restart-safe
+            # association tracker there rather than silently losing identity
+            # evidence after a watchdog restart.
+            "tracker_backend": "court_association" if use_local_cpu else tracker_backend,
             "far_player_enhancement": bool(far_player_enhancement),
             "far_pose_roi": tuple(float(item.strip()) for item in far_pose_roi.split(',')),
             "expected_player_count": 2 if sport_id == "tennis" else int(expected_player_count),
@@ -1101,23 +1177,30 @@ def run_analysis_with_upload_mode(
         stream_output_dir = os.path.join(
             "outputs", "remote_stream_sessions", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         )
+        active_gpu_base_url = (
+            configured_local_cpu_gpu_base_url() if use_local_cpu else gpu_base_url
+        )
         try:
             for stream_status in iter_remote_two_second_stream(
                 video_file,
                 corners,
                 stream_options,
                 stream_output_dir,
-                gpu_base_url=gpu_base_url,
+                gpu_base_url=active_gpu_base_url,
                 sport_id=sport_id,
                 session_mode="singles_match" if sport_id == "tennis" else None,
+                local_cpu=use_local_cpu,
             ):
                 yield _two_second_segment_upload_update(stream_status)
         except RemoteAnalysisError as exc:
+            error_message = str(exc)
+            if use_local_cpu:
+                error_message = error_message.replace("远端 GPU 的", "本地 CPU 服务的")
             yield _two_second_segment_upload_update({
                 "mode": "remote_gpu_two_second_stream",
                 "phase": "failed",
-                "remote_base_url": str(gpu_base_url or "").strip(),
-                "error": str(exc),
+                "remote_base_url": str(active_gpu_base_url or "").strip(),
+                "error": error_message,
             })
         return
 
@@ -1154,6 +1237,8 @@ def run_analysis_with_upload_mode(
         ball_model,
         gpu_base_url,
         generate_promotion_video,
+        sport_id=sport_id,
+        force_local=processing_target == "local_cpu" and sport_id == "tennis",
         progress=progress,
     ):
         yield _full_video_upload_update(update)
@@ -2954,12 +3039,24 @@ def build_ui():
                         ),
                         elem_id="ai-promotion-video-toggle",
                     )
+                    processing_target = gr.Dropdown(
+                        choices=[
+                            ("本地 CPU（不连接远端 GPU）", "local_cpu"),
+                            ("远程 GPU（需要填写服务地址）", "remote_gpu"),
+                        ],
+                        value="local_cpu",
+                        visible=False,
+                        label="网球处理位置",
+                        info="本地 CPU 默认连接 127.0.0.1:18080；选择远程 GPU 后必须填写其服务地址。",
+                        elem_id="tennis-processing-target",
+                    )
                     two_second_segment_push = gr.Checkbox(
                         value=False,
                         label="每 2 秒直接分片推送到 GPU（开发测试）",
                         info=(
                             "勾选：WebUI 在本机将录像切成连续的 2 秒 MP4 片段，直接按顺序推送到上方 GPU 服务地址；"
-                            "不勾选：整段视频直接提交 GPU。此模式不经过本地业务网关或 127.0.0.1:8080。"
+                            "不勾选：整段视频按完整分析任务处理；网球本地 CPU 会在 WebUI 本机导出标注视频，"
+                            "可继续生成宣传视频。"
                         ),
                     )
                     expected_player_count = gr.Radio(
@@ -3651,7 +3748,7 @@ def build_ui():
 
         sport_mode_change = sport_mode.change(
             fn=configure_sport_mode,
-            inputs=[sport_mode],
+            inputs=[sport_mode, processing_target],
             outputs=[
                 sport_mode_banner,
                 sport_calibration_help,
@@ -3667,6 +3764,7 @@ def build_ui():
                 badminton_business_results,
                 generate_annotated_video,
                 generate_promotion_video_toggle,
+                processing_target,
             ],
             js=_SPORT_MODE_CLIENT_SYNC,
             show_progress="hidden",
@@ -3717,9 +3815,21 @@ def build_ui():
             ],
             show_progress="hidden",
         )
+        processing_target.change(
+            fn=configure_processing_target,
+            inputs=[processing_target, sport_mode],
+            outputs=[gpu_base_url],
+            show_progress="hidden",
+        )
+        two_second_segment_push.change(
+            fn=configure_stream_transport,
+            inputs=[two_second_segment_push, sport_mode],
+            outputs=[generate_annotated_video, generate_promotion_video_toggle],
+            show_progress="hidden",
+        )
         verify_gpu_btn.click(
             fn=verify_selected_gpu,
-            inputs=[sport_mode, gpu_base_url],
+            inputs=[sport_mode, gpu_base_url, processing_target],
             outputs=[gpu_service_status],
             show_progress="hidden",
         )
@@ -3781,7 +3891,7 @@ def build_ui():
                 show_court_trajectory, show_shuttlecock_trajectory,
                 show_player_stats, show_pose_roi, visualize_positions,
                 yolo_pose_model, ball_model, gpu_base_url, two_second_segment_push, expected_player_count,
-                sport_mode, generate_promotion_video_toggle,
+                sport_mode, generate_promotion_video_toggle, processing_target,
             ],
             outputs=[
                 output_video, output_gallery, output_metadata, output_detections, output_tracknet_raw,

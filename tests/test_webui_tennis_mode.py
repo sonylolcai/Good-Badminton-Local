@@ -10,8 +10,10 @@ import gradio as gr
 from webui.app import (
     _APP_CSS,
     _SPORT_MODE_CLIENT_SYNC,
+    configure_processing_target,
     configure_sport_mode,
     configure_sport_presentation,
+    configure_stream_transport,
     ensure_court_for_analysis,
     run_analysis_with_upload_mode,
 )
@@ -30,21 +32,37 @@ class TennisWebUiModeTests(unittest.TestCase):
     def test_tennis_mode_exposes_visual_only_fixed_singles_defaults(self):
         updates = configure_sport_mode("tennis")
 
-        self.assertEqual(len(updates), 14)
+        self.assertEqual(len(updates), 15)
         self.assertIn("网球单打视觉分析", updates[0])
         self.assertIn("当前 YOLO-ball 羽毛球权重", updates[0])
         self.assertIn("非专用网球模型证据", updates[0])
         self.assertEqual(updates[3]["value"], "none")
         self.assertTrue(updates[3]["visible"])
         self.assertEqual([item[1] for item in updates[3]["choices"]], ["none", "yolo"])
-        self.assertTrue(updates[4]["value"])
-        self.assertFalse(updates[4]["interactive"])
+        self.assertFalse(updates[4]["value"])
+        self.assertTrue(updates[4]["interactive"])
         self.assertEqual(updates[5]["value"], 2)
-        # The remaining five updates hide legacy business-only controls.
-        self.assertTrue(all(update["visible"] is False for update in updates[7:]))
-        self.assertFalse(updates[12]["value"])
-        self.assertFalse(updates[13]["value"])
-        self.assertFalse(updates[13]["visible"])
+        # Streaming-only controls stay hidden, while complete-video export is
+        # available because the default transport is not segmented.
+        self.assertTrue(all(update["visible"] is False for update in updates[7:12]))
+        self.assertTrue(updates[12]["visible"])
+        self.assertTrue(updates[13]["visible"])
+        self.assertEqual(updates[14]["value"], "local_cpu")
+        self.assertTrue(updates[14]["visible"])
+
+        local_update = configure_processing_target("local_cpu", "tennis")
+        self.assertEqual(local_update["value"], "http://127.0.0.1:18080")
+        self.assertIn("本地 CPU", local_update["label"])
+        self.assertFalse(local_update["visible"])
+        remote_update = configure_processing_target("remote_gpu", "tennis")
+        self.assertTrue(remote_update["visible"])
+
+        stream_updates = configure_stream_transport(True, "tennis")
+        self.assertFalse(stream_updates[0]["visible"])
+        self.assertFalse(stream_updates[1]["visible"])
+        full_updates = configure_stream_transport(False, "tennis")
+        self.assertTrue(full_updates[0]["visible"])
+        self.assertTrue(full_updates[1]["visible"])
 
         presentation = configure_sport_presentation("tennis")
         self.assertIn("手动", presentation[0]["value"])
@@ -66,7 +84,7 @@ class TennisWebUiModeTests(unittest.TestCase):
                 "tennis-match.mp4", "court.jpg", None, [], "zh", "tennis"
             )
 
-    def test_tennis_upload_forces_the_pure_streaming_transport_and_two_tracks(self):
+    def test_tennis_upload_uses_streaming_only_when_operator_enables_it(self):
         corners = [(10, 10), (110, 10), (110, 210), (10, 210)]
         with tempfile.TemporaryDirectory() as directory:
             video = Path(directory) / "tennis-match.mp4"
@@ -83,7 +101,7 @@ class TennisWebUiModeTests(unittest.TestCase):
                         640, 10, 0.5, False, "0.1,0.2,0.8,0.9",
                         False, False, True, True, True, True, True, True,
                         True, "weights/yolo11n-pose.pt", "weights/yolo11s-ball.pt",
-                        "http://tennis.example:8080", False, 4, "tennis",
+                        "http://tennis.example:8080", True, 4, "tennis",
                     )
                 )
 
@@ -110,9 +128,57 @@ class TennisWebUiModeTests(unittest.TestCase):
                     640, 10, 0.5, False, "0.1,0.2,0.8,0.9",
                     False, False, True, True, True, True, True, True,
                     True, "weights/yolo11n-pose.pt", "weights/yolo11s-ball.pt",
-                    "http://tennis.example:8080", False, 4, "tennis",
+                    "http://tennis.example:8080", True, 4, "tennis",
                 ))
         self.assertEqual(stream.call_args.args[2]["shuttle_detector"], "none")
+
+    def test_tennis_local_cpu_target_forces_loopback_transport(self):
+        corners = [(10, 10), (110, 10), (110, 210), (10, 210)]
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "tennis-match.mp4"
+            video.write_bytes(b"test-video")
+            with patch(
+                "webui.app.iter_remote_two_second_stream",
+                return_value=iter([{"phase": "finalized", "analysis_session_id": "ssn_tennis"}]),
+            ) as stream:
+                list(run_analysis_with_upload_mode(
+                    True, str(video), "court.jpg", corners,
+                    "yolo", "whole_body", "zh", False, "singles",
+                    "standard", "none", "bytetrack", 0.7, False,
+                    640, 10, 0.5, False, "0.1,0.2,0.8,0.9",
+                    False, False, True, True, True, True, True, True,
+                    True, "weights/yolo11n-pose.pt", "weights/yolo11s-ball.pt",
+                    "http://remote.example:8080", True, 4, "tennis",
+                    processing_target="local_cpu",
+                ))
+        self.assertEqual(stream.call_args.kwargs["gpu_base_url"], "http://127.0.0.1:18080")
+        self.assertTrue(stream.call_args.kwargs["local_cpu"])
+        self.assertEqual(stream.call_args.args[2]["tracker_backend"], "court_association")
+
+    def test_tennis_without_segment_checkbox_uses_full_local_video_path(self):
+        corners = [(10, 10), (110, 10), (110, 210), (10, 210)]
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "tennis-match.mp4"
+            video.write_bytes(b"test-video")
+            with patch(
+                "webui.app.iter_remote_two_second_stream",
+            ) as stream, patch(
+                "webui.app.run_full_analysis",
+                return_value=iter([tuple([None] * 18)]),
+            ) as full:
+                list(run_analysis_with_upload_mode(
+                    True, str(video), "court.jpg", corners,
+                    "yolo", "whole_body", "zh", False, "singles",
+                    "standard", "none", "court_association", 0.7, False,
+                    640, 10, 0.5, False, "0.1,0.2,0.8,0.9",
+                    True, False, True, True, True, True, True, True,
+                    True, "weights/yolo11n-pose.pt", "weights/yolo11s-ball.pt",
+                    "http://remote.example:8080", False, 2, "tennis",
+                    generate_promotion_video=True, processing_target="local_cpu",
+                ))
+        stream.assert_not_called()
+        self.assertEqual(full.call_args.kwargs["sport_id"], "tennis")
+        self.assertTrue(full.call_args.kwargs["force_local"])
 
 
 if __name__ == "__main__":

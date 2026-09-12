@@ -81,6 +81,19 @@ class RemoteGpuTests(unittest.TestCase):
                 with self.assertRaisesRegex(RemoteAnalysisError, "已阻止上传"):
                     verify_remote_gpu_sport("tennis")
 
+    def test_local_cpu_config_prefers_loopback_url_and_local_key(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOD_LOCAL_CPU_GPU_API_URL": "http://127.0.0.1:18080",
+                "GOOD_LOCAL_CPU_GPU_API_KEY": "local-key",
+            },
+            clear=False,
+        ):
+            config = remote_gpu_config(sport_id="tennis", local_cpu=True)
+        self.assertEqual(config["base_url"], "http://127.0.0.1:18080")
+        self.assertEqual(config["api_key"], "local-key")
+
     def test_cancelled_local_pipeline_exits_before_loading_models(self):
         with self.assertRaises(AnalysisCancelled):
             run_analysis(

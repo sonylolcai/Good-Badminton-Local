@@ -1161,6 +1161,11 @@ class StreamSessionManager:
             daemon=True,
         )
         self._watchdog.start()
+        # A process may have exited after durably accepting segments.  Recovery
+        # reconstructs its engines before the worker exists, so it cannot call
+        # ``_notify`` itself. Wake the fresh worker once to resume that durable
+        # backlog instead of waiting for a new upload or completion request.
+        self._notify()
 
     @property
     def worker_running(self):
