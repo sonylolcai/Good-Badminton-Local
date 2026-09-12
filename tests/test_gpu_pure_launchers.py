@@ -17,6 +17,8 @@ class PureGpuLauncherTests(unittest.TestCase):
         self.assertIn("apps.badminton_gpu.app:app", common)
         self.assertIn("apps.tennis_gpu.app:app", common)
         self.assertNotIn("api.app:app", common)
+        self.assertIn('POSE_MODEL_VAR="${SPORT_ENV_PREFIX}_POSE_MODEL"', common)
+        self.assertIn('Configured ${POSE_MODEL_VAR} does not exist', common)
         self.assertIn('"apps.badminton_gpu.app:app" "badminton"', badminton)
         self.assertIn('"apps.tennis_gpu.app:app" "tennis"', tennis)
 

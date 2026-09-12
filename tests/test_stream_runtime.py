@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 
 from api.stream_runtime import StreamProcessorFactory
-from api.vision_profiles import TENNIS_PROFILE
+from api.vision_profiles import BADMINTON_PROFILE, TENNIS_PROFILE
 from badminton_analysis.streaming import FinalizationContext, FrameContext
 from tests.stream_test_utils import create_request
 
@@ -157,6 +157,52 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual(person.data["tracking"]["roster"]["maximum_player_count"], 4)
         json.dumps(measurement.snapshot_state())
 
+    def test_pose_weight_configuration_is_isolated_by_sport(self):
+        badminton_pose = self.root / "badminton-pose.pt"
+        tennis_pose = self.root / "tennis-pose.pt"
+        badminton_pose.write_bytes(b"badminton pose")
+        tennis_pose.write_bytes(b"tennis pose")
+        paths = []
+        session = create_request()
+        session["configuration"].update(
+            {"sport_id": "tennis", "session_mode": "singles_match"}
+        )
+        factory = StreamProcessorFactory(
+            self.root,
+            vision_profile=TENNIS_PROFILE,
+            pose_model_factory=lambda path: paths.append(path) or _PoseModel(),
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "GOOD_BADMINTON_STREAM_POSE_MODEL": str(badminton_pose),
+                "GOOD_TENNIS_STREAM_POSE_MODEL": str(tennis_pose),
+                "GOOD_TENNIS_STREAM_POSE_CONF": "0.31",
+                "GOOD_TENNIS_STREAM_DEVICE": "cpu",
+            },
+            clear=False,
+        ):
+            measurement, _ = factory(session)
+            events = list(
+                measurement.process_frame(
+                    np.zeros((64, 64, 3), dtype=np.uint8), self.context()
+                )
+            )
+
+        self.assertEqual(paths, [str(tennis_pose)])
+        self.assertEqual(measurement.person.observation_provider.pose.conf, 0.31)
+        self.assertEqual(measurement.person.observation_provider.pose.device, "cpu")
+        person = next(event for event in events if event.event_type == "person_observation")
+        identity = person.data["model_identity"]
+        self.assertEqual(identity["sport_id"], "tennis")
+        self.assertEqual(identity["model_checkpoint"], "tennis-pose.pt")
+        self.assertEqual(len(identity["model_sha256"]), 64)
+
+        self.assertNotEqual(
+            BADMINTON_PROFILE.default_pose_checkpoint,
+            TENNIS_PROFILE.default_pose_checkpoint,
+        )
+
     def test_yolo_mode_adds_shuttle_evidence_on_the_same_sample_clock(self):
         session = create_request()
         session["configuration"]["shuttle_detector"] = "yolo"
@@ -223,6 +269,9 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual(ball.data["sport_id"], "tennis")
         self.assertEqual(ball.data["ball_kind"], "tennis_ball")
         self.assertEqual(ball.data["model_required_class"], "tennis_ball")
+        self.assertEqual(ball.data["model_identity"]["sport_id"], "tennis")
+        self.assertEqual(ball.data["model_identity"]["model_kind"], "ball")
+        self.assertEqual(len(ball.data["model_identity"]["model_sha256"]), 64)
         self.assertNotIn("shuttle_observation", [event.event_type for event in events])
 
     def test_tennis_yolo_uses_badminton_label_only_as_explicit_experiment(self):

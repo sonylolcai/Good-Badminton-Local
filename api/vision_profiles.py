@@ -64,9 +64,15 @@ class SportVisionProfile:
     service_name: str
     coordinate_system_id: str
     court_dimensions_m: Point
+    default_pose_checkpoint: str
     session_modes: Tuple[SessionModeProfile, ...]
     default_session_mode: Optional[str]
     allowed_ball_detectors: Tuple[str, ...]
+
+    @property
+    def model_environment_prefix(self) -> str:
+        """Return the only environment prefix allowed to select this sport's models."""
+        return f"GOOD_{self.sport_id.upper()}_STREAM"
 
     @property
     def supported_session_modes(self) -> Tuple[str, ...]:
@@ -104,6 +110,7 @@ BADMINTON_PROFILE = SportVisionProfile(
     service_name="good-badminton-gpu-api",
     coordinate_system_id="standard_badminton_court_m",
     court_dimensions_m=(BADMINTON_WIDTH_M, BADMINTON_LENGTH_M),
+    default_pose_checkpoint="yolo11n-pose.pt",
     session_modes=(
         SessionModeProfile(
             session_mode="match",
@@ -128,6 +135,7 @@ TENNIS_PROFILE = SportVisionProfile(
     service_name="good-tennis-gpu-api",
     coordinate_system_id="tennis_singles_court_m_v1",
     court_dimensions_m=(TENNIS_SINGLES_WIDTH_M, TENNIS_COURT_LENGTH_M),
+    default_pose_checkpoint="yolo11s-pose.pt",
     session_modes=(
         SessionModeProfile(
             session_mode="singles_match",

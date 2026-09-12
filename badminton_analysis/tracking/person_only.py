@@ -669,11 +669,13 @@ class PersonOnlyFrameProcessor:
         self,
         tracker: PersonOnlyTracker,
         observation_provider: Callable[[Any, FrameContext], Any],
+        observation_model: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if not callable(observation_provider):
             raise ValueError("observation_provider must be callable")
         self.tracker = tracker
         self.observation_provider = observation_provider
+        self.observation_model = deepcopy(observation_model) if observation_model else None
 
     def process_frame(self, frame: Any, context: FrameContext) -> Iterable[ProcessorEvent]:
         provided = self.observation_provider(frame, context)
@@ -738,6 +740,7 @@ class PersonOnlyFrameProcessor:
                     confidence=float(track.get("confidence") or 0.0),
                     data={
                         "analysis_mode": "person_only",
+                        "model_identity": deepcopy(self.observation_model),
                         "track": deepcopy(track),
                         "tracking": {
                             "backend": snapshot["tracking"]["backend"],

@@ -14,10 +14,10 @@ param(
     # weights are ever placed in this package.
     [switch]$IncludeTrackNetABTools,
 
-    # Include the repository's current pose and badminton YOLO-ball checkpoints
-    # only for an explicitly labelled tennis trial. The ball model is never
-    # presented as trained tennis evidence. Both files are copied to persistent
-    # server weights on refresh; normal source packages exclude model weights.
+    # Include the repository's current badminton YOLO-ball checkpoint only for
+    # an explicitly labelled tennis trial. The ball model is never
+    # presented as trained tennis evidence. This one checkpoint is copied to
+    # persistent server weights on refresh; normal source packages exclude weights.
     [switch]$IncludeExperimentalTennisBallModel
 )
 
@@ -137,7 +137,6 @@ try {
         if ($Sport -ne 'tennis') {
             throw 'IncludeExperimentalTennisBallModel is only valid with -Sport tennis.'
         }
-        Copy-SourceFile -RelativePath 'weights/yolo11n-pose.pt'
         Copy-SourceFile -RelativePath 'weights/yolo11s-ball.pt'
     }
 
@@ -227,7 +226,7 @@ try {
         Write-Host 'TrackNet A/B tools are included; source code and checkpoint ZIPs remain separate uploads.'
     }
     if ($IncludeExperimentalTennisBallModel) {
-        Write-Host 'Included yolo11n-pose.pt and yolo11s-ball.pt for the tennis pose and experimental ball-detection modes.'
+        Write-Host 'Included yolo11s-ball.pt only as experimental tennis-ball evidence; provision tennis pose weights separately.'
     }
     Write-Host 'First deployment only (when that fixed directory does not yet exist):'
     Write-Host "unzip -p /root/$packageName-upload.zip $packageName/deploy/refresh_gpu_api_from_zip.sh | bash -s -- /root/$packageName-upload.zip /root/$packageName $Sport"

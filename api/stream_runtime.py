@@ -12,10 +12,12 @@ fails clearly instead of silently substituting YOLO or fabricated ball data.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 from collections import deque
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -40,7 +42,29 @@ _MODEL_CACHE: dict[tuple[str, str], Any] = {}
 _MODEL_CACHE_LOCK = threading.RLock()
 
 
-def _load_ultralytics_model(model_path: str, cache_kind: str):
+@lru_cache(maxsize=32)
+def _checkpoint_sha256(model_path: str) -> str | None:
+    path = Path(model_path).expanduser().resolve()
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _model_identity(model_path: str, *, sport_id: str, model_kind: str) -> dict[str, object]:
+    """Persist enough model provenance to detect cross-sport weight mistakes."""
+    return {
+        "sport_id": str(sport_id),
+        "model_kind": str(model_kind),
+        "model_checkpoint": Path(model_path).name,
+        "model_sha256": _checkpoint_sha256(model_path),
+    }
+
+
+def _load_ultralytics_model(model_path: str, cache_kind: str, *, expected_task: str):
     resolved = str(Path(model_path).resolve())
     key = (cache_kind, resolved)
     with _MODEL_CACHE_LOCK:
@@ -51,6 +75,12 @@ def _load_ultralytics_model(model_path: str, cache_kind: str):
             from ultralytics import YOLO
 
             model = YOLO(resolved)
+            actual_task = str(getattr(model, "task", "") or "")
+            if actual_task != expected_task:
+                raise ValueError(
+                    f"{cache_kind} checkpoint must be an Ultralytics {expected_task} model; "
+                    f"got task={actual_task or '<unknown>'}"
+                )
             _MODEL_CACHE[key] = model
         return model
 
@@ -192,9 +222,10 @@ class PoseObservationProvider:
 class YoloShuttleFrameProcessor:
     """Low-latency measurement processor with durable, explicit evidence."""
 
-    def __init__(self, tracker: ShuttlecockTracker, court_corners):
+    def __init__(self, tracker: ShuttlecockTracker, court_corners, *, model_identity=None):
         self.tracker = tracker
         self.court_corners = [tuple(float(value) for value in point) for point in court_corners]
+        self.model_identity = deepcopy(model_identity) if model_identity else None
 
     def process_frame(self, frame, context: FrameContext):
         detected = self.tracker.detect_ball(frame, roi_corners=self.court_corners)
@@ -210,6 +241,7 @@ class YoloShuttleFrameProcessor:
                 confidence=max(0.0, min(1.0, confidence)),
                 data={
                     "detector": "yolo",
+                    "model_identity": deepcopy(self.model_identity),
                     "measurement": deepcopy(state),
                     "source_frame_index": int(context.source_frame_index),
                     "measurement_bucket": int(context.measurement_bucket),
@@ -273,7 +305,15 @@ class YoloTennisBallFrameProcessor(YoloShuttleFrameProcessor):
         detector_mode: str,
         experimental: bool,
     ):
-        super().__init__(tracker, court_corners)
+        super().__init__(
+            tracker,
+            court_corners,
+            model_identity=_model_identity(
+                model_path,
+                sport_id="tennis",
+                model_kind="ball",
+            ),
+        )
         self.model_path = str(model_path)
         self.ball_kind = str(ball_kind)
         self.detector_mode = str(detector_mode)
@@ -299,6 +339,7 @@ class YoloTennisBallFrameProcessor(YoloShuttleFrameProcessor):
                     "sport_id": "tennis",
                     "ball_kind": self.ball_kind,
                     "detector": "yolo",
+                    "model_identity": deepcopy(self.model_identity),
                     "model_checkpoint": Path(self.model_path).name,
                     "model_required_class": self.tracker.REQUIRED_CLASS_NAME,
                     "detector_mode": self.detector_mode,
@@ -440,6 +481,10 @@ class StreamProcessorFactory:
         ):
             self._tennis_ball_model_spec()
 
+    def _profile_environment(self, suffix: str, default: str) -> str:
+        key = f"{self.vision_profile.model_environment_prefix}_{suffix}"
+        return str(os.environ.get(key) or default).strip()
+
     @staticmethod
     def _tennis_ball_model_spec() -> dict[str, object]:
         """Resolve a declared tennis model or the packaged cross-sport trial.
@@ -552,21 +597,25 @@ class StreamProcessorFactory:
         )
 
         project_root = Path(__file__).resolve().parents[1]
-        pose_path = os.environ.get(
-            "GOOD_BADMINTON_STREAM_POSE_MODEL",
-            str(project_root / "weights" / "yolo11n-pose.pt"),
+        pose_path = self._profile_environment(
+            "POSE_MODEL",
+            str(project_root / "weights" / self.vision_profile.default_pose_checkpoint),
         )
         pose_model = (
             self.pose_model_factory(pose_path)
             if self.pose_model_factory is not None
-            else _load_ultralytics_model(pose_path, "pose")
+            else _load_ultralytics_model(
+                pose_path,
+                f"{self.vision_profile.sport_id}:pose",
+                expected_task="pose",
+            )
         )
         pose = YOLOPoseProcessor(
             model_path=pose_path,
             model=pose_model,
-            conf=float(os.environ.get("GOOD_BADMINTON_STREAM_POSE_CONF", "0.15")),
+            conf=float(self._profile_environment("POSE_CONF", "0.15")),
             imgsz=int(configuration["pose_imgsz"]),
-            device=os.environ.get("GOOD_BADMINTON_STREAM_DEVICE", "auto"),
+            device=self._profile_environment("DEVICE", "auto"),
         )
         far_enabled = bool(calibration.get("far_player_enhancement", False))
         provider = PoseObservationProvider(
@@ -576,7 +625,15 @@ class StreamProcessorFactory:
             asymmetric=far_enabled,
             far_roi=calibration.get("far_roi"),
         )
-        person = PersonOnlyFrameProcessor(tracker, provider)
+        person = PersonOnlyFrameProcessor(
+            tracker,
+            provider,
+            observation_model=_model_identity(
+                pose_path,
+                sport_id=self.vision_profile.sport_id,
+                model_kind="pose",
+            ),
+        )
         # Direct composition tests may omit the manager-owned ID. Real accepted
         # stream sessions always have one; a private factory fallback keeps
         # those tests isolated without changing the production path.
@@ -595,7 +652,11 @@ class StreamProcessorFactory:
                 ball_model = (
                     self.ball_model_factory(ball_path)
                     if self.ball_model_factory is not None
-                    else _load_ultralytics_model(ball_path, "tennis_ball")
+                    else _load_ultralytics_model(
+                        ball_path,
+                        "tennis:ball",
+                        expected_task="detect",
+                    )
                 )
                 tennis_ball = YoloTennisBallFrameProcessor(
                     ball_spec["tracker_class"](ball_model),
@@ -608,18 +669,27 @@ class StreamProcessorFactory:
                 return CompositeMeasurementProcessor(
                     person, tennis_ball, candidate_photos
                 ), None
-            ball_path = os.environ.get(
-                "GOOD_BADMINTON_STREAM_BALL_MODEL",
+            ball_path = self._profile_environment(
+                "BALL_MODEL",
                 str(project_root / "weights" / "yolo11s-ball.pt"),
             )
             ball_model = (
                 self.ball_model_factory(ball_path)
                 if self.ball_model_factory is not None
-                else _load_ultralytics_model(ball_path, "ball")
+                else _load_ultralytics_model(
+                    ball_path,
+                    "badminton:ball",
+                    expected_task="detect",
+                )
             )
             shuttle = YoloShuttleFrameProcessor(
                 ShuttlecockTracker(ball_model, show_trajectory=False),
                 calibration["image_corners"],
+                model_identity=_model_identity(
+                    ball_path,
+                    sport_id="badminton",
+                    model_kind="ball",
+                ),
             )
             return CompositeMeasurementProcessor(person, shuttle, candidate_photos), None
 

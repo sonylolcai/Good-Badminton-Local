@@ -39,6 +39,18 @@ if [[ -n "${GOOD_SPORT_VISION_PROFILE:-}" && "${GOOD_SPORT_VISION_PROFILE}" != "
   exit 64
 fi
 
+SPORT_ENV_PREFIX="GOOD_${SPORT_ID^^}_STREAM"
+POSE_MODEL_VAR="${SPORT_ENV_PREFIX}_POSE_MODEL"
+POSE_MODEL_PATH="${!POSE_MODEL_VAR:-}"
+if [[ -z "$POSE_MODEL_PATH" ]]; then
+  echo "Missing ${POSE_MODEL_VAR}; each sport deployment must declare its own pose weights." >&2
+  exit 64
+fi
+if [[ ! -f "$POSE_MODEL_PATH" ]]; then
+  echo "Configured ${POSE_MODEL_VAR} does not exist: $POSE_MODEL_PATH" >&2
+  exit 64
+fi
+
 # Tennis may run in pose-only mode before any ball checkpoint is available.
 # A session that explicitly enables YOLO performs its own model-path and label
 # check. This lets WebUI operators validate player tracking first, while still

@@ -184,12 +184,6 @@ printf 'GOOD_BADMINTON_API_DATA_DIR=%s\n' "$DATA_DIR" >> "$env_tmp"
 chmod 600 "$env_tmp"
 mv "$env_tmp" "$ENV_FILE"
 
-if [[ "$SPORT_ID" == "tennis" && -f "$SOURCE_DIR/weights/yolo11n-pose.pt" ]]; then
-  # The optional tennis trial package is self-contained for person pose.
-  # Move it into persistent state before replacing APP_DIR.
-  cp -p "$SOURCE_DIR/weights/yolo11n-pose.pt" "$WEIGHTS_DIR/yolo11n-pose.pt"
-  echo "Installed pose checkpoint into persistent weights."
-fi
 if [[ "$SPORT_ID" == "tennis" && -f "$SOURCE_DIR/weights/yolo11s-ball.pt" ]]; then
   # The optional package payload is the existing badminton checkpoint used
   # only by the explicit tennis experimental mode. Move it into persistent
@@ -197,6 +191,14 @@ if [[ "$SPORT_ID" == "tennis" && -f "$SOURCE_DIR/weights/yolo11s-ball.pt" ]]; th
   cp -p "$SOURCE_DIR/weights/yolo11s-ball.pt" "$WEIGHTS_DIR/yolo11s-ball.pt"
   echo "Installed experimental tennis YOLO-ball checkpoint into persistent weights."
 fi
+
+SPORT_ENV_PREFIX="GOOD_${SPORT_ID^^}_STREAM"
+POSE_MODEL_VAR="${SPORT_ENV_PREFIX}_POSE_MODEL"
+POSE_MODEL_PATH="$(sed -n "s/^${POSE_MODEL_VAR}=//p" "$ENV_FILE" | tail -n 1 | tr -d '\r')"
+if [[ -z "$POSE_MODEL_PATH" ]]; then
+  fail "Missing ${POSE_MODEL_VAR} in $ENV_FILE. Upload this sport's pose checkpoint into $WEIGHTS_DIR and configure its absolute path before refresh."
+fi
+[[ -f "$POSE_MODEL_PATH" ]] || fail "Configured ${POSE_MODEL_VAR} does not exist: $POSE_MODEL_PATH"
 
 if [[ "$SPORT_ID" == "badminton" ]]; then
   [[ -f "$WEIGHTS_DIR/yolo11s-ball.pt" ]] || fail \

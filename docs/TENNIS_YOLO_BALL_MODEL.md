@@ -4,6 +4,15 @@ The tennis GPU service can start in pose-only mode. In WebUI, select **only
 person pose** when no ball model is required. Selecting YOLO ball detection
 uses one of the following explicitly separated modes:
 
+The tennis process must also declare its own pose checkpoint. It never reads
+the badminton pose, confidence, or device variables:
+
+```bash
+GOOD_TENNIS_STREAM_POSE_MODEL=/root/good-tennis-gpu-api-state/weights/yolo11s-pose.pt
+GOOD_TENNIS_STREAM_DEVICE=auto
+GOOD_TENNIS_STREAM_POSE_CONF=0.15
+```
+
 1. **Dedicated tennis mode**: configure a dedicated checkpoint only on the
    tennis GPU service:
 
@@ -18,8 +27,9 @@ GOOD_TENNIS_STREAM_BALL_MODEL=/root/good-tennis-gpu-api-state/weights/tennis-bal
 .\deploy\package_gpu_api.ps1 -Sport tennis -IncludeExperimentalTennisBallModel
 ```
 
-It creates `deploy/good-tennis-gpu-api-upload.zip` and places the current Pose
-and experimental ball checkpoints into persistent `weights/` during refresh. The fixed tennis launcher
+It creates `deploy/good-tennis-gpu-api-upload.zip` and places only the
+experimental ball checkpoint into persistent `weights/` during refresh. The tennis Pose checkpoint
+must be provisioned separately. The fixed tennis launcher
 already selects the sport; `GOOD_SPORT_VISION_PROFILE` is optional and must
 only be absent or equal to `tennis`.
 
