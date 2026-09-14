@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from evaluation.streaming import (
+from badminton_analysis.streaming_validation import (
     DEFAULT_STREAMING_SLO,
     compare_stream_benchmark,
     new_benchmark,
@@ -11,7 +11,7 @@ from evaluation.streaming import (
     run_stream_replay,
     validate_trace,
 )
-from evaluation.streaming.baseline import build_gate_report
+from badminton_analysis.streaming_validation.baseline import build_gate_report
 from tests.stream_test_utils import (
     counting_processor_factory,
     segment_metadata,

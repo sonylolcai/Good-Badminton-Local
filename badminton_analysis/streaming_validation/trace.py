@@ -144,3 +144,4 @@ def validate_trace(benchmark) -> List[str]:
     if not isinstance(config, dict) or not config.get("sample_hz") or not config.get("resolution"):
         errors.append("trace.config must include sample_hz and resolution")
     return errors
+

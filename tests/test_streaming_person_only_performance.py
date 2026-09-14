@@ -13,7 +13,7 @@ from pathlib import Path
 
 from badminton_analysis.tracking.person_only import PersonOnlyFrameProcessor, PersonOnlyTracker
 
-from evaluation.streaming import run_stream_replay, validate_trace
+from badminton_analysis.streaming_validation import run_stream_replay, validate_trace
 from tests.stream_test_utils import segment_metadata, write_video_segment_bytes
 
 

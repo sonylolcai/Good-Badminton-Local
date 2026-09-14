@@ -98,8 +98,8 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
         raise RuntimeError("TrackNetV3 源码或权重路径无效；请检查 GPU 服务环境变量。")
 
     project_root = Path(__file__).resolve().parents[1]
-    runner = project_root / "evaluation" / "shuttle_tracknet_ab" / "run_tracknet_v3.py"
-    fast_predictor = project_root / "evaluation" / "shuttle_tracknet_ab" / "fast_predict_tracknet_v3.py"
+    runner = project_root / "badminton_analysis" / "tracknet" / "run_tracknet_v3.py"
+    fast_predictor = project_root / "badminton_analysis" / "tracknet" / "fast_predict_tracknet_v3.py"
     if not runner.is_file() or not fast_predictor.is_file():
         raise RuntimeError("当前部署包缺少 TrackNetV3 主流程工具。")
 

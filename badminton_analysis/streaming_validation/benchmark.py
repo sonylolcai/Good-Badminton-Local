@@ -218,3 +218,4 @@ def run_stream_replay(
     benchmark["errors"] = []
     write_trace(data_dir / "end_to_end_trace.json", benchmark)
     return benchmark, manager
+

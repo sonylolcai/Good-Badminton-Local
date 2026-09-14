@@ -175,3 +175,4 @@ def run_reliability_scenarios(data_dir, processor_factory, raw):
         except Exception as exc:
             results[name] = _result("failed", f"{type(exc).__name__}: {exc}")
     return results
+
