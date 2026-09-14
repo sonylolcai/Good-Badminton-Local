@@ -1579,14 +1579,13 @@ def _movement_metric_summary_rows(metrics):
     return rows
 
 
-def _load_latest_movement_display():
-    """Hydrate the analysis tab from the newest completed local result.
+def _load_business_movement_display(analysis_dir=None):
+    """Hydrate business outputs from an already completed analysis result.
 
-    Restarting the WebUI must not force an operator to upload and analyse the
-    same video again merely to inspect or amend already-generated movement
-    data. This reads only durable local artifacts and never reruns inference.
+    This reads only durable local artifacts and never starts inference.  The
+    independent analysis platform owns creation of new analysis results.
     """
-    run_dir = default_analysis_run("outputs")
+    run_dir = Path(str(analysis_dir)) if analysis_dir else default_analysis_run("outputs")
     if not run_dir:
         return None, [], {"status": "waiting_for_analysis"}, [], None, {
             "status": "waiting_for_analysis",
@@ -1609,6 +1608,10 @@ def _load_latest_movement_display():
             "movement_metrics": str(metrics_path) if metrics_path.is_file() else None,
         },
     )
+
+
+def _load_latest_movement_display():
+    return _load_business_movement_display()
 
 
 def save_body_profiles_and_refresh_metrics(analysis_dir, profile_rows, consent, sport_id="badminton"):
@@ -2936,7 +2939,7 @@ def _start_task_reconciliation_worker():
     threading.Thread(target=worker, name="remote-task-reconciliation", daemon=True).start()
 
 
-def build_ui():
+def _build_legacy_analysis_ui():
     t = _UI_TEXT["zh"]
 
     with gr.Blocks(
@@ -4029,6 +4032,301 @@ def build_ui():
             queue=False,
             show_progress="hidden",
         )
+
+    return demo
+
+
+def build_ui():
+    """Build the business service UI without the extracted analysis workbench."""
+    analysis_url = os.environ.get("GOOD_BADMINTON_ANALYSIS_URL", "http://127.0.0.1:3100")
+    run_choices = _review_run_choices()
+    default_run = default_analysis_run("outputs") or None
+
+    with gr.Blocks(title="Good Badminton — 业务服务") as demo:
+        gr.Markdown(
+            "# Good Badminton 业务服务\n"
+            "场馆、比赛、交付、球员档案和赛后业务结果保留在这里。"
+            f"新建分析、评测和球路复核请进入[数据分析评测平台]({analysis_url})。"
+        )
+        sport_mode = gr.Radio(
+            choices=[("羽毛球", "badminton"), ("网球", "tennis")],
+            value="badminton",
+            label="赛后业务所属运动",
+        )
+
+        with gr.Tabs():
+            render_backoffice_tabs(_ANALYSIS_TASKS)
+
+            with gr.Tab("赛后业务"):
+                gr.Markdown(
+                    "## 已完成分析的业务处理\n"
+                    "这里只读取评测平台或 GPU 已经落地的匿名分析产物，不上传视频、不运行模型。"
+                )
+                with gr.Row():
+                    business_analysis_dir = gr.Dropdown(
+                        choices=run_choices,
+                        value=default_run,
+                        label="已完成分析结果",
+                        scale=4,
+                    )
+                    refresh_business_runs = gr.Button("刷新结果", scale=1)
+                    load_business_run = gr.Button("读取业务结果", variant="primary", scale=1)
+                business_load_status = gr.JSON(
+                    label="业务结果读取状态",
+                    value={"status": "waiting_for_analysis_result"},
+                )
+                movement_metrics_file = gr.File(label="运动数据（按匿名 Track ID）")
+                movement_summary = gr.Dataframe(
+                    headers=[
+                        "track_id", "距离(m)", "平均速度(m/s)", "峰值速度(m/s)",
+                        "有效移动(s)", "高强度(s)", "加速事件", "减速事件",
+                        "敏捷移动（整场/30秒峰值）", "可用覆盖率(%)",
+                        "运动消耗估算(kcal)", "数据质量",
+                    ],
+                    datatype=[
+                        "str", "number", "number", "number", "number", "number",
+                        "number", "number", "str", "number", "str", "str",
+                    ],
+                    interactive=False,
+                    label="赛后运动数据汇总",
+                )
+                movement_detail = gr.JSON(label="完整运动证据")
+
+                with gr.Accordion("身体参数与能量估算", open=False):
+                    gr.Markdown("身高体重是业务侧人工输入，只用于已测移动时段的能量估算，不发送给 GPU。")
+                    body_profile_table = gr.Dataframe(
+                        headers=["track_id", "weight_kg", "height_cm"],
+                        datatype=["str", "number", "number"],
+                        interactive=True,
+                        label="赛后身体参数",
+                    )
+                    body_profile_consent = gr.Checkbox(
+                        label="我同意仅将上述身高体重用于本次赛后能量消耗估算"
+                    )
+                    save_body_profile = gr.Button("保存身体参数并刷新运动数据")
+                    body_profile_status = gr.JSON(label="保存状态")
+                    performance_report = gr.File(label="业务表现报告")
+
+                with gr.Accordion("赛后身份与队伍确认", open=False):
+                    gr.Markdown("身份绑定只写入业务侧人工确认文件，不改原始检测，也不发送给 GPU。")
+                    with gr.Row():
+                        load_identity = gr.Button("读取 Track ID")
+                        save_identity = gr.Button("保存身份/队伍绑定", variant="primary")
+                    identity_table = gr.Dataframe(
+                        headers=[
+                            "track_id", "person_id（可选）", "team_id（team_a/team_b）",
+                            "detected", "predicted", "missing", "distance_m",
+                        ],
+                        datatype=["str", "str", "str", "number", "number", "number", "number"],
+                        interactive=True,
+                        label="业务身份绑定",
+                    )
+                    identity_notice = gr.Markdown("请先选择一条已完成分析结果。")
+
+                with gr.Accordion("AI 宣传视频", open=False):
+                    gr.Markdown("复用已完成分析的标注视频，不触发重复推理。")
+                    promotion_source = gr.File(label="标注视频", file_types=["video"])
+                    promotion_run = gr.Button("生成 AI 宣传视频", variant="primary")
+                    promotion_video = gr.Video(label="AI 宣传视频")
+                    promotion_timeline = gr.File(label="宣传视频时间轴与点评证据")
+                    promotion_status = gr.JSON(label="宣传视频状态")
+                    promotion_enabled = gr.State(value=True)
+
+            with gr.Tab("教练档案"):
+                gr.Markdown(
+                    "## 球员专属 AI 教练档案与纵向跟进\n"
+                    "档案由教练人工维护；纵向反馈消费已完成的匿名分析产物和业务侧身份绑定。"
+                )
+                with gr.Row():
+                    coach_person_id = gr.Textbox(label="学员固定 person_id", scale=3)
+                    coach_profile_load = gr.Button("读取档案", scale=1)
+                    coach_profile_save = gr.Button("保存教练档案", scale=1)
+                with gr.Row():
+                    coach_display_name = gr.Textbox(label="学员称呼（可选）")
+                    coach_dominant_hand = gr.Dropdown(
+                        choices=[("未评估", "unknown"), ("右手", "right"), ("左手", "left")],
+                        value="unknown",
+                        label="持拍手",
+                    )
+                    coach_primary_event = gr.Dropdown(
+                        choices=[("未评估", "unknown"), ("单打", "singles"), ("双打", "doubles"), ("混双", "mixed")],
+                        value="unknown",
+                        label="主要项目",
+                    )
+                    coach_training_stage = gr.Dropdown(
+                        choices=[
+                            ("初始评估", "assessment"),
+                            ("技术基础", "technique_foundation"),
+                            ("专项强化", "targeted_strengthening"),
+                            ("赛前准备", "pre_competition"),
+                            ("维持调整", "maintenance"),
+                        ],
+                        value="assessment",
+                        label="当前训练阶段",
+                    )
+                gr.Markdown("#### 教练主观技术评分（1–5；0 = 暂未评估）")
+                with gr.Row():
+                    coach_serve_receive = gr.Slider(0, 5, value=0, step=1, label="发接发")
+                    coach_net_control = gr.Slider(0, 5, value=0, step=1, label="网前控制")
+                    coach_rear_court_attack = gr.Slider(0, 5, value=0, step=1, label="后场进攻")
+                    coach_defensive_stability = gr.Slider(0, 5, value=0, step=1, label="防守稳定性")
+                    coach_shot_consistency = gr.Slider(0, 5, value=0, step=1, label="击球一致性")
+                gr.Markdown("#### 教练主观战术评分（1–5；0 = 暂未评估）")
+                with gr.Row():
+                    coach_shot_selection = gr.Slider(0, 5, value=0, step=1, label="球路选择")
+                    coach_court_awareness = gr.Slider(0, 5, value=0, step=1, label="场地意识")
+                    coach_pressure_building = gr.Slider(0, 5, value=0, step=1, label="施压组织")
+                    coach_adaptation = gr.Slider(0, 5, value=0, step=1, label="临场调整")
+                with gr.Row():
+                    coach_strengths = gr.Textbox(label="教练已确认优势", lines=3)
+                    coach_development_priorities = gr.Textbox(label="当前培养重点", lines=3)
+                coach_current_training_goal = gr.Textbox(label="当前训练目标", lines=2)
+                coach_training_progress_notes = gr.Textbox(label="近期训练进度 / 教练备注", lines=3)
+                coach_play_style_notes = gr.Textbox(label="当前打法 / 已确认的调整方向", lines=2)
+                coach_match_notes = gr.Textbox(label="本场表现与对手情况（可选，教练录入）", lines=3)
+                coach_profile_status = gr.JSON(label="球员教练档案状态")
+                coach_followup = gr.Button("保存档案并更新本场纵向跟进", variant="primary")
+                coach_followup_file = gr.File(label="AI 教练纵向反馈")
+                coach_followup_status = gr.JSON(label="本场 AI 教练跟进结果")
+
+            with gr.Tab("业务任务历史") as business_history_tab:
+                gr.Markdown("## 业务任务历史\n读取业务任务账本并对账已受理的远端 Job；不会重复提交视频。")
+                initial_task_choices = _task_history_choices()
+                initial_task_id = initial_task_choices[0][1] if initial_task_choices else None
+                with gr.Row():
+                    refresh_task_history = gr.Button("刷新并对账远端", variant="primary")
+                    task_history_selector = gr.Dropdown(
+                        choices=initial_task_choices,
+                        value=initial_task_id,
+                        label="查看任务详情",
+                    )
+                task_history_notice = gr.Markdown("尚未执行远端对账。")
+                task_history_table = gr.Dataframe(
+                    value=_task_history_rows(),
+                    headers=[
+                        "业务任务", "发起时间", "当前状态", "远端 Job", "最后进度",
+                        "最后阶段", "本地结果", "错误摘要",
+                    ],
+                    datatype=["str"] * 8,
+                    interactive=False,
+                    label="业务任务",
+                )
+                task_history_detail = gr.JSON(
+                    value=_task_history_detail(initial_task_id),
+                    label="业务任务详情与事件",
+                )
+
+        console_open_state = gr.State(value=False)
+        console_trigger = gr.Button("打开业务服务后台输出", size="sm")
+        with gr.Column(visible=False) as console_panel:
+            console_close = gr.Button("关闭", size="sm")
+            console_output = gr.Textbox(
+                value=get_backend_logs(), lines=22, max_lines=22,
+                show_label=False, interactive=False, autoscroll=True,
+            )
+        console_timer = gr.Timer(value=1.0, active=True)
+
+        load_outputs = [
+            movement_metrics_file, movement_summary, movement_detail,
+            body_profile_table, business_analysis_dir, business_load_status,
+        ]
+        refresh_business_runs.click(
+            _review_refresh_runs,
+            business_analysis_dir,
+            business_analysis_dir,
+            show_progress="hidden",
+        )
+        load_business_run.click(
+            _load_business_movement_display,
+            business_analysis_dir,
+            load_outputs,
+            show_progress="hidden",
+        )
+        demo.load(_load_latest_movement_display, outputs=load_outputs, show_progress="hidden")
+        save_body_profile.click(
+            save_body_profiles_and_refresh_metrics,
+            [business_analysis_dir, body_profile_table, body_profile_consent, sport_mode],
+            [movement_metrics_file, movement_summary, movement_detail, body_profile_table, performance_report, body_profile_status],
+        )
+        load_identity.click(
+            _match_identity_table,
+            business_analysis_dir,
+            [identity_table, identity_notice],
+            show_progress="hidden",
+        )
+        save_identity.click(
+            _save_match_identity_table,
+            [business_analysis_dir, identity_table],
+            identity_notice,
+        )
+        promotion_run.click(
+            generate_promotion_video_for_webui,
+            [promotion_enabled, business_analysis_dir, promotion_source, sport_mode],
+            [promotion_video, promotion_timeline, promotion_status],
+        )
+
+        coach_form_inputs = [
+            coach_display_name, coach_dominant_hand, coach_primary_event, coach_training_stage,
+            coach_serve_receive, coach_net_control, coach_rear_court_attack,
+            coach_defensive_stability, coach_shot_consistency, coach_shot_selection,
+            coach_court_awareness, coach_pressure_building, coach_adaptation,
+            coach_strengths, coach_development_priorities, coach_current_training_goal,
+            coach_training_progress_notes, coach_play_style_notes,
+        ]
+        coach_form_outputs = [*coach_form_inputs, coach_profile_status]
+        coach_profile_load.click(
+            load_coach_athlete_profile,
+            [coach_person_id, sport_mode],
+            coach_form_outputs,
+            show_progress="hidden",
+        )
+        coach_profile_save.click(
+            save_coach_athlete_profile,
+            [coach_person_id, sport_mode, *coach_form_inputs],
+            coach_profile_status,
+            show_progress="hidden",
+        )
+        coach_followup.click(
+            save_coach_athlete_profile,
+            [coach_person_id, sport_mode, *coach_form_inputs],
+            coach_profile_status,
+            show_progress="hidden",
+        ).then(
+            generate_longitudinal_coach_followup,
+            [business_analysis_dir, coach_person_id, sport_mode, coach_match_notes],
+            [coach_followup_file, coach_followup_status],
+        )
+
+        refresh_task_history.click(
+            _task_history_refresh,
+            task_history_selector,
+            [task_history_table, task_history_selector, task_history_detail, task_history_notice],
+            show_progress="hidden",
+        )
+        business_history_tab.select(
+            _task_history_refresh,
+            task_history_selector,
+            [task_history_table, task_history_selector, task_history_detail, task_history_notice],
+            show_progress="hidden",
+        )
+        task_history_selector.change(
+            _task_history_select,
+            task_history_selector,
+            task_history_detail,
+            show_progress="hidden",
+        )
+        console_trigger.click(
+            toggle_backend_console,
+            console_open_state,
+            [console_open_state, console_panel, console_output],
+            show_progress="hidden",
+        )
+        console_close.click(
+            close_backend_console,
+            outputs=[console_open_state, console_panel],
+            show_progress="hidden",
+        )
+        console_timer.tick(get_backend_logs, outputs=console_output, show_progress="hidden")
 
     return demo
 

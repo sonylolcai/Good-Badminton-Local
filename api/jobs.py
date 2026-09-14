@@ -282,7 +282,7 @@ class AnalysisJobManager:
         try:
             # Lazy import keeps /health inexpensive and avoids model imports
             # before the worker actually receives a GPU task.
-            from webui.pipeline import run_analysis
+            from analysis_platform.runner import run_analysis
 
             result = run_analysis(
                 video_path,

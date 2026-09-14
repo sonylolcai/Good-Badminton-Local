@@ -1,0 +1,21 @@
+{
+  "schema_version": "analysis-boundary.v1",
+  "contract_type": "analysis_task",
+  "run_id": "run_invalid_001",
+  "case_id": "case_demo_mp4",
+  "dataset_version": "smoke-v1.0.0",
+  "code_fingerprint": "git:7dbc65031a33871839c3dd74429d274e25908eb3",
+  "model_fingerprint": "869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0",
+  "parameters_fingerprint": "0890427ea634b2164db034d3a77aca3eb1fd6e2b569ce0581580e01f9e9566e7",
+  "input_sha256": "b60cc98c5c5066e31eed777c6cf92bc2d4899d210a5f7285d7358ee7c63d7b26",
+  "input_path": "videos/demo.mp4",
+  "parameters": {
+    "sport_id": "badminton",
+    "analysis_sample_hz": 10,
+    "pose_imgsz": 960,
+    "shuttle_detector": "yolo",
+    "tracker_backend": "bytetrack",
+    "generate_annotated_video": true,
+    "person_id": "user_123"
+  }
+}

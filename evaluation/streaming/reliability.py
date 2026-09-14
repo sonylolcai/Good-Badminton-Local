@@ -17,6 +17,9 @@ from api.stream_errors import StreamSessionError
 from api.stream_sessions import StreamSessionManager
 
 
+COURT_CORNERS = [[0.0, 0.0], [1280.0, 0.0], [1280.0, 720.0], [0.0, 720.0]]
+
+
 def _segment_metadata(index, raw, source_start):
     return {
         "schema_version": "stream-session.v1",
@@ -27,6 +30,7 @@ def _segment_metadata(index, raw, source_start):
         "idempotency_key": f"reliability-segment-{index:03d}",
         "content_type": "video/mp4",
         "content_length_bytes": len(raw),
+        "court_corners": COURT_CORNERS,
     }
 
 
@@ -35,6 +39,7 @@ def _create_request():
         "schema_version": "stream-session.v1",
         "camera_id": "reliability-camera",
         "calibration_id": "reliability-calibration",
+        "court_corners": COURT_CORNERS,
         "analysis_mode": "person_only",
         "configuration": {
             "analysis_sample_hz": 10,

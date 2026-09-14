@@ -1,0 +1,71 @@
+{
+  "far_player": {
+    "status": "complete",
+    "methods": {
+      "full_640": {
+        "metrics": {
+          "far_player_ground_truth_count": 20,
+          "far_player_recall": 0.8,
+          "longest_consecutive_miss_seconds": 0.4,
+          "false_positive_count": 2
+        },
+        "timing": {"evaluated_frame_count": 12}
+      }
+    }
+  },
+  "doubles": {
+    "metrics": {
+      "ground_truth_player_observations": 40,
+      "player_recall": 0.9,
+      "id_switches": 2,
+      "longest_track_interruption_frames": 3,
+      "occlusion_recovery_opportunities": 4,
+      "occlusion_recovery_rate": 0.75,
+      "hit_attribution_ground_truth_count": 5,
+      "hit_attribution_accuracy": 0.8
+    }
+  },
+  "shuttle_tracknet_ab": {
+    "status": "complete_human_reviewed_ab_benchmark",
+    "methods": {
+      "a_current_yolo": {
+        "visible_ground_truth_count": 20,
+        "true_positive_count": 10,
+        "raw_detection_recall": 0.5,
+        "not_visible_ground_truth_count": 10,
+        "false_positive_rate": 0.1,
+        "median_localization_error_px": 4.0,
+        "longest_consecutive_raw_miss_seconds": 0.3,
+        "inferred_points_on_visible_ground_truth": 0
+      },
+      "b_tracknet_v3_raw": {
+        "visible_ground_truth_count": 20,
+        "true_positive_count": 16,
+        "raw_detection_recall": 0.8,
+        "not_visible_ground_truth_count": 10,
+        "false_positive_rate": 0.2,
+        "median_localization_error_px": 3.0,
+        "longest_consecutive_raw_miss_seconds": 0.1,
+        "inferred_points_on_visible_ground_truth": 0
+      },
+      "b_star_tracknet_v3_rectified": {
+        "visible_ground_truth_count": 20,
+        "true_positive_count": 16,
+        "raw_detection_recall": 0.8,
+        "not_visible_ground_truth_count": 10,
+        "false_positive_rate": 0.2,
+        "median_localization_error_px": 3.0,
+        "longest_consecutive_raw_miss_seconds": 0.1,
+        "inferred_points_on_visible_ground_truth": 3
+      }
+    }
+  },
+  "performance_streaming": {
+    "status": "PASS",
+    "checks": [
+      {"name": "segment.p95_seconds", "status": "PASS", "actual": 1.2},
+      {"name": "queue.backlog_seconds_at_video_end", "status": "PASS", "actual": 30.0},
+      {"name": "llm.request_count", "status": "PASS", "actual": 1}
+    ]
+  }
+}
