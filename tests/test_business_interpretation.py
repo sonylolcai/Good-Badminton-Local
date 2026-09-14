@@ -11,18 +11,10 @@ from business_gateway.post_match import generate_business_interpretation
 
 
 class BusinessInterpretationTests(unittest.TestCase):
-    def test_legacy_public_imports_delegate_to_the_same_business_implementation(self):
-        from badminton_analysis.analysis.movement_metrics import (
-            generate_movement_metrics as legacy_movement,
-        )
-        from badminton_analysis.analysis.performance_report import (
-            generate_performance_report as legacy_report,
-        )
-        from business_gateway.metrics.movement import generate_movement_metrics
-        from business_gateway.report.performance import generate_performance_report
-
-        self.assertIs(legacy_movement, generate_movement_metrics)
-        self.assertIs(legacy_report, generate_performance_report)
+    def test_business_interpretation_is_not_part_of_the_gpu_package(self):
+        analysis_dir = Path(__file__).parents[1] / "badminton_analysis" / "analysis"
+        self.assertFalse((analysis_dir / "movement_metrics.py").exists())
+        self.assertFalse((analysis_dir / "performance_report.py").exists())
 
     def test_three_analysis_artifacts_are_sufficient_and_refresh_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
