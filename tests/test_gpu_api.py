@@ -47,6 +47,15 @@ class GpuApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_court_detection_rejects_non_video_uploads(self):
+        response = self.client.post(
+            "/api/v1/court/detect",
+            headers={"X-API-Key": "test-api-key"},
+            files={"video": ("notes.txt", b"not a video", "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 422)
+
     def test_valid_upload_creates_a_queued_job_with_stable_status_url(self):
         response = self.client.post(
             "/api/v1/jobs",

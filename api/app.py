@@ -75,6 +75,12 @@ def create_app(
         health_payload=stream_health_payload,
     )
 
+    @app.post("/api/v1/court/detect", dependencies=[Depends(require_api_key)])
+    async def detect_court(video: UploadFile = File(...)):
+        if Path(video.filename or "").suffix.lower() not in VIDEO_EXTENSIONS:
+            raise HTTPException(status_code=422, detail="video has an unsupported file extension")
+        raise HTTPException(status_code=501, detail="Court detection is not available yet")
+
     @app.post("/api/v1/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_api_key)])
     async def create_job(
         video: UploadFile = File(...),
