@@ -56,6 +56,27 @@ class GpuApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_court_detection_returns_detected_corners_for_a_video(self):
+        self.app.state.court_detector = lambda _path: {
+            "corners": [[10, 20], [30, 20], [30, 40], [10, 40]],
+            "preview_bgr": None,
+        }
+
+        response = self.client.post(
+            "/api/v1/court/detect",
+            headers={"X-API-Key": "test-api-key"},
+            files={"video": ("match.mp4", b"video-bytes", "video/mp4")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "corners": [[10, 20], [30, 20], [30, 40], [10, 40]],
+                "preview_data_url": None,
+            },
+        )
+
     def test_valid_upload_creates_a_queued_job_with_stable_status_url(self):
         response = self.client.post(
             "/api/v1/jobs",

@@ -1,7 +1,7 @@
-"""Compatibility alias for the analysis runner moved out of the WebUI."""
+"""Compatibility alias for the GPU-owned analysis pipeline."""
 
 import sys
 
-from analysis_platform import runner as _implementation
+from badminton_analysis import pipeline as _implementation
 
 sys.modules[__name__] = _implementation

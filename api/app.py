@@ -1,9 +1,11 @@
 """HTTP boundary for the GPU-only Good-Badminton analysis service."""
 
+import base64
 import json
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +50,13 @@ def create_app(
     app.state.stream_manager = stream_manager
     app.state.vision_profile = vision_profile
 
+    def default_court_detector(path):
+        from badminton_analysis.pipeline import prepare_court_from_video
+
+        return prepare_court_from_video(path)
+
+    app.state.court_detector = default_court_detector
+
     def require_api_key(x_api_key: Optional[str] = Header(default=None)):
         expected = os.environ.get("GOOD_BADMINTON_API_KEY")
         if not expected:
@@ -79,7 +88,17 @@ def create_app(
     async def detect_court(video: UploadFile = File(...)):
         if Path(video.filename or "").suffix.lower() not in VIDEO_EXTENSIONS:
             raise HTTPException(status_code=422, detail="video has an unsupported file extension")
-        raise HTTPException(status_code=501, detail="Court detection is not available yet")
+        with tempfile.TemporaryDirectory(prefix="gpu-court-") as temporary:
+            source = await _save_upload(video, Path(temporary), VIDEO_EXTENSIONS, "video")
+            result = app.state.court_detector(str(source))
+        preview_data_url = None
+        if result.get("preview_bgr") is not None:
+            import cv2
+
+            encoded, data = cv2.imencode(".jpg", result["preview_bgr"])
+            if encoded:
+                preview_data_url = "data:image/jpeg;base64," + base64.b64encode(data.tobytes()).decode("ascii")
+        return {"corners": result.get("corners") or [], "preview_data_url": preview_data_url}
 
     @app.post("/api/v1/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_api_key)])
     async def create_job(
