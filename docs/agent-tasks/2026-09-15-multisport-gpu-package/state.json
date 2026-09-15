@@ -1,0 +1,27 @@
+{
+  "schema_version": "long-task.v1",
+  "task_id": "2026-09-15-multisport-gpu-package",
+  "status": "awaiting_plan_approval",
+  "repositories": [
+    {
+      "path": "S:/Code Base/MiniProgram/bdTeach/Good-Badminton",
+      "baseline_commit": "fd305b36f8ad6d7f562744a613970c0497192fae",
+      "branch": "feat/tennis-gpu-modes"
+    },
+    {
+      "path": "S:/Code Base/MiniProgram/bdTeach/Good-Badminton-Evaluation-Platform",
+      "baseline_commit": "a6213d066b21db6e7c81829f74810e90ee45f1f0",
+      "branch": "feat/evaluation-backend-separation"
+    }
+  ],
+  "approvals": {"plan": null, "tests": null},
+  "current_task": "plan_approval",
+  "commits": [],
+  "checks": [
+    {
+      "scope": "GPU and business baseline",
+      "result": "tests.test_gpu_api, test_gpu_code_boundary, test_gpu_pure_launchers, test_gpu_sport_profiles and test_remote_gpu: 47 tests passed"
+    }
+  ],
+  "updated_at": "2026-09-15T16:45:00+08:00"
+}

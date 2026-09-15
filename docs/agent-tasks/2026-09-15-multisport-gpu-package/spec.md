@@ -1,0 +1,47 @@
+# 多运动 GPU 单包
+
+## 来源与目标
+
+来源：用户确认 GPU 服务应只有一个部署包；业务服务或评测后端通过请求中的 `sport_id` 选择羽毛球或网球视觉配置，并要求开始打包。
+
+目标：交付一个可上传到既有 GPU 主机的源码 ZIP。单一 GPU 进程同时保留完整视频 `/api/v1/jobs` 与 2 秒分片 `/api/v1/stream-sessions`，按每个任务或会话持久化的 `sport_id` 选择既有羽毛球或网球 profile。
+
+## 已确认事实
+
+- 现有 `deploy/package_gpu_api.ps1` 仍按 `-Sport` 生成两个固定运动 ZIP，且引用已删除的 `deploy/run_performance_gate.sh` 与 `evaluation/` 路径，当前不再是可靠打包入口。
+- 现有 GPU 入口 `apps.badminton_gpu.app:app` / `apps.tennis_gpu.app:app` 在进程启动时固定 profile；`webui.remote_gpu.verify_remote_gpu_sport` 与评测后端 `GpuClient.verify` 也要求 health 返回单个 `sport_id`。
+- `api.app` 已提供完整视频上传、状态、取消和产物下载；它也已注册分片会话路由。`api.gpu_stream_app` 只有分片接口，不能满足完整视频接口要求。
+- 当前基线：47 项相关 GPU/业务测试通过；当前 GPU 服务未在本任务中部署或启动。
+
+## 范围
+
+- 一个 GPU HTTP 进程，health 声明 `supported_sport_ids=["badminton", "tennis"]`。
+- 业务服务与评测后端各自仍只通过自己的后端访问 GPU；浏览器不获取 GPU 地址或密钥。
+- 请求/会话中的 `sport_id` 决定 session mode、场地坐标、人数约束和球检测器白名单；推导后的配置随会话持久化。
+- 完整视频任务与 2 秒流式任务都保留上传、状态、取消及产物接口。
+- 生成一个白名单 ZIP：不含评测代码、业务代码、WebUI、测试、模型权重、数据、产物、虚拟环境或密钥。
+
+## 非范围
+
+- 不训练或替换羽毛球、网球模型，不修改权重或宣布球检测精度。
+- 不部署、上传 ZIP、重启远端 GPU、迁移远端状态，或修改生产/业务数据库。
+- 不增加 Docker 镜像。现有 GPU 主机以源码 ZIP、已安装 CUDA Python 运行时和持久化权重目录为部署边界。
+- 不修改浏览器到后端的网络边界，不增加业务功能或评测功能。
+
+## 兼容与安全承诺
+
+- 旧的 `GOOD_BADMINTON_GPU_API_*` 与 `GOOD_TENNIS_GPU_API_*` 服务端配置可继续作为回退；新增单一地址配置优先用于共享实例。
+- 未显式携带 `sport_id` 的旧羽毛球请求继续按 `badminton` 处理；更新后的业务/评测调用一律显式传值。
+- 旧固定运动部署不被本任务自动删除。新单包切换仅在后续、单独授权的 GPU 部署中进行。
+- `sport_id` 只表示匿名视觉 profile，不携带用户、参赛人、比分或评测决策。
+
+## 验收条件
+
+| ID | 条件 |
+|---|---|
+| AC-01 | 一个 API 进程 health 返回两种受支持运动，且无单一固定运动身份歧义。 |
+| AC-02 | 羽毛球与网球流会话均由请求 `sport_id` 得到各自 profile 派生配置；不支持的运动、模式或人数在持久化前返回 422。 |
+| AC-03 | 完整视频与流式接口均保留认证、创建、状态、取消和产物读取契约；完整视频任务可持久化 `sport_id`。 |
+| AC-04 | 业务服务和评测后端接受共享 health 中的目标运动，并继续在不支持时拒绝提交。 |
+| AC-05 | 生成一个 Linux 可解压 ZIP，启动入口为多运动 `api.app:app`，且 ZIP 不含评测、业务、WebUI、测试、权重、数据或密钥。 |
+| AC-06 | 不部署远端 GPU；提交物可由现有刷新脚本在后续受控部署中使用。 |
