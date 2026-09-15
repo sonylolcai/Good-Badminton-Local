@@ -1,6 +1,10 @@
 # 实施计划
 
-## 当前与目标流
+## 唯一交付决策
+
+本任务只生成 `good-badminton-gpu-api-upload.zip`：它同时包含羽毛球和网球的运行代码，由每个请求携带的 `sport_id` 选择既有视觉 profile。不会生成、交付或部署任何按运动拆分的 ZIP。
+
+## 待替换现状与目标流
 
 ```text
 当前：调用方 -> 固定羽毛球或网球 GPU URL -> 固定 profile 进程
@@ -17,7 +21,7 @@ GPU 仍只产出匿名视觉观测、状态、性能追踪及文件产物；评�
 | `api/stream_runtime.py`、`api/mode_sync.py` | 修改 | 按请求解析 profile，持久化派生配置，构建正确的运行时。 | MGP-01 |
 | `api/gpu_stream_app.py`、`apps/badminton_gpu/app.py`、`apps/tennis_gpu/app.py` | 删除 | 去除与单包目标冲突的固定入口。 | MGP-01 |
 | `webui/remote_gpu.py` | 修改 | 共享地址/密钥优先，health 检查目标是否在支持列表，羽毛球也显式传 `sport_id`。 | MGP-02 |
-| `deploy/package_gpu_api.ps1` | 修改 | 仅打入 GPU 运行时白名单，输出单一 ZIP，不再引用删除的评测文件。 | MGP-03 |
+| `deploy/package_gpu_api.ps1` | 修改 | 仅打入 GPU 运行时白名单，输出唯一的多运动 ZIP，不再引用删除的评测文件。 | MGP-03 |
 | `deploy/refresh_gpu_api_from_zip.sh`、`deploy/start_gpu_api_container.sh`、`deploy/install_gpu_api.sh`、`deploy/good-badminton-gpu-api.service` | 修改 | 启动/刷新唯一 `api.app:app`，保留持久化密钥、权重与任务状态。 | MGP-03 |
 | `deploy/start_sport_gpu_container.sh`、`deploy/start_badminton_gpu_container.sh`、`deploy/start_tennis_gpu_container.sh` | 删除 | 移除固定入口部署歧义。 | MGP-03 |
 | `tests/test_gpu_pure_launchers.py`、`tests/test_gpu_sport_profiles.py`、`tests/test_remote_gpu.py` | 修改 | 将固定进程断言替换为多运动会话和共享 health 断言。 | MGP-01, MGP-02 |

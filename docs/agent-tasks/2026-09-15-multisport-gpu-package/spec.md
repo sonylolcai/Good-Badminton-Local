@@ -1,14 +1,16 @@
 # 多运动 GPU 单包
 
+> **唯一交付决策：** 本任务最终只产生一个同时支持羽毛球和网球的 GPU 源码 ZIP，以及一个多运动 API 进程。下文提及的“两个固定运动 ZIP / 入口”仅是需要替换的旧仓库现状，不是本次交付物，也不应继续打包。
+
 ## 来源与目标
 
 来源：用户确认 GPU 服务应只有一个部署包；业务服务或评测后端通过请求中的 `sport_id` 选择羽毛球或网球视觉配置，并要求开始打包。
 
 目标：交付一个可上传到既有 GPU 主机的源码 ZIP。单一 GPU 进程同时保留完整视频 `/api/v1/jobs` 与 2 秒分片 `/api/v1/stream-sessions`，按每个任务或会话持久化的 `sport_id` 选择既有羽毛球或网球 profile。
 
-## 已确认事实
+## 待替换的旧实现与已确认事实
 
-- 现有 `deploy/package_gpu_api.ps1` 仍按 `-Sport` 生成两个固定运动 ZIP，且引用已删除的 `deploy/run_performance_gate.sh` 与 `evaluation/` 路径，当前不再是可靠打包入口。
+- **待替换旧实现：** `deploy/package_gpu_api.ps1` 仍按 `-Sport` 生成两个固定运动 ZIP，且引用已删除的 `deploy/run_performance_gate.sh` 与 `evaluation/` 路径；本任务不会沿用这些 ZIP，而是将其替换为唯一的多运动打包入口。
 - 现有 GPU 入口 `apps.badminton_gpu.app:app` / `apps.tennis_gpu.app:app` 在进程启动时固定 profile；`webui.remote_gpu.verify_remote_gpu_sport` 与评测后端 `GpuClient.verify` 也要求 health 返回单个 `sport_id`。
 - `api.app` 已提供完整视频上传、状态、取消和产物下载；它也已注册分片会话路由。`api.gpu_stream_app` 只有分片接口，不能满足完整视频接口要求。
 - 当前基线：47 项相关 GPU/业务测试通过；当前 GPU 服务未在本任务中部署或启动。
