@@ -1,7 +1,7 @@
 {
   "schema_version": "long-task.v1",
   "task_id": "2026-09-15-multisport-gpu-package",
-  "status": "awaiting_plan_approval",
+  "status": "awaiting_test_approval",
   "repositories": [
     {
       "path": "S:/Code Base/MiniProgram/bdTeach/Good-Badminton",
@@ -14,14 +14,22 @@
       "branch": "feat/evaluation-backend-separation"
     }
   ],
-  "approvals": {"plan": null, "tests": null},
-  "current_task": "plan_approval",
+  "approvals": {"plan": {"approved_at": "2026-09-15T16:24:44+08:00", "user_wording": "确认"}, "tests": null},
+  "current_task": "test_approval",
   "commits": [],
   "checks": [
     {
       "scope": "GPU and business baseline",
       "result": "tests.test_gpu_api, test_gpu_code_boundary, test_gpu_pure_launchers, test_gpu_sport_profiles and test_remote_gpu: 47 tests passed"
+    },
+    {
+      "scope": "GPU multi-sport RED",
+      "result": "2026-09-15: .venv\\Scripts\\python.exe -m unittest tests.test_gpu_api tests.test_gpu_sport_profiles tests.test_gpu_pure_launchers tests.test_remote_gpu tests.test_gpu_package -v => 49 run, 9 failures, 3 errors. Failures prove missing shared health/profile dispatch, job sport persistence, shared caller config, fixed launchers and stale two-package script."
+    },
+    {
+      "scope": "Evaluation client RED",
+      "result": "2026-09-15: backend\\.venv\\Scripts\\python.exe -m unittest tests.test_gpu_client -v => 3 run, 1 error: shared supported_sport_ids health is rejected as an identity mismatch."
     }
   ],
-  "updated_at": "2026-09-15T16:45:00+08:00"
+  "updated_at": "2026-09-15T16:24:44+08:00"
 }
