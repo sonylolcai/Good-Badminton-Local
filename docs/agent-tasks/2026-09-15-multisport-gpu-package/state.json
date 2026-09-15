@@ -1,7 +1,7 @@
 {
   "schema_version": "long-task.v1",
   "task_id": "2026-09-15-multisport-gpu-package",
-  "status": "awaiting_test_approval",
+  "status": "implementing",
   "repositories": [
     {
       "path": "S:/Code Base/MiniProgram/bdTeach/Good-Badminton",
@@ -14,9 +14,15 @@
       "branch": "feat/evaluation-backend-separation"
     }
   ],
-  "approvals": {"plan": {"approved_at": "2026-09-15T16:24:44+08:00", "user_wording": "确认"}, "tests": null},
-  "current_task": "test_approval",
-  "commits": [],
+  "approvals": {"plan": {"approved_at": "2026-09-15T16:24:44+08:00", "user_wording": "确认"}, "tests": {"approved_at": "2026-09-15T16:52:20+08:00", "user_wording": "批准"}},
+  "current_task": "MGP-02",
+  "commits": [
+    {
+      "task": "MGP-01",
+      "hash": "a87addd",
+      "subject": "feat(gpu): resolve sport profile per request"
+    }
+  ],
   "checks": [
     {
       "scope": "GPU and business baseline",
@@ -29,7 +35,11 @@
     {
       "scope": "Evaluation client RED",
       "result": "2026-09-15: backend\\.venv\\Scripts\\python.exe -m unittest tests.test_gpu_client -v => 3 run, 1 error: shared supported_sport_ids health is rejected as an identity mismatch."
+    },
+    {
+      "scope": "MGP-01 targeted verification",
+      "result": "2026-09-15: .venv\\Scripts\\python.exe -m unittest tests.test_gpu_api tests.test_gpu_sport_profiles tests.test_gpu_pure_launchers tests.test_gpu_code_boundary -v => 32 passed."
     }
   ],
-  "updated_at": "2026-09-15T16:24:44+08:00"
+  "updated_at": "2026-09-15T16:52:20+08:00"
 }
