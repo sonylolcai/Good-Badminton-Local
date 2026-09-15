@@ -43,9 +43,12 @@ def _normalize_sport_id(sport_id):
 
 
 def configured_gpu_base_url(sport_id="badminton"):
-    """Return the configured fixed-sport URL without performing network I/O."""
+    """Return the shared GPU URL, with fixed-sport settings as a fallback."""
     _load_local_config_file()
     sport_id = _normalize_sport_id(sport_id)
+    shared = os.environ.get("GOOD_GPU_API_URL", "").strip()
+    if shared:
+        return shared
     configured = os.environ.get(f"GOOD_{sport_id.upper()}_GPU_API_URL", "").strip()
     if configured:
         return configured
@@ -79,8 +82,10 @@ def remote_gpu_config(base_url_override=None, *, sport_id="badminton", local_cpu
         )
     )
     if not configured_base_url:
-        env_name = f"GOOD_{sport_id.upper()}_GPU_API_URL"
-        raise RemoteAnalysisError(f"请在 WebUI 服务器配置 {env_name}，或在页面填写 {sport_id} GPU 服务地址")
+        raise RemoteAnalysisError(
+            "请在 WebUI 服务器配置 GOOD_GPU_API_URL（推荐），"
+            f"或保留兼容的 GOOD_{sport_id.upper()}_GPU_API_URL。"
+        )
     parsed = urlparse(configured_base_url)
     if (
         parsed.scheme not in {"http", "https"}
@@ -93,29 +98,36 @@ def remote_gpu_config(base_url_override=None, *, sport_id="badminton", local_cpu
         raise RemoteAnalysisError("GPU 服务地址必须是无账号、无查询参数的 http(s) 基础地址")
     return {
         "base_url": configured_base_url.rstrip("/"),
-        # Separate service credentials are preferred. The old badminton key is
-        # a compatibility fallback only, useful while both test services share
-        # one reverse-proxy credential.
+        # A shared GPU credential is preferred. The old sport-specific keys
+        # remain a server-side compatibility fallback during rollout.
         "api_key": (
             (
                 os.environ.get("GOOD_LOCAL_CPU_GPU_API_KEY", "")
+                or os.environ.get("GOOD_GPU_API_KEY", "")
                 or os.environ.get("GOOD_BADMINTON_GPU_API_KEY", "")
             )
             if local_cpu else (
-                os.environ.get(f"GOOD_{sport_id.upper()}_GPU_API_KEY", "")
+                os.environ.get("GOOD_GPU_API_KEY", "")
+                or os.environ.get(f"GOOD_{sport_id.upper()}_GPU_API_KEY", "")
                 or os.environ.get("GOOD_BADMINTON_GPU_API_KEY", "")
             )
         ),
         "timeout_seconds": float(
             os.environ.get(
-                f"GOOD_{sport_id.upper()}_GPU_API_TIMEOUT",
-                os.environ.get("GOOD_BADMINTON_GPU_API_TIMEOUT", "30"),
+                "GOOD_GPU_API_TIMEOUT",
+                os.environ.get(
+                    f"GOOD_{sport_id.upper()}_GPU_API_TIMEOUT",
+                    os.environ.get("GOOD_BADMINTON_GPU_API_TIMEOUT", "30"),
+                ),
             )
         ),
         "poll_seconds": float(
             os.environ.get(
-                f"GOOD_{sport_id.upper()}_GPU_API_POLL_SECONDS",
-                os.environ.get("GOOD_BADMINTON_GPU_API_POLL_SECONDS", "2"),
+                "GOOD_GPU_API_POLL_SECONDS",
+                os.environ.get(
+                    f"GOOD_{sport_id.upper()}_GPU_API_POLL_SECONDS",
+                    os.environ.get("GOOD_BADMINTON_GPU_API_POLL_SECONDS", "2"),
+                ),
             )
         ),
         "sport_id": sport_id,
@@ -123,17 +135,21 @@ def remote_gpu_config(base_url_override=None, *, sport_id="badminton", local_cpu
 
 
 def verify_remote_gpu_sport(sport_id, gpu_base_url=None, *, local_cpu=False):
-    """Fail closed when a WebUI mode points at the wrong fixed-sport GPU."""
+    """Fail closed unless the shared GPU advertises the requested sport."""
     sport_id = _normalize_sport_id(sport_id)
     config = remote_gpu_config(gpu_base_url, sport_id=sport_id, local_cpu=local_cpu)
     health = _json_request(config, "/api/v1/health")
-    actual = str(health.get("sport_id") or "").strip().lower()
-    if actual != sport_id:
+    advertised = health.get("supported_sport_ids")
+    if isinstance(advertised, (list, tuple)):
+        supported = {str(value).strip().lower() for value in advertised}
+    else:
+        supported = {str(health.get("sport_id") or "").strip().lower()}
+    if health.get("status") != "ok" or sport_id not in supported:
         raise RemoteAnalysisError(
-            f"当前选择的是{sport_id}，但 GPU 服务返回 sport_id={actual or 'missing'}；已阻止上传。"
+            f"当前选择的是{sport_id}，但 GPU 服务支持 {sorted(supported)}；已阻止上传。"
         )
-    if health.get("service_kind") not in {None, "pure_gpu_visual_observation"}:
-        raise RemoteAnalysisError("GPU 服务不是纯视觉流式入口；已阻止将视频发送到整文件业务接口。")
+    if health.get("service_kind") not in {None, "pure_gpu_visual_observation", "gpu_visual_inference"}:
+        raise RemoteAnalysisError("GPU 服务不是允许的视觉推理入口；已阻止上传。")
     return health
 
 
@@ -155,7 +171,8 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
                         business_task_id=None, cancel_cb=None, gpu_base_url=None):
     """Submit, wait for, and retrieve one remote job into *output_dir*."""
     raise_if_cancelled(cancel_cb)
-    config = remote_gpu_config(gpu_base_url)
+    sport_id = _normalize_sport_id(options.get("sport_id", "badminton"))
+    config = remote_gpu_config(gpu_base_url, sport_id=sport_id)
     if not config["api_key"]:
         raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured in the WebUI process")
 
@@ -170,6 +187,7 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
         status_cb=status_cb,
         idempotency_key=business_task_id,
         cancel_cb=cancel_cb,
+        sport_id=sport_id,
     )
     job_id = job["job_id"]
     receipt = job.get("receipt") or {}
@@ -291,6 +309,7 @@ def iter_remote_two_second_stream(
     normalized_corners = [[float(x), float(y)] for x, y in corners]
     far_roi = options.get("far_pose_roi")
     stream_configuration = {
+        "sport_id": sport_id,
         "analysis_sample_hz": int(options["analysis_sample_hz"]),
         "pose_imgsz": int(options["pose_imgsz"]),
         "shuttle_detector": str(options["shuttle_detector"]),
@@ -302,13 +321,8 @@ def iter_remote_two_second_stream(
         "tracker_backend": str(options["tracker_backend"]),
         "far_player_enhancement": bool(options.get("far_player_enhancement", False)),
     }
-    if sport_id != "badminton":
-        stream_configuration.update(
-            {
-                "sport_id": sport_id,
-                "session_mode": session_mode,
-            }
-        )
+    if session_mode is not None:
+        stream_configuration["session_mode"] = session_mode
     stream_configuration.update(
         stream_roster_configuration(
             int(options["expected_player_count"]),
@@ -651,12 +665,12 @@ def _remote_options(options):
     return {
         key: value
         for key, value in options.items()
-        if key not in {"yolo_pose_model", "ball_model"}
+        if key not in {"yolo_pose_model", "ball_model", "sport_id"}
     }
 
 
 def _submit_multipart(config, video_path, template_path, corners, options, progress_cb=None, status_cb=None,
-                      idempotency_key=None, cancel_cb=None):
+                      idempotency_key=None, cancel_cb=None, sport_id="badminton"):
     parsed = urlparse(config["base_url"])
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_URL must be an http(s) URL")
@@ -664,6 +678,7 @@ def _submit_multipart(config, video_path, template_path, corners, options, progr
     fields = {
         "court_corners": json.dumps(corners),
         "options_json": json.dumps(options),
+        "sport_id": _normalize_sport_id(sport_id),
     }
     length = _multipart_length(boundary, fields, [("video", video_path), ("template", template_path)])
     connection_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
@@ -982,5 +997,3 @@ def _multipart_length(boundary, fields, files):
         path = Path(path)
         length += len(_file_header(boundary, name, path)) + path.stat().st_size + 2
     return length + len(f"--{boundary}--\r\n".encode("utf-8"))
-
-
