@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from .jobs import AnalysisJobManager
 from .stream_runtime import StreamProcessorFactory
 from .stream_routes import register_stream_routes
-from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile, get_vision_profile
+from .vision_profiles import get_vision_profile, supported_sport_ids
 from .stream_sessions import StreamSessionManager
 
 
@@ -31,24 +31,19 @@ def create_app(
     *,
     stream_processor_factory=None,
     stream_manager=None,
-    vision_profile: SportVisionProfile = BADMINTON_PROFILE,
 ):
     data_path = Path(data_dir or os.environ.get("GOOD_BADMINTON_API_DATA_DIR", "api_data")).resolve()
     manager = AnalysisJobManager(data_path, start_worker=start_worker)
     if stream_manager is None:
-        stream_processor_factory = stream_processor_factory or StreamProcessorFactory(
-            data_path,
-            vision_profile=vision_profile,
-        )
+        stream_processor_factory = stream_processor_factory or StreamProcessorFactory(data_path)
         stream_manager = StreamSessionManager(
             data_path,
             processor_factory=stream_processor_factory,
             start_worker=start_worker,
         )
-    app = FastAPI(title=f"{vision_profile.service_name} GPU API", version="1.0.0")
+    app = FastAPI(title="Good-Badminton multi-sport GPU API", version="1.0.0")
     app.state.job_manager = manager
     app.state.stream_manager = stream_manager
-    app.state.vision_profile = vision_profile
 
     def default_court_detector(path):
         from badminton_analysis.pipeline import prepare_court_from_video
@@ -67,10 +62,9 @@ def create_app(
     def stream_health_payload():
         return {
             "status": "ok",
-            "service": vision_profile.service_name,
-            "sport_id": vision_profile.sport_id,
-            "coordinate_system_id": vision_profile.coordinate_system_id,
-            "supported_session_modes": list(vision_profile.supported_session_modes),
+            "service": "good-badminton-gpu-api",
+            "service_kind": "gpu_visual_inference",
+            "supported_sport_ids": list(supported_sport_ids()),
             "contract_versions": ["stream-session.v1"],
             "worker_running": manager.worker_running,
             "stream_worker_running": stream_manager.worker_running,
@@ -106,10 +100,22 @@ def create_app(
         template: UploadFile = File(...),
         court_corners: str = Form(...),
         options_json: str = Form("{}"),
+        sport_id: str = Form("badminton"),
         x_idempotency_key: Optional[str] = Header(default=None),
     ):
         corners = _parse_corners(court_corners)
         options = _parse_options(options_json)
+        try:
+            profile = get_vision_profile(sport_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if options["shuttle_detector"] not in profile.allowed_ball_detectors:
+            allowed = ", ".join(profile.allowed_ball_detectors)
+            raise HTTPException(
+                status_code=422,
+                detail=f"shuttle_detector must be one of [{allowed}] for sport_id={profile.sport_id}",
+            )
+        options["sport_id"] = profile.sport_id
         if x_idempotency_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", x_idempotency_key):
             raise HTTPException(status_code=422, detail="X-Idempotency-Key must be 16-128 safe characters")
         existing = manager.get_by_idempotency_key(x_idempotency_key)
@@ -406,12 +412,7 @@ async def _save_upload(upload, staging_dir, allowed_extensions, field_name):
     return path
 
 
-def _configured_vision_profile():
-    """Resolve the one sport identity for the legacy import-time entrypoint."""
-    return get_vision_profile(os.environ.get("GOOD_SPORT_VISION_PROFILE", "badminton"))
-
-
-app = create_app(vision_profile=_configured_vision_profile())
+app = create_app()
 
 
 if __name__ == "__main__":

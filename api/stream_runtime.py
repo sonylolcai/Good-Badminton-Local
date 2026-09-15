@@ -31,7 +31,7 @@ from badminton_analysis.streaming.models import FinalizationContext, FrameContex
 from badminton_analysis.tracking.person_only import PersonOnlyFrameProcessor, PersonOnlyTracker
 
 from .mode_sync import VisionModeSynchronizer
-from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile
+from .vision_profiles import SportVisionProfile, get_vision_profile
 
 from .candidate_photos import CandidatePhotoCollector
 
@@ -393,7 +393,7 @@ class StreamProcessorFactory:
         pose_model_factory: Optional[Callable[[str], Any]] = None,
         ball_model_factory: Optional[Callable[[str], Any]] = None,
         byte_tracker_factory=None,
-        vision_profile: SportVisionProfile = BADMINTON_PROFILE,
+        vision_profile: Optional[SportVisionProfile] = None,
         mode_synchronizer: Optional[VisionModeSynchronizer] = None,
     ):
         self.data_dir = Path(data_dir).resolve()
@@ -412,8 +412,8 @@ class StreamProcessorFactory:
         self.byte_tracker_factory = byte_tracker_factory
         self.vision_profile = vision_profile
         # This factory performs visual inference only.  The separate
-        # synchronizer resolves the fixed deployment profile plus requested
-        # visual mode before any model or tracker is constructed.
+        # synchronizer resolves the request-selected, allow-listed profile
+        # plus visual mode before any model or tracker is constructed.
         self.mode_synchronizer = mode_synchronizer or VisionModeSynchronizer(
             vision_profile
         )
@@ -434,10 +434,8 @@ class StreamProcessorFactory:
             raise ValueError(
                 "TrackNetV3 streaming requires a configured bounded-state temporal processor factory"
             )
-        if (
-            self.vision_profile.sport_id == "tennis"
-            and configuration.get("shuttle_detector") == "yolo"
-        ):
+        profile = get_vision_profile(configuration["sport_id"])
+        if profile.sport_id == "tennis" and configuration.get("shuttle_detector") == "yolo":
             self._tennis_ball_model_spec()
 
     @staticmethod
@@ -484,6 +482,7 @@ class StreamProcessorFactory:
     def __call__(self, session):
         self.validate_session_request(session)
         configuration = session["configuration"]
+        vision_profile = get_vision_profile(configuration["sport_id"])
         calibration = {
             "calibration_id": session["calibration_id"],
             "image_corners": session["court_corners"],
@@ -548,7 +547,7 @@ class StreamProcessorFactory:
             sport_id=configuration["sport_id"],
             session_mode=configuration["session_mode"],
             calibration_scope=configuration["calibration_scope"],
-            coordinate_system_id=self.vision_profile.coordinate_system_id,
+            coordinate_system_id=vision_profile.coordinate_system_id,
         )
 
         project_root = Path(__file__).resolve().parents[1]
@@ -589,7 +588,7 @@ class StreamProcessorFactory:
         if shuttle_detector == "none":
             return CompositeMeasurementProcessor(person, candidate_photos=candidate_photos), None
         if shuttle_detector == "yolo":
-            if self.vision_profile.sport_id == "tennis":
+            if vision_profile.sport_id == "tennis":
                 ball_spec = self._tennis_ball_model_spec()
                 ball_path = str(ball_spec["path"])
                 ball_model = (

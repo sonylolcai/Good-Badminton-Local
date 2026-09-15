@@ -29,6 +29,13 @@ class GpuApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
 
+    def test_health_advertises_the_single_process_multi_sport_contract(self):
+        response = self.client.get("/api/v1/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["supported_sport_ids"], ["badminton", "tennis"])
+        self.assertNotIn("sport_id", response.json())
+
     def test_job_submission_requires_api_key(self):
         response = self.client.post("/api/v1/jobs")
 
@@ -125,6 +132,43 @@ class GpuApiTests(unittest.TestCase):
         self.assertEqual(recovered.status_code, 200)
         self.assertEqual(recovered.json()["job_id"], job_id)
         self.assertTrue(recovered.json()["receipt"]["reused"])
+
+    def test_job_persists_the_request_sport_id(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-tennis"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "sport_id": "tennis",
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["input"]["sport_id"], "tennis")
+        self.assertEqual(stored["options"]["sport_id"], "tennis")
+
+    def test_job_rejects_an_unknown_sport_before_persisting_a_manifest(self):
+        before = list(self.app.state.job_manager.jobs_dir.glob("*/manifest.json"))
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-unknown-sport"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "sport_id": "squash",
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(list(self.app.state.job_manager.jobs_dir.glob("*/manifest.json")), before)
 
     def test_job_accepts_fixed_roster_options(self):
         response = self.client.post(

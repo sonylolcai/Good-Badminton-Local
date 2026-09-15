@@ -108,6 +108,7 @@ class AnalysisJobManager:
                 "video_filename": Path(video_path).name,
                 "template_filename": Path(template_path).name,
                 "court_corners": corners,
+                "sport_id": options.get("sport_id", "badminton"),
                 "match_session_ref": options.get("match_session_ref"),
             },
             "options": options,

@@ -1,10 +1,10 @@
-"""Fixed sport and session-mode profiles for the GPU vision runtime.
+"""Allow-listed sport and session-mode profiles for the GPU vision runtime.
 
-The process entry point selects exactly one :class:`SportVisionProfile` at
-startup.  Requests may select only a session mode exposed by that profile; they
-cannot switch the process to another sport.  This keeps sport-specific court
-geometry and roster rules behind one small interface while the streaming,
-pose, tracking and checkpoint implementation remains shared.
+Each accepted request selects exactly one :class:`SportVisionProfile` from this
+allow-list. Requests may select only a session mode exposed by that profile;
+they cannot supply court geometry or roster rules. This keeps sport-specific
+visual constraints behind one small interface while streaming, pose, tracking
+and checkpoint implementation remains shared.
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ class SessionModeProfile:
 
 @dataclass(frozen=True)
 class SportVisionProfile:
-    """The fixed sport identity and its allowed GPU vision modes."""
+    """One allow-listed sport identity and its permitted GPU vision modes."""
 
     sport_id: str
     service_name: str
@@ -191,3 +191,8 @@ def get_vision_profile(sport_id: str) -> SportVisionProfile:
     except KeyError as exc:
         allowed = ", ".join(sorted(_PROFILES))
         raise ValueError(f"GPU sport profile must be one of [{allowed}]") from exc
+
+
+def supported_sport_ids() -> tuple[str, ...]:
+    """Return the stable, allow-listed sports served by one GPU process."""
+    return tuple(sorted(_PROFILES))

@@ -7,13 +7,13 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from api.app import _configured_vision_profile, create_app
-from api.gpu_stream_app import create_gpu_stream_app
+from api.app import create_app
 from api.mode_sync import VisionModeSynchronizer
 from api.stream_runtime import StreamProcessorFactory
 from api.vision_profiles import (
     FULL_COURT,
     NEAR_HALF_COURT,
+    BADMINTON_PROFILE,
     TENNIS_PROFILE,
 )
 from badminton_analysis.analysis.fixed_camera_match import CourtSpace
@@ -185,96 +185,69 @@ class GpuSportProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "vision profile does not match"):
             incompatible.restore_state(state)
 
-    def test_tennis_app_health_and_runtime_are_profile_fixed(self):
+    def test_single_gpu_app_advertises_both_profiles_and_resolves_each_request(self):
         with tempfile.TemporaryDirectory() as directory:
             app = create_app(
                 data_dir=Path(directory),
                 start_worker=False,
-                vision_profile=TENNIS_PROFILE,
             )
             response = TestClient(app).get("/api/v1/health")
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["sport_id"], "tennis")
-            self.assertEqual(
-                response.json()["supported_session_modes"],
-                ["singles_match", "single_player_training"],
-            )
+            self.assertEqual(response.json()["supported_sport_ids"], ["badminton", "tennis"])
+            self.assertNotIn("sport_id", response.json())
 
-            request = create_request()
-            request["configuration"].update(
-                {"sport_id": "tennis", "session_mode": "single_player_training"}
-            )
-            factory = StreamProcessorFactory(Path(directory), vision_profile=TENNIS_PROFILE)
-            factory.validate_session_request(request)
-            self.assertEqual(request["configuration"]["expected_player_count"], 1)
-            self.assertEqual(request["configuration"]["shuttle_detector"], "none")
+            for configuration, expected_profile in (
+                ({"sport_id": "badminton", "session_mode": "match", "expected_player_count": 2}, BADMINTON_PROFILE),
+                ({"sport_id": "tennis", "session_mode": "single_player_training"}, TENNIS_PROFILE),
+            ):
+                request = create_request()
+                request["configuration"].update(configuration)
+                with self.subTest(configuration=configuration):
+                    factory = StreamProcessorFactory(Path(directory))
+                    factory.validate_session_request(request)
+                    self.assertEqual(request["configuration"]["sport_id"], expected_profile.sport_id)
+                    self.assertEqual(request["configuration"]["court_dimensions_m"], list(expected_profile.court_dimensions_m))
 
-    def test_pure_gpu_app_exposes_stream_contract_without_job_or_business_state(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            "os.environ", {"GOOD_BADMINTON_API_KEY": "test-key"}, clear=False
-        ):
-            app = create_gpu_stream_app(
-                data_dir=Path(directory),
-                start_worker=False,
-                vision_profile=TENNIS_PROFILE,
-            )
-            client = TestClient(app)
-
-            health = client.get("/api/v1/health")
-            self.assertEqual(health.status_code, 200)
-            self.assertEqual(health.json()["sport_id"], "tennis")
-            self.assertEqual(health.json()["service_kind"], "pure_gpu_visual_observation")
-            self.assertFalse(hasattr(app.state, "job_manager"))
-
-            # A pure GPU deployment has no endpoint that can run the legacy
-            # whole-video pipeline (hit/rally/report/rendering derivation).
-            response = client.post("/api/v1/jobs", headers={"X-API-Key": "test-key"})
-            self.assertEqual(response.status_code, 404)
-
-    def test_process_profile_is_selected_only_at_startup(self):
-        with patch.dict(
-            "os.environ", {"GOOD_SPORT_VISION_PROFILE": "tennis"}, clear=False
-        ):
-            self.assertEqual(_configured_vision_profile().sport_id, "tennis")
-
-    def test_tennis_session_persists_profile_derived_training_configuration(self):
+    def test_single_gpu_endpoint_persists_each_request_profile(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             "os.environ", {"GOOD_BADMINTON_API_KEY": "test-key"}, clear=False
         ):
             app = create_app(
                 data_dir=Path(directory),
                 start_worker=False,
-                vision_profile=TENNIS_PROFILE,
-            )
-            request = create_request()
-            request["configuration"].update(
-                {"sport_id": "tennis", "session_mode": "single_player_training"}
-            )
-            response = TestClient(app).post(
-                "/api/v1/stream-sessions",
-                headers={"X-API-Key": "test-key"},
-                json=request,
-            )
-
-            self.assertEqual(response.status_code, 202)
-            session = app.state.stream_manager.get_session(
-                response.json()["analysis_session_id"]
-            )
-            self.assertEqual(session["configuration"]["expected_player_count"], 1)
-            self.assertEqual(session["configuration"]["calibration_scope"], NEAR_HALF_COURT)
-
-    def test_tennis_endpoint_rejects_a_wrong_sport_or_conflicting_roster(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            "os.environ", {"GOOD_BADMINTON_API_KEY": "test-key"}, clear=False
-        ):
-            app = create_app(
-                data_dir=Path(directory),
-                start_worker=False,
-                vision_profile=TENNIS_PROFILE,
             )
             client = TestClient(app)
             cases = (
-                ({"sport_id": "badminton", "session_mode": "singles_match"}, "does not match"),
+                ({"sport_id": "badminton", "session_mode": "match", "expected_player_count": 2}, "badminton", FULL_COURT),
+                ({"sport_id": "tennis", "session_mode": "single_player_training"}, "tennis", NEAR_HALF_COURT),
+            )
+            for configuration, sport_id, calibration_scope in cases:
+                request = create_request()
+                request["configuration"].update(configuration)
+                with self.subTest(configuration=configuration):
+                    response = client.post(
+                        "/api/v1/stream-sessions",
+                        headers={"X-API-Key": "test-key"},
+                        json=request,
+                    )
+                    self.assertEqual(response.status_code, 202)
+                    session = app.state.stream_manager.get_session(
+                        response.json()["analysis_session_id"]
+                    )
+                    self.assertEqual(session["configuration"]["sport_id"], sport_id)
+                    self.assertEqual(session["configuration"]["calibration_scope"], calibration_scope)
+
+    def test_single_gpu_endpoint_rejects_unknown_or_conflicting_profile_before_persisting(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"GOOD_BADMINTON_API_KEY": "test-key"}, clear=False
+        ):
+            app = create_app(
+                data_dir=Path(directory),
+                start_worker=False,
+            )
+            client = TestClient(app)
+            cases = (
+                ({"sport_id": "squash", "session_mode": "match"}, "must be one of"),
                 (
                     {
                         "sport_id": "tennis",
@@ -288,6 +261,7 @@ class GpuSportProfileTests(unittest.TestCase):
                 request = create_request()
                 request["configuration"].update(configuration)
                 with self.subTest(configuration=configuration):
+                    before = list(app.state.stream_manager.sessions_dir.glob("*/manifest.json"))
                     response = client.post(
                         "/api/v1/stream-sessions",
                         headers={"X-API-Key": "test-key"},
@@ -295,6 +269,7 @@ class GpuSportProfileTests(unittest.TestCase):
                     )
                     self.assertEqual(response.status_code, 422)
                     self.assertIn(message, response.json()["error"]["message"])
+                    self.assertEqual(list(app.state.stream_manager.sessions_dir.glob("*/manifest.json")), before)
 
 
 if __name__ == "__main__":

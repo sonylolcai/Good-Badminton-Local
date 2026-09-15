@@ -1,40 +1,43 @@
-"""Synchronize an external session request with one fixed GPU sport profile.
+"""Synchronize an external session request with an allow-listed GPU sport profile.
 
 This module intentionally contains no model invocation, frame decoding, pose
 logic, tracking logic, or business interpretation.  It is the only seam where
-the deployment-selected sport and a client-selected *visual* session mode meet.
+an allow-listed sport and a client-selected *visual* session mode meet.
 The resulting mapping is persisted with the stream session and is then consumed
 as immutable visual input by :mod:`api.stream_runtime`.
 """
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Mapping, Optional
 
-from .vision_profiles import SportVisionProfile
+from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile, get_vision_profile
 
 
 class VisionModeSynchronizer:
-    """Resolve request configuration without permitting runtime sport switches.
+    """Resolve request configuration from an allow-listed visual profile.
 
     A business service may request a mode by opaque name, but it cannot supply
-    rule semantics, roster size, calibration geometry, or a different sport.
-    Those values are derived from the profile selected by the process entry
-    point and returned as visual-runtime configuration only.
+    rule semantics, roster size or calibration geometry. Those values are
+    derived from the selected profile and returned as visual-runtime
+    configuration only.
     """
 
-    def __init__(self, vision_profile: SportVisionProfile):
+    def __init__(self, vision_profile: Optional[SportVisionProfile] = None):
         self.vision_profile = vision_profile
 
     def synchronize(self, configuration: Mapping) -> dict:
         """Validate and return the profile-derived visual configuration."""
         normalized = dict(configuration)
-        profile = self.vision_profile
         requested_sport = normalized.get("sport_id")
-        if requested_sport is not None and requested_sport != profile.sport_id:
-            raise ValueError(
-                f"sport_id={requested_sport} does not match this {profile.sport_id} GPU process"
-            )
+        if self.vision_profile is not None:
+            profile = self.vision_profile
+            if requested_sport is not None and requested_sport != profile.sport_id:
+                raise ValueError(
+                    f"sport_id={requested_sport} does not match this {profile.sport_id} GPU process"
+                )
+        else:
+            profile = get_vision_profile(requested_sport or BADMINTON_PROFILE.sport_id)
 
         mode = profile.mode(normalized.get("session_mode"))
         expected = normalized.get("expected_player_count")
