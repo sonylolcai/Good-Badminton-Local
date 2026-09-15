@@ -7,6 +7,7 @@ class GpuCodeBoundaryTests(unittest.TestCase):
         root = Path(__file__).parents[1]
         self.assertFalse((root / "evaluation").exists())
         self.assertFalse((root / "analysis_platform").exists())
+        self.assertEqual([], list((root / "badminton_analysis" / "streaming_validation").glob("*.py")))
         imports = []
         for directory in (root / "api", root / "badminton_analysis"):
             for path in directory.rglob("*.py"):
