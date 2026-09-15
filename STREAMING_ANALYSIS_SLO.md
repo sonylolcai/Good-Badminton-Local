@@ -159,16 +159,10 @@ outputs/remote_jobs/<run>/end_to_end_trace.json                    # 本次结�
 
 ## 版本迭代性能门禁
 
-每次修改模型、采样率、推理流程、视频导出、CUDA/TensorRT 或 GPU 部署脚本后，都必须
-对一个完成任务的 `performance_trace.json` 运行版本化门禁：
-
-```bash
-bash deploy/run_performance_gate.sh /path/to/performance_trace.json
-```
-
-门禁锁定生产参数：Pose `960 + 统一分析 10 Hz`、YOLO 球，以及整场最多一次 LLM 请求；它还能
-与同源视频的上一个 trace 比较每阶段回退。工具和报告格式见
-[`evaluation/performance/README.md`](evaluation/performance/README.md)。
+每次修改模型、采样率、推理流程、视频导出、CUDA/TensorRT 或 GPU 部署脚本后，GPU 服务只产出
+不可变 `performance_trace.json`。版本化门禁、基线比较与报告写入由独立评测平台执行；本仓库不再
+包含或运行任何 performance gate。门禁锁定的生产参数和报告格式由评测平台的
+`backend/evaluation_suites/performance` 维护。
 
 批处理 trace 只能给出真实阶段耗时，结果会明确标为 `warn`，不能证明流式 SLO。等分片
 接口实现后，必须额外提供 1--2 秒分片回放报告；只有该回放通过 P95 分片、队列积压、封口

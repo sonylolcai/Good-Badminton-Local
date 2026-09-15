@@ -8,6 +8,7 @@ class GpuCodeBoundaryTests(unittest.TestCase):
         self.assertFalse((root / "evaluation").exists())
         self.assertFalse((root / "analysis_platform").exists())
         self.assertEqual([], list((root / "badminton_analysis" / "streaming_validation").glob("*.py")))
+        self.assertFalse((root / "deploy" / "run_performance_gate.sh").exists())
         imports = []
         for directory in (root / "api", root / "badminton_analysis"):
             for path in directory.rglob("*.py"):
