@@ -1,7 +1,7 @@
 {
   "schema_version": "long-task.v1",
   "task_id": "2026-09-15-multisport-gpu-package",
-  "status": "implementing",
+  "status": "awaiting_remote_validation",
   "repositories": [
     {
       "path": "S:/Code Base/MiniProgram/bdTeach/Good-Badminton",
@@ -15,12 +15,22 @@
     }
   ],
   "approvals": {"plan": {"approved_at": "2026-09-15T16:24:44+08:00", "user_wording": "确认"}, "tests": {"approved_at": "2026-09-15T16:52:20+08:00", "user_wording": "批准"}},
-  "current_task": "MGP-02",
+  "current_task": "T-MGP-10",
   "commits": [
     {
       "task": "MGP-01",
       "hash": "a87addd",
       "subject": "feat(gpu): resolve sport profile per request"
+    },
+    {
+      "task": "MGP-02 business",
+      "hash": "de063f9",
+      "subject": "feat(business): prefer shared multi-sport GPU"
+    },
+    {
+      "task": "MGP-02 evaluation",
+      "hash": "17e64b5",
+      "subject": "feat(evaluation): target shared multi-sport GPU"
     }
   ],
   "checks": [
@@ -39,7 +49,27 @@
     {
       "scope": "MGP-01 targeted verification",
       "result": "2026-09-15: .venv\\Scripts\\python.exe -m unittest tests.test_gpu_api tests.test_gpu_sport_profiles tests.test_gpu_pure_launchers tests.test_gpu_code_boundary -v => 32 passed."
+    },
+    {
+      "scope": "MGP-02 business verification",
+      "result": "2026-09-15: .venv\\Scripts\\python.exe -m unittest tests.test_remote_gpu -v => 15 passed."
+    },
+    {
+      "scope": "MGP-02 evaluation verification",
+      "result": "2026-09-15: backend\\.venv\\Scripts\\python.exe -m unittest tests.test_gpu_client tests.test_service -v => 7 passed."
+    },
+    {
+      "scope": "MGP-03 local verification",
+      "result": "2026-09-15: Good-Badminton 49 tests and Evaluation-Platform GPU client 3 tests passed; package ZIP was built and inspected locally. No remote upload, restart, or GPU inference was performed."
+    },
+    {
+      "scope": "QA regression repair",
+      "result": "2026-09-16: RED proved evaluation metadata was sent as unsupported GPU options, full tennis jobs could bypass the required profile, Docker mapped weights to /models, and refresh had no retained-version rollback. Final targeted regression: Good-Badminton 66 tests passed; Evaluation-Platform backend 12 tests passed."
+    },
+    {
+      "scope": "MGP-03 package and local Docker verification",
+      "result": "2026-09-16: deploy/good-badminton-gpu-api-upload.zip rebuilt (SHA256 2C81A54F45616C8BC4D634553810E24333ED3B10CC8D1E6945C5FADE58F9EFC1), archive allow-list inspected (65 entries), refresh shell syntax passed, and Docker image built successfully. A temporary 127.0.0.1:28080 container returned shared health and became healthy; /app/weights mount was verified. No real model inference, remote upload, restart, or GPU test was performed."
     }
   ],
-  "updated_at": "2026-09-15T16:52:20+08:00"
+  "updated_at": "2026-09-16T10:59:11.7740694+08:00"
 }

@@ -3,10 +3,27 @@ set -euo pipefail
 
 # Deploy the model/video-only API to a CUDA 12.4 GPU instance.  This script
 # intentionally does not deploy business databases, users, SSO, or frontend.
-APP_DIR="${1:-$HOME/good-badminton}"
-BRANCH="${2:-fixed-camera-singles-spatial-tracking}"
+DEFAULT_APP_DIR="$HOME/good-badminton-gpu-api"
+APP_DIR="${1:-$DEFAULT_APP_DIR}"
+BRANCH="${2:-}"
 REPOSITORY="${GOOD_BADMINTON_REPOSITORY:-https://github.com/sonylolcai/Good-Badminton-Local.git}"
 SERVICE_NAME="good-badminton-gpu-api"
+STATE_DIR="${GOOD_BADMINTON_STATE_DIR:-${APP_DIR}-state}"
+ENV_FILE="${STATE_DIR}/.gpu-api.env"
+DATA_DIR="${STATE_DIR}/api_data"
+WEIGHTS_DIR="${STATE_DIR}/weights"
+
+[[ "$APP_DIR" == "$DEFAULT_APP_DIR" ]] || {
+  echo "For safety APP_DIR must be exactly $DEFAULT_APP_DIR (got: $APP_DIR)." >&2
+  exit 64
+}
+[[ "$STATE_DIR" == "${DEFAULT_APP_DIR}-state" ]] || {
+  echo "For safety STATE_DIR must be exactly ${DEFAULT_APP_DIR}-state (got: $STATE_DIR)." >&2
+  exit 64
+}
+
+mkdir -p "$STATE_DIR" "$DATA_DIR" "$WEIGHTS_DIR"
+chmod 700 "$STATE_DIR" "$DATA_DIR" "$WEIGHTS_DIR"
 
 command -v nvidia-smi >/dev/null || { echo "nvidia-smi is required" >&2; exit 1; }
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
@@ -34,6 +51,9 @@ if [[ "${GOOD_BADMINTON_SKIP_GIT_SYNC:-0}" == "1" ]]; then
     exit 1
   }
   echo "Skipping Git sync; deploying the extracted source at $APP_DIR."
+elif [[ -z "$BRANCH" ]]; then
+  echo "Pass a reviewed shared-GPU branch as argument 2, or set GOOD_BADMINTON_SKIP_GIT_SYNC=1 for an extracted ZIP package." >&2
+  exit 64
 elif [[ ! -d "$APP_DIR/.git" ]]; then
   GIT_TERMINAL_PROMPT=0 git clone --branch "$BRANCH" --single-branch "$REPOSITORY" "$APP_DIR"
 else
@@ -52,8 +72,8 @@ assert torch.cuda.is_available(), "The selected system PyTorch cannot access CUD
 print(f"Reusing system PyTorch {torch.__version__} (CUDA {torch.version.cuda}).")
 PY
 else
-  python3 -m venv "$APP_DIR/.venv"
-  PYTHON_BIN="$APP_DIR/.venv/bin/python"
+  python3 -m venv "$STATE_DIR/.venv"
+  PYTHON_BIN="$STATE_DIR/.venv/bin/python"
   "$PYTHON_BIN" -m pip install --upgrade pip
 
   # CUDA wheels must be installed before the project packages.  The base
@@ -88,13 +108,36 @@ GOOD_BADMINTON_PYTHON_BIN="$PYTHON_BIN" \
 GOOD_BADMINTON_WHEELHOUSE="${GOOD_BADMINTON_WHEELHOUSE:-}" \
   "$APP_DIR/deploy/install_lap.sh"
 
-if [[ ! -f "$APP_DIR/.gpu-api.env" ]]; then
+if [[ ! -f "$ENV_FILE" && -f "$APP_DIR/.gpu-api.env" && ! -L "$APP_DIR/.gpu-api.env" ]]; then
+  cp -p "$APP_DIR/.gpu-api.env" "$ENV_FILE"
+fi
+if [[ ! -L "$APP_DIR/api_data" && -d "$APP_DIR/api_data" ]] && \
+   [[ -z "$(find "$DATA_DIR" -mindepth 1 -print -quit)" ]]; then
+  cp -a "$APP_DIR/api_data/." "$DATA_DIR/"
+fi
+if [[ ! -L "$APP_DIR/weights" && -d "$APP_DIR/weights" ]] && \
+   [[ -z "$(find "$WEIGHTS_DIR" -mindepth 1 -print -quit)" ]]; then
+  cp -a "$APP_DIR/weights/." "$WEIGHTS_DIR/"
+fi
+
+if [[ ! -f "$ENV_FILE" ]]; then
   umask 077
   api_key="$(openssl rand -hex 32)"
-  printf 'GOOD_BADMINTON_API_KEY=%s\nGOOD_BADMINTON_API_DATA_DIR=%s/api_data\nPORT=8080\n' \
-    "$api_key" "$APP_DIR" > "$APP_DIR/.gpu-api.env"
-  echo "Created $APP_DIR/.gpu-api.env. Store its API key in the business service secret manager."
+  printf 'GOOD_BADMINTON_API_KEY=%s\nGOOD_BADMINTON_API_DATA_DIR=%s\nPORT=8080\n' \
+    "$api_key" "$DATA_DIR" > "$ENV_FILE"
+  echo "Created $ENV_FILE. Store its API key in the business service secret manager."
 fi
+chmod 600 "$ENV_FILE"
+env_tmp="$(mktemp "${STATE_DIR}/.gpu-api.env.XXXXXX")"
+grep -v '^GOOD_BADMINTON_API_DATA_DIR=' "$ENV_FILE" > "$env_tmp" || true
+printf 'GOOD_BADMINTON_API_DATA_DIR=%s\n' "$DATA_DIR" >> "$env_tmp"
+chmod 600 "$env_tmp"
+mv "$env_tmp" "$ENV_FILE"
+
+rm -rf "$APP_DIR/.gpu-api.env" "$APP_DIR/api_data" "$APP_DIR/weights"
+ln -s "$ENV_FILE" "$APP_DIR/.gpu-api.env"
+ln -s "$DATA_DIR" "$APP_DIR/api_data"
+ln -s "$WEIGHTS_DIR" "$APP_DIR/weights"
 
 "$PYTHON_BIN" -m unittest tests.test_gpu_api -v
 
@@ -103,6 +146,7 @@ if command -v systemctl >/dev/null && systemctl show-environment >/dev/null 2>&1
   sed \
     -e "s|__GPU_USER__|$USER|g" \
     -e "s|__APP_DIR__|$APP_DIR|g" \
+    -e "s|__ENV_FILE__|$ENV_FILE|g" \
     -e "s|__PYTHON_BIN__|$PYTHON_BIN|g" \
     "$APP_DIR/deploy/${SERVICE_NAME}.service" | sudo tee "$service_file" >/dev/null
   sudo systemctl daemon-reload
@@ -119,9 +163,9 @@ else
     cd "$APP_DIR"
     set -a
     # shellcheck disable=SC1091
-    source "$APP_DIR/.gpu-api.env"
+    source "$ENV_FILE"
     set +a
-    nohup "$PYTHON_BIN" -m uvicorn apps.badminton_gpu.app:app --host 0.0.0.0 --port "${PORT:-8080}" \
+    nohup "$PYTHON_BIN" -m uvicorn api.app:app --host 0.0.0.0 --port "${PORT:-8080}" \
       > "$APP_DIR/gpu-api.log" 2>&1 &
     echo $! > "$pid_file"
   )

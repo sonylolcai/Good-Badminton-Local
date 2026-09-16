@@ -144,6 +144,7 @@ class GpuApiTests(unittest.TestCase):
             data={
                 "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
                 "sport_id": "tennis",
+                "options_json": '{"session_mode":"singles_match","match_mode":"singles"}',
             },
         )
 
@@ -151,6 +152,34 @@ class GpuApiTests(unittest.TestCase):
         stored = self.app.state.job_manager.get_job(response.json()["job_id"])
         self.assertEqual(stored["input"]["sport_id"], "tennis")
         self.assertEqual(stored["options"]["sport_id"], "tennis")
+        self.assertEqual(stored["options"]["session_mode"], "singles_match")
+
+    def test_tennis_job_rejects_incompatible_full_video_modes_before_persisting(self):
+        before = list(self.app.state.job_manager.jobs_dir.glob("*/job.json"))
+        cases = (
+            '{"session_mode":"singles_match","match_mode":"doubles"}',
+            '{"session_mode":"single_player_training","match_mode":"singles"}',
+        )
+        for index, options_json in enumerate(cases):
+            with self.subTest(options_json=options_json):
+                response = self.client.post(
+                    "/api/v1/jobs",
+                    headers={
+                        "X-API-Key": "test-api-key",
+                        "X-Idempotency-Key": f"business-task-tennis-invalid-{index}",
+                    },
+                    files={
+                        "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                        "template": ("court.png", b"image-bytes", "image/png"),
+                    },
+                    data={
+                        "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                        "sport_id": "tennis",
+                        "options_json": options_json,
+                    },
+                )
+                self.assertEqual(response.status_code, 422)
+        self.assertEqual(list(self.app.state.job_manager.jobs_dir.glob("*/job.json")), before)
 
     def test_job_rejects_an_unknown_sport_before_persisting_a_manifest(self):
         before = list(self.app.state.job_manager.jobs_dir.glob("*/manifest.json"))

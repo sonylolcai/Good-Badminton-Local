@@ -27,6 +27,7 @@ GPU 仍只产出匿名视觉观测、状态、性能追踪及文件产物；评�
 | `tests/test_gpu_pure_launchers.py`、`tests/test_gpu_sport_profiles.py`、`tests/test_remote_gpu.py` | 修改 | 将固定进程断言替换为多运动会话和共享 health 断言。 | MGP-01, MGP-02 |
 | `tests/test_gpu_package.py` | 新增 | 运行打包脚本并检查 ZIP 内容和入口。 | MGP-03 |
 | `docs/GPU_MULTI_SPORT_PACKAGE.md` | 新增 | 单包构建、配置、上传和后续受控部署说明。 | MGP-03 |
+| `Dockerfile.local`、`docker-compose.local.yml`、`.gpu-api.local.env.example`、`docs/LOCAL_GPU_API_DOCKER.md` | 新增 | 本地 CPU Docker Compose 启动；模型目录映射到 API 实际读取的 `/app/weights`。 | MGP-03 |
 | `docs/GPU_MULTI_SPORT_ITERATION_PLAN.md` | 修改 | 标注旧“两包/固定入口”方案已被本次用户决策替代。 | MGP-03 |
 | `backend/evaluation_service/gpu_client.py` | 修改 | 接受共享 health 的 `supported_sport_ids` 并验证目标运动。 | MGP-02 |
 | `backend/tests/test_gpu_client.py` | 修改 | 覆盖共享 health 成功与不支持运动失败。 | MGP-02 |
@@ -37,7 +38,7 @@ GPU 仍只产出匿名视觉观测、状态、性能追踪及文件产物；评�
 |---|---|---|---|---|
 | MGP-01 多运动 GPU API | 无 | 单一 API 按 session/job 解析 profile | AC-01–03 的单元与 API 测试 | 回退到 `fd305b3` 的固定入口包 |
 | MGP-02 调用方兼容 | MGP-01 | 业务/评测后端按支持列表校验共享实例 | AC-04 定向测试 | 保留旧配置回退，回退调用方提交 |
-| MGP-03 单包构建 | MGP-01 | 白名单 ZIP、刷新/启动脚本、运行说明 | AC-05–06 的构建检查 | 旧远端目录与状态不自动变更 |
+| MGP-03 单包构建 | MGP-01 | 白名单 ZIP、刷新/启动脚本、运行说明与本地 Docker 包装 | AC-05–07 的构建检查 | 旧远端目录与状态不自动变更 |
 
 MGP-02 与 MGP-03 在 MGP-01 通过后可并行；本次由同一执行者串行完成并逐任务提交。
 
@@ -51,6 +52,7 @@ MGP-02 与 MGP-03 在 MGP-01 通过后可并行；本次由同一执行者串行
 | ZIP 泄露或混入评测/业务代码 | 源码白名单 + 自动 ZIP 内容测试；权重、数据和 `.env` 继续不入包。 |
 | 远端状态或权重损失 | 刷新仅替换应用目录；状态/权重目录为外部持久目录；本任务不执行远端刷新。 |
 | GPU 显存/吞吐未验证 | 明确列为后续真实 GPU 验收，不把本地测试当作硬件结论。 |
+| Windows 本地 Python/CLI 运行时漂移 | 本地开发通过固定 Python 镜像启动；仅绑定 loopback，远端 GPU 仍使用 ZIP 方案。 |
 
 ## 验证矩阵
 
@@ -60,7 +62,8 @@ MGP-02 与 MGP-03 在 MGP-01 通过后可并行；本次由同一执行者串行
 | AC-04 | `webui.remote_gpu` 与评测 `GpuClient` 使用模拟 health 的成功/失败测试。 |
 | AC-05 | PowerShell 打包至临时 ZIP；验证 POSIX 路径、唯一入口和禁止路径。 |
 | AC-06 | 构建脚本静态检查及运行手册；远端部署单列为未执行。 |
+| 本地 Docker | Compose 构建并启动，health 同时声明两项运动，且容器实际可见 `/app/weights` 挂载。 |
 
 ## 计划审批
 
-已批准：用户于 2026-09-15 确认“只交付一个 GPU 包；按 `sport_id` 在同一 GPU 进程中选择运动 profile”的方案。下一关为测试方案审批；在获批前不修改生产运行代码。
+已批准：用户于 2026-09-15 确认“只交付一个 GPU 包；按 `sport_id` 在同一 GPU 进程中选择运动 profile”；测试方案亦已获批。当前仅剩需单独授权的真实 GPU T-MGP-10，未执行远端部署。

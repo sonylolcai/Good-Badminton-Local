@@ -3,39 +3,38 @@ set -euo pipefail
 
 # Refresh an already-provisioned Good-Badminton GPU API from one uploaded ZIP.
 #
-# This is intentionally a *replacement* deployment: after the ZIP has passed
-# validation and the currently running API has stopped, the old application
-# directory is removed and recreated.  Persistent state lives next to, not in,
-# the application directory, so this replacement never removes API keys,
-# queued/completed job records, or model weights.
+# The ZIP is validated and staged before downtime. The most recent application
+# directory is retained beside persistent state and restored automatically if
+# the candidate cannot start or advertise the shared multi-sport health shape.
 #
-# The explicit third argument selects one of two fixed deployment identities;
-# it cannot be supplied by a WebUI request or changed after the server starts.
-# Defaults preserve the existing badminton command.
-#
-# The package must be produced by deploy/package_gpu_api.ps1.  It contains a
-# single fixed-sport top-level directory, no virtual environment,
+# The package must be produced by deploy/package_gpu_api.ps1. It contains the
+# shared allow-listed multi-sport API in one top-level directory, no virtual environment,
 # no model files, no API data and no secrets.  The script also accepts a flat
 # archive containing api/app.py for recovery purposes.
 
-SPORT_ID="${3:-badminton}"
-case "$SPORT_ID" in
-  badminton|tennis) ;;
-  *) echo "ERROR: sport must be badminton or tennis (got: $SPORT_ID)" >&2; exit 64 ;;
-esac
-DEPLOY_NAME="good-${SPORT_ID}-gpu-api"
+DEPLOY_NAME="good-badminton-gpu-api"
 DEFAULT_ARCHIVE_PATH="/root/${DEPLOY_NAME}-upload.zip"
 DEFAULT_APP_DIR="/root/${DEPLOY_NAME}"
 
 ARCHIVE_PATH="${1:-$DEFAULT_ARCHIVE_PATH}"
 APP_DIR="${2:-$DEFAULT_APP_DIR}"
 STATE_DIR="${GOOD_BADMINTON_STATE_DIR:-${APP_DIR}-state}"
-PYTHON_BIN="${GOOD_BADMINTON_PYTHON_BIN:-python3}"
 ENV_FILE="${STATE_DIR}/.gpu-api.env"
 DATA_DIR="${STATE_DIR}/api_data"
 WEIGHTS_DIR="${STATE_DIR}/weights"
+PREVIOUS_APP_DIR="$STATE_DIR/previous-app"
+CANDIDATE_APP_DIR="$STATE_DIR/.candidate-app"
+FAILED_APP_DIR="$STATE_DIR/failed-app"
 LEGACY_APP_DIR="${GOOD_BADMINTON_LEGACY_APP_DIR:-}"
 REMOVE_LEGACY_APP="${GOOD_BADMINTON_REMOVE_LEGACY_APP:-0}"
+
+if [[ -n "${GOOD_BADMINTON_PYTHON_BIN:-}" ]]; then
+  PYTHON_BIN="$GOOD_BADMINTON_PYTHON_BIN"
+elif [[ -x "$STATE_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$STATE_DIR/.venv/bin/python"
+else
+  PYTHON_BIN="python3"
+fi
 
 fail() {
   echo "ERROR: $*" >&2
@@ -59,6 +58,7 @@ fi
 
 command -v unzip >/dev/null || fail "unzip is required. Install it once in the GPU image."
 command -v curl >/dev/null || fail "curl is required for the local health check."
+command -v "$PYTHON_BIN" >/dev/null || fail "Python runtime is not executable: $PYTHON_BIN"
 [[ -f "$ARCHIVE_PATH" ]] || fail "Upload package first: $ARCHIVE_PATH"
 [[ -s "$ARCHIVE_PATH" ]] || fail "Uploaded package is empty: $ARCHIVE_PATH"
 
@@ -77,26 +77,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[1/6] Validating uploaded package..."
+echo "[1/7] Validating uploaded package..."
 unzip -q "$ARCHIVE_PATH" -d "$STAGING_DIR"
 
 SOURCE_DIR=""
-if [[ -f "$STAGING_DIR/$DEPLOY_NAME/api/gpu_stream_app.py" ]]; then
+if [[ -f "$STAGING_DIR/$DEPLOY_NAME/api/app.py" ]]; then
   SOURCE_DIR="$STAGING_DIR/$DEPLOY_NAME"
 elif [[ -f "$STAGING_DIR/api/app.py" ]]; then
   SOURCE_DIR="$STAGING_DIR"
 else
-  fail "Package does not contain $DEPLOY_NAME/api/gpu_stream_app.py"
+  fail "Package does not contain $DEPLOY_NAME/api/app.py"
 fi
 
 [[ -f "$SOURCE_DIR/deploy/start_gpu_api_container.sh" ]] || \
   fail "Package is missing deploy/start_gpu_api_container.sh"
-[[ -f "$SOURCE_DIR/deploy/start_badminton_gpu_container.sh" ]] || \
-  fail "Package is missing deploy/start_badminton_gpu_container.sh"
-[[ -f "$SOURCE_DIR/deploy/start_sport_gpu_container.sh" ]] || \
-  fail "Package is missing deploy/start_sport_gpu_container.sh"
-[[ -f "$SOURCE_DIR/apps/${SPORT_ID}_gpu/app.py" ]] || \
-  fail "Package is missing fixed ${SPORT_ID} GPU entry point"
+[[ -f "$SOURCE_DIR/deploy/stop_gpu_api_container.sh" ]] || \
+  fail "Package is missing deploy/stop_gpu_api_container.sh"
+[[ -f "$SOURCE_DIR/api/vision_profiles.py" ]] || \
+  fail "Package is missing shared sport profiles"
 [[ -f "$SOURCE_DIR/deploy/install_lap.sh" ]] || \
   fail "Package is missing deploy/install_lap.sh"
 
@@ -111,6 +109,16 @@ import torch
 if not torch.cuda.is_available():
     raise SystemExit("PyTorch cannot access CUDA in the selected Python runtime")
 print(f"Python GPU runtime ready: torch={torch.__version__}, cuda={torch.version.cuda}")
+PY
+
+"$PYTHON_BIN" -m compileall -q "$SOURCE_DIR/api" "$SOURCE_DIR/badminton_analysis"
+PYTHONPATH="$SOURCE_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" - <<'PY'
+import tempfile
+from api.app import create_app
+
+with tempfile.TemporaryDirectory() as data_dir:
+    app = create_app(data_dir=data_dir, start_worker=False)
+    assert app.title == "Good-Badminton multi-sport GPU API"
 PY
 
 echo "[3/7] Ensuring the ByteTrack lap dependency..."
@@ -184,34 +192,27 @@ printf 'GOOD_BADMINTON_API_DATA_DIR=%s\n' "$DATA_DIR" >> "$env_tmp"
 chmod 600 "$env_tmp"
 mv "$env_tmp" "$ENV_FILE"
 
-if [[ "$SPORT_ID" == "tennis" && -f "$SOURCE_DIR/weights/yolo11n-pose.pt" ]]; then
-  # The optional tennis trial package is self-contained for person pose.
-  # Move it into persistent state before replacing APP_DIR.
-  cp -p "$SOURCE_DIR/weights/yolo11n-pose.pt" "$WEIGHTS_DIR/yolo11n-pose.pt"
-  echo "Installed pose checkpoint into persistent weights."
-fi
-if [[ "$SPORT_ID" == "tennis" && -f "$SOURCE_DIR/weights/yolo11s-ball.pt" ]]; then
-  # The optional package payload is the existing badminton checkpoint used
-  # only by the explicit tennis experimental mode. Move it into persistent
-  # state before replacing APP_DIR, just like all other server weights.
-  cp -p "$SOURCE_DIR/weights/yolo11s-ball.pt" "$WEIGHTS_DIR/yolo11s-ball.pt"
-  echo "Installed experimental tennis YOLO-ball checkpoint into persistent weights."
-fi
+checkpoint_from_env() {
+  local key="$1"
+  local fallback="$2"
+  local configured
+  configured="$(sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n 1 | tr -d '\r')"
+  printf '%s' "${configured:-$fallback}"
+}
 
-if [[ "$SPORT_ID" == "badminton" ]]; then
-  [[ -f "$WEIGHTS_DIR/yolo11s-ball.pt" ]] || fail \
-    "Missing $WEIGHTS_DIR/yolo11s-ball.pt. Upload the checked ball-model weight there once; it is preserved on later code upgrades."
-else
-  tennis_checkpoint="$(sed -n 's/^GOOD_TENNIS_STREAM_BALL_MODEL=//p' "$ENV_FILE" | tail -n 1 | tr -d '\r')"
+pose_checkpoint="$(checkpoint_from_env GOOD_BADMINTON_STREAM_POSE_MODEL "$WEIGHTS_DIR/yolo11n-pose.pt")"
+ball_checkpoint="$(checkpoint_from_env GOOD_BADMINTON_STREAM_BALL_MODEL "$WEIGHTS_DIR/yolo11s-ball.pt")"
+[[ -f "$pose_checkpoint" ]] || fail \
+  "Missing pose checkpoint: $pose_checkpoint. Upload yolo11n-pose.pt to $WEIGHTS_DIR or correct GOOD_BADMINTON_STREAM_POSE_MODEL."
+[[ -f "$ball_checkpoint" ]] || fail \
+  "Missing badminton ball checkpoint: $ball_checkpoint. Upload yolo11s-ball.pt to $WEIGHTS_DIR or correct GOOD_BADMINTON_STREAM_BALL_MODEL."
+for tennis_key in GOOD_TENNIS_STREAM_BALL_MODEL GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL; do
+  tennis_checkpoint="$(sed -n "s/^${tennis_key}=//p" "$ENV_FILE" | tail -n 1 | tr -d '\r')"
   if [[ -n "$tennis_checkpoint" && ! -f "$tennis_checkpoint" ]]; then
-    fail "Tennis YOLO checkpoint not found: $tennis_checkpoint"
+    fail "Tennis YOLO checkpoint not found for ${tennis_key}: $tennis_checkpoint"
   fi
-  if [[ -z "$tennis_checkpoint" && ! -f "$WEIGHTS_DIR/yolo11s-ball.pt" ]]; then
-    echo "No tennis ball checkpoint installed; tennis service will start in pose-only mode."
-  fi
-fi
+done
 
-echo "[5/7] Stopping the old API, if present..."
 stop_existing_api() {
   local source_dir="$1"
   [[ -d "$source_dir" ]] || return 0
@@ -225,51 +226,82 @@ stop_existing_api() {
     fi
   fi
 }
+link_persistent_state() {
+  local target_dir="$1"
+  rm -rf "$target_dir/.gpu-api.env" "$target_dir/api_data" "$target_dir/weights"
+  ln -s "$ENV_FILE" "$target_dir/.gpu-api.env"
+  ln -s "$DATA_DIR" "$target_dir/api_data"
+  ln -s "$WEIGHTS_DIR" "$target_dir/weights"
+}
+
+echo "[5/7] Staging the candidate application..."
+rm -rf "$CANDIDATE_APP_DIR"
+mkdir -p "$CANDIDATE_APP_DIR"
+cp -a "$SOURCE_DIR/." "$CANDIDATE_APP_DIR/"
+chmod +x "$CANDIDATE_APP_DIR/deploy/start_gpu_api_container.sh" \
+  "$CANDIDATE_APP_DIR/deploy/stop_gpu_api_container.sh" \
+  "$CANDIDATE_APP_DIR/deploy/install_lap.sh" \
+  "$CANDIDATE_APP_DIR/deploy/refresh_gpu_api_from_zip.sh"
+link_persistent_state "$CANDIDATE_APP_DIR"
+
+echo "[6/7] Switching application code with rollback retained..."
 stop_existing_api "$APP_DIR"
 if [[ -n "$LEGACY_APP_DIR" ]]; then
   stop_existing_api "$LEGACY_APP_DIR"
 fi
+rm -rf "$PREVIOUS_APP_DIR"
+if [[ -d "$APP_DIR" ]]; then
+  mv "$APP_DIR" "$PREVIOUS_APP_DIR"
+fi
+mv "$CANDIDATE_APP_DIR" "$APP_DIR"
 
-echo "[6/7] Replacing only application code..."
-# APP_DIR is validated above.  STATE_DIR is a sibling and survives this rm.
-rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR"
-cp -a "$SOURCE_DIR/." "$APP_DIR/"
-chmod +x "$APP_DIR/deploy/start_gpu_api_container.sh" \
-  "$APP_DIR/deploy/start_badminton_gpu_container.sh" \
-  "$APP_DIR/deploy/start_sport_gpu_container.sh" \
-  "$APP_DIR/deploy/start_tennis_gpu_container.sh" \
-  "$APP_DIR/deploy/stop_gpu_api_container.sh" \
-  "$APP_DIR/deploy/install_lap.sh" \
-  "$APP_DIR/deploy/refresh_gpu_api_from_zip.sh"
+verify_shared_health() {
+  local health_url="$1"
+  local payload
+  payload="$(curl -fsS --max-time 5 "$health_url")" || return 1
+  "$PYTHON_BIN" -c '
+import json
+import sys
+payload = json.load(sys.stdin)
+missing = {"badminton", "tennis"}.difference(payload.get("supported_sport_ids") or [])
+if payload.get("status") != "ok" or missing:
+    raise SystemExit("shared GPU health is missing: " + ", ".join(sorted(missing)))
+' <<<"$payload"
+}
 
-# Make the code see the persistent state through its normal paths.  This
-# prevents old jobs, cache data, model weights and the secret from being lost
-# when the application directory is replaced on the next deployment.
-rm -rf "$APP_DIR/.gpu-api.env" "$APP_DIR/api_data" "$APP_DIR/weights"
-ln -s "$ENV_FILE" "$APP_DIR/.gpu-api.env"
-ln -s "$DATA_DIR" "$APP_DIR/api_data"
-ln -s "$WEIGHTS_DIR" "$APP_DIR/weights"
+restore_previous_api() {
+  local reason="$1"
+  stop_existing_api "$APP_DIR"
+  [[ -d "$PREVIOUS_APP_DIR" ]] || \
+    fail "$reason; this was a first deployment, so no previous application exists. Candidate retained at $APP_DIR."
+  rm -rf "$FAILED_APP_DIR"
+  mv "$APP_DIR" "$FAILED_APP_DIR"
+  mv "$PREVIOUS_APP_DIR" "$APP_DIR"
+  if ! GOOD_BADMINTON_ENV_FILE="$ENV_FILE" GOOD_BADMINTON_PYTHON_BIN="$PYTHON_BIN" \
+    "$APP_DIR/deploy/start_gpu_api_container.sh" "$APP_DIR"; then
+    fail "$reason; automatic rollback could not restart $APP_DIR. Failed candidate: $FAILED_APP_DIR"
+  fi
+  fail "$reason; restored the previous API. Failed candidate: $FAILED_APP_DIR"
+}
 
 echo "[7/7] Starting and verifying the refreshed API..."
-GOOD_BADMINTON_ENV_FILE="$ENV_FILE" \
-GOOD_BADMINTON_PYTHON_BIN="$PYTHON_BIN" \
-  "$APP_DIR/deploy/start_${SPORT_ID}_gpu_container.sh" "$APP_DIR"
-
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
 health_url="http://127.0.0.1:${PORT:-8080}/api/v1/health"
+if ! GOOD_BADMINTON_ENV_FILE="$ENV_FILE" GOOD_BADMINTON_PYTHON_BIN="$PYTHON_BIN" \
+  "$APP_DIR/deploy/start_gpu_api_container.sh" "$APP_DIR"; then
+  restore_previous_api "Candidate API did not start"
+fi
 for _ in {1..10}; do
-  if curl -fsS --max-time 5 "$health_url"; then
+  if verify_shared_health "$health_url"; then
     break
   fi
   sleep 1
 done
-curl -fsS --max-time 5 "$health_url" >/dev/null || \
-  fail "GPU API started but did not remain healthy; see $APP_DIR/gpu-api.log"
-echo
+verify_shared_health "$health_url" || \
+  restore_previous_api "Candidate API did not remain shared-multi-sport healthy; see $APP_DIR/gpu-api.log"
 if [[ -n "$LEGACY_APP_DIR" && "$REMOVE_LEGACY_APP" == "1" ]]; then
   # Explicit opt-in only: the fresh process has passed its health check, so
   # removing this one legacy code directory cannot remove persistent state.

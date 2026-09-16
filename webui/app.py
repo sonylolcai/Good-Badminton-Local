@@ -627,6 +627,7 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
     effective_annotated_video = bool(generate_annotated_video or generate_promotion_video)
     options = {
         "sport_id": "tennis" if sport_id == "tennis" else "badminton",
+        "session_mode": "singles_match" if sport_id == "tennis" else "match",
         "pose_family": pose_family,
         "pose_mode": pose_mode,
         "language": language,
@@ -2950,7 +2951,7 @@ def _build_legacy_analysis_ui():
             choices=[("羽毛球模式", "badminton"), ("网球模式（单打对打）", "tennis")],
             value="badminton",
             label="运动模式",
-            info="每次分析固定一种运动，并在上传前校验对应 GPU 实例的 sport_id。",
+            info="每个任务显式选择运动，并在上传前校验共享 GPU 服务声明的 sport_id。",
         )
         sport_mode_banner = gr.Markdown(
             "## 羽毛球视觉分析\n"

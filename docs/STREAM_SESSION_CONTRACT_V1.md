@@ -105,16 +105,13 @@ Required configuration:
 - `shuttle_detector`: `none`, `yolo` or explicitly enabled `tracknet_v3`.
 - `generate_annotated_video`: production default is `false`.
 
-Fixed-sport GPU deployments may additionally accept these optional anonymous
-vision fields. They select visual constraints only; they never identify a
-person, make a score decision or change the process to another sport.
+共享多运动 GPU 进程接受以下匿名视觉字段。它们只选择 allow-listed 的视觉约束；不会
+识别人物、作出比分决定或加载任意外部模型。
 
-- `sport_id`: an optional identity assertion. It must match the deployment's
-  fixed profile (`badminton` or `tennis`).
-- `session_mode`: required by the tennis deployment. It accepts only
-  `singles_match` (two anonymous athletes) or `single_player_training` (one
-  near-side anonymous athlete). The badminton compatibility deployment keeps
-  `match` and its existing 2/4-person roster policy.
+- `sport_id`: 可选以兼容旧羽毛球请求，缺省为 `badminton`；显式传入时必须是该共享进程声明的 allow-list 成员。
+- `session_mode`: 网球请求必填，只接受 `singles_match`（两名匿名运动员）或
+  `single_player_training`（一名近端匿名运动员）。羽毛球 profile 保持 `match`
+  及既有的 2/4 人 roster 约束。
 - `calibration_scope`: `full_court` or, only for tennis single-player training,
   `near_half_court`. In the latter case the four `court_corners` represent the
   near net-line corners followed by the near baseline corners, and map to the
@@ -123,7 +120,7 @@ person, make a score decision or change the process to another sport.
 The server derives `expected_player_count` and `max_roster_count` from a fixed
 tennis mode: 2 for `singles_match`, 1 for `single_player_training`. A caller
 cannot override those values. `shuttle_detector` is retained as a v1 wire-name:
-the tennis deployment accepts `none` or `yolo`. `none` is pose-only. `yolo`
+the tennis profile accepts `none` or `yolo`. `none` is pose-only. `yolo`
 uses a configured `GOOD_TENNIS_STREAM_BALL_MODEL` when present, requiring the
 exact class name `tennis_ball`. If absent, the explicitly packaged current
 `yolo11s-ball.pt` may be used only as an experimental `badminton`-labelled

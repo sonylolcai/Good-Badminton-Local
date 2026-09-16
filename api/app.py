@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.responses import FileResponse
 
 from .jobs import AnalysisJobManager
+from .mode_sync import VisionModeSynchronizer
 from .stream_runtime import StreamProcessorFactory
 from .stream_routes import register_stream_routes
 from .vision_profiles import get_vision_profile, supported_sport_ids
@@ -107,15 +108,27 @@ def create_app(
         options = _parse_options(options_json)
         try:
             profile = get_vision_profile(sport_id)
+            # The complete-video pipeline has a two-player match shape.  A
+            # tennis training session has a different roster/calibration path
+            # and must use the stream-session endpoint instead of being
+            # accepted as a misleading full-video job.
+            if profile.sport_id == "tennis" and options["session_mode"] != "singles_match":
+                raise ValueError(
+                    "full-video tennis requires session_mode=singles_match; "
+                    "use /api/v1/stream-sessions for single_player_training"
+                )
+            resolved = VisionModeSynchronizer().synchronize(
+                {
+                    "sport_id": profile.sport_id,
+                    "session_mode": options["session_mode"],
+                    "expected_player_count": 2 if options["match_mode"] == "singles" else 4,
+                    "shuttle_detector": options["shuttle_detector"],
+                }
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if options["shuttle_detector"] not in profile.allowed_ball_detectors:
-            allowed = ", ".join(profile.allowed_ball_detectors)
-            raise HTTPException(
-                status_code=422,
-                detail=f"shuttle_detector must be one of [{allowed}] for sport_id={profile.sport_id}",
-            )
-        options["sport_id"] = profile.sport_id
+        options["sport_id"] = resolved["sport_id"]
+        options["session_mode"] = resolved["session_mode"]
         if x_idempotency_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", x_idempotency_key):
             raise HTTPException(status_code=422, detail="X-Idempotency-Key must be 16-128 safe characters")
         existing = manager.get_by_idempotency_key(x_idempotency_key)
@@ -305,6 +318,9 @@ def _parse_options(value):
         "far_player_enhancement": False,
         "far_pose_roi": [0.12, 0.30, 0.86, 0.82],
         "match_mode": "singles",
+        # Stream-session mode names are shared with the complete-video
+        # boundary so tennis cannot silently bypass its profile constraints.
+        "session_mode": None,
         "lock_match_roster": True,
         "roster_stable_frames": 2,
         # ByteTrack is the production association source. It is invoked only
@@ -355,6 +371,8 @@ def _parse_options(value):
         options["browser_video_reencode"] = False
     if options["match_mode"] not in {"singles", "doubles"}:
         raise HTTPException(status_code=422, detail="match_mode must be singles or doubles")
+    if options["session_mode"] is not None and not isinstance(options["session_mode"], str):
+        raise HTTPException(status_code=422, detail="session_mode must be a string or null")
     if options["tracker_backend"] not in {"court_association", "bytetrack"}:
         raise HTTPException(status_code=422, detail="tracker_backend must be court_association or bytetrack")
     if not isinstance(options["enable_bytetrack"], bool):

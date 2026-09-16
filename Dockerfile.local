@@ -1,0 +1,28 @@
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    YOLO_CONFIG_DIR=/var/lib/good-badminton/ultralytics
+
+RUN set -eux; \
+    for attempt in 1 2 3; do \
+        apt-get -o Acquire::Retries=3 update \
+        && apt-get -o Acquire::Retries=3 install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 libgomp1 \
+        && break; \
+        test "$attempt" = 3 && exit 1; \
+        sleep 5; \
+    done; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --retries 5 --timeout 120 -r /tmp/requirements.txt
+
+COPY api /app/api
+COPY badminton_analysis /app/badminton_analysis
+COPY good_badminton_contracts /app/good_badminton_contracts
+COPY simhei.ttf /app/simhei.ttf
+
+EXPOSE 8080
+CMD ["python", "-m", "uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8080"]

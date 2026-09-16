@@ -280,10 +280,10 @@ unzip -p /root/good-badminton-gpu-api-upload.zip \
   good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash
 ```
 
-该脚本会先检查 ZIP 路径安全、Python 依赖和 CUDA；停止旧 API；**只删除**固定应用
-目录；解压新代码；把持久密钥、权重和任务目录重新挂载到新代码；启动 `8080` 并通过
-`/api/v1/health` 验证。任一步骤失败会停止而不会删除状态目录。首次运行时，脚本会创建
-持久 `.gpu-api.env`，但不会在终端输出 API Key；需要将该密钥同步到业务/WebUI 的密钥配置。
+该脚本会先检查 ZIP 路径安全、Python 依赖、CUDA、应用导入和模型路径；随后将候选代码
+切换到固定应用目录，并把上一版保留在 state 目录。候选版本启动失败或 health 没有同时
+声明羽毛球和网球时，脚本会自动恢复上一版。密钥、权重和任务目录始终位于持久 state 目录；
+首次运行时会创建持久 `.gpu-api.env`，但不会在终端输出 API Key。
 
 若服务器目前仍运行旧式目录（例如 `/root/good-badminton-source-2ff758c`），首次切换
 时在运行脚本前设置它。脚本会先迁移旧目录中的 `.gpu-api.env`、`api_data/` 和 `weights/`，
@@ -302,14 +302,15 @@ rm -f /tmp/good-badminton-refresh.sh
 `.gpu-api.pid`，先手动停止已确认属于 Good-Badminton 的旧 `uvicorn` 进程，再执行迁移，
 避免两个程序争抢 `8080` 端口。
 
-首次切换还会校验羽毛球模型在固定持久路径中存在：
+首次切换还会校验姿态与羽毛球模型在固定持久路径中存在：
 
 ```text
+/root/good-badminton-gpu-api-state/weights/yolo11n-pose.pt
 /root/good-badminton-gpu-api-state/weights/yolo11s-ball.pt
 ```
 
-旧目录里已有 `weights/` 时脚本会自动迁移；否则只需手工上传一次到上面的路径。脚本
-会在删除旧代码目录**之前**因缺权重而失败，不会生成“健康但实际无法分析视频”的假部署。
+旧目录里已有 `weights/` 时脚本会自动迁移；否则只需手工上传一次到上面的路径。脚本会在
+切换代码之前因缺权重而失败，不会生成“健康但实际无法分析视频”的假部署。
 
 云平台的开机启动命令也固定为：
 
@@ -331,13 +332,9 @@ TrackNetV3 不能填入 WebUI 的 `yolo11s-ball.pt` 输入框；它是独立的�
 放到 `ckpts/` 后以 `predict.py` 推理；其公布的开发环境较旧，因此必须以服务器实际
 GPU 小视频验收为准，不能假定与当前 Python/Torch 一定兼容。
 
-本地先把 A/B 工具包含进一次应用升级包：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\package_gpu_api.ps1 -IncludeTrackNetABTools
-```
-
-按固定升级流程刷新 GPU 应用代码。然后把下面两份文件上传到服务器：
+当前共享 GPU 包刻意不包含 TrackNetV3 A/B 工具；不要向
+`package_gpu_api.ps1` 传已删除的 `-IncludeTrackNetABTools` 参数。若要恢复该候选实验，
+应先单独审批并交付独立工具包。然后把下面两份文件上传到服务器：
 
 ```text
 /root/good-badminton-tracknet-upload/TrackNetV3-source.zip

@@ -40,11 +40,11 @@
 
 ```dotenv
 GOOD_BADMINTON_API_KEY=replace-with-secret
-GOOD_BADMINTON_API_DATA_DIR=/opt/good-badminton/api_data
+GOOD_BADMINTON_API_DATA_DIR=/root/good-badminton-gpu-api-state/api_data
 GOOD_BADMINTON_STREAM_RETENTION_HOURS=72
 GOOD_BADMINTON_STREAM_SEGMENT_TIMEOUT_SECONDS=10
-GOOD_BADMINTON_STREAM_POSE_MODEL=/opt/good-badminton/weights/yolo11n-pose.pt
-GOOD_BADMINTON_STREAM_BALL_MODEL=/opt/good-badminton/weights/yolo11s-ball.pt
+GOOD_BADMINTON_STREAM_POSE_MODEL=/root/good-badminton-gpu-api-state/weights/yolo11n-pose.pt
+GOOD_BADMINTON_STREAM_BALL_MODEL=/root/good-badminton-gpu-api-state/weights/yolo11s-ball.pt
 GOOD_BADMINTON_STREAM_DEVICE=auto
 GOOD_BADMINTON_STREAM_POSE_CONF=0.15
 PORT=8080

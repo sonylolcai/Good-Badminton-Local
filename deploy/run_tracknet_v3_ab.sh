@@ -42,7 +42,7 @@ fail() {
 [[ -f "$VIDEO_PATH" ]] || fail "Original video not found: $VIDEO_PATH"
 [[ -f "$BASELINE_DETECTIONS" ]] || fail "YOLO detections.jsonl not found: $BASELINE_DETECTIONS"
 [[ -f "$APP_DIR/evaluation/shuttle_tracknet_ab/run_tracknet_v3.py" ]] || \
-  fail "The current Good-Badminton deployment does not include A/B tools. Rebuild the deployment ZIP with -IncludeTrackNetABTools and refresh it first."
+  fail "The shared GPU package does not include TrackNetV3 A/B tools. Use an explicitly approved separate tool package."
 [[ -f "$TRACKNET_ROOT/predict.py" ]] || fail "TrackNetV3 source is not installed. Run setup_tracknet_v3_ab.sh first."
 [[ -f "$TRACKNET_CHECKPOINT" ]] || fail "TrackNetV3 checkpoint is not installed. Run setup_tracknet_v3_ab.sh first."
 [[ "$TRACKNET_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || fail "TRACKNET_BATCH_SIZE must be a positive integer."

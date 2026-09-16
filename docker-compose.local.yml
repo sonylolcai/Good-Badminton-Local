@@ -1,0 +1,27 @@
+services:
+  gpu-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    ports:
+      - "127.0.0.1:${GOOD_BADMINTON_LOCAL_PORT:-8080}:8080"
+    environment:
+      GOOD_BADMINTON_API_KEY: ${GOOD_BADMINTON_API_KEY:?copy .gpu-api.local.env.example to .gpu-api.local.env and replace the key}
+      GOOD_BADMINTON_API_DATA_DIR: /var/lib/good-badminton/api_data
+      GOOD_BADMINTON_STREAM_DEVICE: cpu
+      GOOD_BADMINTON_STREAM_TRACKER_BACKEND: court_association
+      GOOD_BADMINTON_STREAM_SEGMENT_TIMEOUT_SECONDS: ${GOOD_BADMINTON_STREAM_SEGMENT_TIMEOUT_SECONDS:-10}
+    volumes:
+      - good_badminton_local_api_data:/var/lib/good-badminton
+      - ./weights:/app/weights:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json, urllib.request; payload=json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health', timeout=3)); assert payload.get('status') == 'ok' and {'badminton', 'tennis'} <= set(payload.get('supported_sport_ids') or [])"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    init: true
+    restart: unless-stopped
+
+volumes:
+  good_badminton_local_api_data:

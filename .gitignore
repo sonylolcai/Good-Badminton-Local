@@ -16,6 +16,7 @@ results/
 outputs/
 api_data/
 .gpu-api.env
+.gpu-api.local.env
 .webui-remote-gpu.env
 .webui-operator.env
 .env.development

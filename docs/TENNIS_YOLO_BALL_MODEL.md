@@ -1,27 +1,26 @@
 # Tennis YOLO Ball Model Contract
 
-The tennis GPU service can start in pose-only mode. In WebUI, select **only
-person pose** when no ball model is required. Selecting YOLO ball detection
-uses one of the following explicitly separated modes:
+The shared GPU service can run tennis sessions in pose-only mode. In WebUI,
+select **only person pose** when no ball model is required. Selecting YOLO ball
+detection uses one of the following explicitly separated modes:
 
-1. **Dedicated tennis mode**: configure a dedicated checkpoint only on the
-   tennis GPU service:
+1. **Dedicated tennis mode**: configure a dedicated checkpoint on the shared
+   GPU server:
 
 ```bash
-GOOD_TENNIS_STREAM_BALL_MODEL=/root/good-tennis-gpu-api-state/weights/tennis-ball-yolo.pt
+GOOD_TENNIS_STREAM_BALL_MODEL=/root/good-badminton-gpu-api-state/weights/tennis-ball-yolo.pt
 ```
 
-2. **Current-checkpoint experiment**: build the tennis package with the
-   existing `yolo11s-ball.pt` included:
+2. **Current-checkpoint experiment**: place the existing `yolo11s-ball.pt`
+   in the persistent shared weights directory and configure:
 
-```powershell
-.\deploy\package_gpu_api.ps1 -Sport tennis -IncludeExperimentalTennisBallModel
+```bash
+GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL=/root/good-badminton-gpu-api-state/weights/yolo11s-ball.pt
 ```
 
-It creates `deploy/good-tennis-gpu-api-upload.zip` and places the current Pose
-and experimental ball checkpoints into persistent `weights/` during refresh. The fixed tennis launcher
-already selects the sport; `GOOD_SPORT_VISION_PROFILE` is optional and must
-only be absent or equal to `tennis`.
+Build the unique source package with `powershell -File deploy/package_gpu_api.ps1`.
+It contains no checkpoints; refresh preserves the shared persistent `weights/`
+directory. Submit these sessions with `sport_id=tennis`.
 
 The dedicated checkpoint's `names` metadata must contain the exact label
 `tennis_ball`; detections use `ball_kind=tennis_ball`. The optional experiment
