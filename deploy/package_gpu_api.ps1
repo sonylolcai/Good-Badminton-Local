@@ -1,14 +1,19 @@
 [CmdletBinding()]
 param(
     # The file to upload through the GPU provider's browser upload page.
-    [string]$OutputPath = ''
+    [string]$OutputPath = '',
+
+    # A complete, self-contained release with the three allow-listed runtime
+    # checkpoints and their SHA-256 manifest. The default remains source-only.
+    [switch]$IncludeWeights
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $packageName = 'good-badminton-gpu-api'
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    $OutputPath = Join-Path $PSScriptRoot "$packageName-upload.zip"
+    $archiveKind = if ($IncludeWeights) { 'full-release' } else { 'upload' }
+    $OutputPath = Join-Path $PSScriptRoot "$packageName-$archiveKind.zip"
 }
 $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("good-badminton-gpu-package-" + [guid]::NewGuid().ToString('N'))
 $packageRoot = Join-Path $stagingRoot $packageName
@@ -26,6 +31,11 @@ $requiredFiles = @(
     'deploy/setup_tracknet_v3_ab.sh',
     'deploy/start_gpu_api_container.sh',
     'deploy/stop_gpu_api_container.sh'
+)
+$releaseWeightPaths = @(
+    'weights/yolo11n-pose.pt',
+    'weights/yolo11s-ball.pt',
+    'weights/tennis-ball.pt'
 )
 
 function Copy-SourceFile {
@@ -45,6 +55,20 @@ function Copy-SourceFile {
     }
     else {
         Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+}
+
+function Get-Sha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString(
+            $algorithm.ComputeHash([System.IO.File]::ReadAllBytes($Path))
+        )).Replace('-', '')
+    }
+    finally {
+        $algorithm.Dispose()
     }
 }
 
@@ -75,6 +99,27 @@ try {
 
     foreach ($relativePath in $requiredFiles) {
         Copy-SourceFile -RelativePath $relativePath
+    }
+
+    if ($IncludeWeights) {
+        $manifestWeights = @(
+            foreach ($relativePath in $releaseWeightPaths) {
+                Copy-SourceFile -RelativePath $relativePath
+                $item = Get-Item -LiteralPath (Join-Path $packageRoot $relativePath)
+                [ordered]@{
+                    path = [System.IO.Path]::GetFileName($relativePath)
+                    sha256 = Get-Sha256 -Path $item.FullName
+                    bytes = $item.Length
+                }
+            }
+        )
+        $manifest = [ordered]@{
+            schema_version = 'complete-model-release.v1'
+            weights = $manifestWeights
+        }
+        $manifestPath = Join-Path $packageRoot 'weights/manifest.json'
+        $manifestJson = ($manifest | ConvertTo-Json -Depth 4) + [Environment]::NewLine
+        [System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.UTF8Encoding]::new($false))
     }
 
     # Include new, uncommitted runtime modules while keeping the same allow-list.
@@ -129,10 +174,19 @@ try {
     $item = Get-Item -LiteralPath $absoluteOutputPath
     Write-Host "Created GPU deployment package: $($item.FullName)"
     Write-Host "Size: $([math]::Round($item.Length / 1MB, 2)) MiB"
-    Write-Host 'Upload it to /root/good-badminton-gpu-api-upload.zip, then run:'
-    Write-Host 'bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh'
-    Write-Host 'First deployment only:'
-    Write-Host 'unzip -p /root/good-badminton-gpu-api-upload.zip good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash -s --'
+    if ($IncludeWeights) {
+        Write-Host 'Complete release: three checked model files plus manifest; no secrets or job data.'
+        Write-Host 'Upload it to /root/good-badminton-gpu-api-full-release.zip, then run:'
+        Write-Host 'bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh /root/good-badminton-gpu-api-full-release.zip'
+        Write-Host 'First deployment only:'
+        Write-Host 'unzip -p /root/good-badminton-gpu-api-full-release.zip good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash -s -- /root/good-badminton-gpu-api-full-release.zip'
+    }
+    else {
+        Write-Host 'Upload it to /root/good-badminton-gpu-api-upload.zip, then run:'
+        Write-Host 'bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh'
+        Write-Host 'First deployment only:'
+        Write-Host 'unzip -p /root/good-badminton-gpu-api-upload.zip good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash -s --'
+    }
 }
 finally {
     if (Test-Path -LiteralPath $stagingRoot) {

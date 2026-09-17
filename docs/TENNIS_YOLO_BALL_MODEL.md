@@ -8,7 +8,7 @@ detection uses one of the following explicitly separated modes:
    GPU server:
 
 ```bash
-GOOD_TENNIS_STREAM_BALL_MODEL=/root/good-badminton-gpu-api-state/weights/tennis-ball-yolo.pt
+GOOD_TENNIS_STREAM_BALL_MODEL=/root/good-badminton-gpu-api-state/weights/tennis-ball.pt
 ```
 
 2. **Current-checkpoint experiment**: place the existing `yolo11s-ball.pt`
@@ -18,9 +18,12 @@ GOOD_TENNIS_STREAM_BALL_MODEL=/root/good-badminton-gpu-api-state/weights/tennis-
 GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL=/root/good-badminton-gpu-api-state/weights/yolo11s-ball.pt
 ```
 
-Build the unique source package with `powershell -File deploy/package_gpu_api.ps1`.
-It contains no checkpoints; refresh preserves the shared persistent `weights/`
-directory. Submit these sessions with `sport_id=tennis`.
+For a source-only update, build with `powershell -File deploy/package_gpu_api.ps1`;
+it contains no checkpoints and preserves the shared persistent `weights/`
+directory. For a complete code-and-model release, use
+`powershell -File deploy/package_gpu_api.ps1 -IncludeWeights`; it contains the
+dedicated `tennis-ball.pt` together with the two badminton runtime checkpoints
+and a SHA-256 manifest. Submit these sessions with `sport_id=tennis`.
 
 The dedicated checkpoint's `names` metadata must contain the exact label
 `tennis_ball`; detections use `ball_kind=tennis_ball`. The optional experiment

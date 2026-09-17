@@ -7,13 +7,14 @@ set -euo pipefail
 # directory is retained beside persistent state and restored automatically if
 # the candidate cannot start or advertise the shared multi-sport health shape.
 #
-# The package must be produced by deploy/package_gpu_api.ps1. It contains the
-# shared allow-listed multi-sport API in one top-level directory, no virtual environment,
-# no model files, no API data and no secrets.  The script also accepts a flat
-# archive containing api/app.py for recovery purposes.
+# The normal package is source-only. An explicit complete release package adds
+# exactly the three runtime checkpoints plus a SHA-256 manifest; neither form
+# contains a virtual environment, API data or secrets. The script also accepts
+# a flat archive containing api/app.py for recovery purposes.
 
 DEPLOY_NAME="good-badminton-gpu-api"
 DEFAULT_ARCHIVE_PATH="/root/${DEPLOY_NAME}-upload.zip"
+FULL_RELEASE_ARCHIVE_PATH="/root/${DEPLOY_NAME}-full-release.zip"
 DEFAULT_APP_DIR="/root/${DEPLOY_NAME}"
 
 ARCHIVE_PATH="${1:-$DEFAULT_ARCHIVE_PATH}"
@@ -25,6 +26,9 @@ WEIGHTS_DIR="${STATE_DIR}/weights"
 PREVIOUS_APP_DIR="$STATE_DIR/previous-app"
 CANDIDATE_APP_DIR="$STATE_DIR/.candidate-app"
 FAILED_APP_DIR="$STATE_DIR/failed-app"
+PREVIOUS_WEIGHTS_DIR="$STATE_DIR/previous-weights"
+CANDIDATE_WEIGHTS_DIR="$STATE_DIR/.candidate-weights"
+FAILED_WEIGHTS_DIR="$STATE_DIR/failed-weights"
 LEGACY_APP_DIR="${GOOD_BADMINTON_LEGACY_APP_DIR:-}"
 REMOVE_LEGACY_APP="${GOOD_BADMINTON_REMOVE_LEGACY_APP:-0}"
 
@@ -46,8 +50,8 @@ fail() {
   fail "For safety APP_DIR must be exactly $DEFAULT_APP_DIR (got: $APP_DIR)."
 [[ "$STATE_DIR" == "${DEFAULT_APP_DIR}-state" ]] || \
   fail "For safety STATE_DIR must be exactly ${DEFAULT_APP_DIR}-state (got: $STATE_DIR)."
-[[ "$ARCHIVE_PATH" == "$DEFAULT_ARCHIVE_PATH" ]] || \
-  fail "For safety ARCHIVE_PATH must be exactly $DEFAULT_ARCHIVE_PATH (got: $ARCHIVE_PATH)."
+[[ "$ARCHIVE_PATH" == "$DEFAULT_ARCHIVE_PATH" || "$ARCHIVE_PATH" == "$FULL_RELEASE_ARCHIVE_PATH" ]] || \
+  fail "For safety ARCHIVE_PATH must be exactly $DEFAULT_ARCHIVE_PATH or $FULL_RELEASE_ARCHIVE_PATH (got: $ARCHIVE_PATH)."
 if [[ -n "$LEGACY_APP_DIR" ]]; then
   [[ "$LEGACY_APP_DIR" == /root/* && "$LEGACY_APP_DIR" != /root && \
      "$LEGACY_APP_DIR" != "$APP_DIR" && -d "$LEGACY_APP_DIR" ]] || \
@@ -97,6 +101,19 @@ fi
   fail "Package is missing shared sport profiles"
 [[ -f "$SOURCE_DIR/deploy/install_lap.sh" ]] || \
   fail "Package is missing deploy/install_lap.sh"
+
+PACKAGE_WEIGHTS_DIR="$SOURCE_DIR/weights"
+PACKAGE_WEIGHTS_MANIFEST="$PACKAGE_WEIGHTS_DIR/manifest.json"
+HAS_PACKAGED_WEIGHTS=0
+if [[ -e "$PACKAGE_WEIGHTS_DIR" ]]; then
+  [[ -f "$PACKAGE_WEIGHTS_MANIFEST" ]] || \
+    fail "Package weights must include weights/manifest.json"
+  [[ "$ARCHIVE_PATH" == "$FULL_RELEASE_ARCHIVE_PATH" ]] || \
+    fail "Only $FULL_RELEASE_ARCHIVE_PATH may contain model weights"
+  HAS_PACKAGED_WEIGHTS=1
+elif [[ "$ARCHIVE_PATH" == "$FULL_RELEASE_ARCHIVE_PATH" ]]; then
+  fail "Complete release package is missing weights/manifest.json"
+fi
 
 echo "[2/7] Checking the existing Python/GPU runtime..."
 "$PYTHON_BIN" - <<'PY'
@@ -200,18 +217,107 @@ checkpoint_from_env() {
   printf '%s' "${configured:-$fallback}"
 }
 
-pose_checkpoint="$(checkpoint_from_env GOOD_BADMINTON_STREAM_POSE_MODEL "$WEIGHTS_DIR/yolo11n-pose.pt")"
-ball_checkpoint="$(checkpoint_from_env GOOD_BADMINTON_STREAM_BALL_MODEL "$WEIGHTS_DIR/yolo11s-ball.pt")"
-[[ -f "$pose_checkpoint" ]] || fail \
-  "Missing pose checkpoint: $pose_checkpoint. Upload yolo11n-pose.pt to $WEIGHTS_DIR or correct GOOD_BADMINTON_STREAM_POSE_MODEL."
-[[ -f "$ball_checkpoint" ]] || fail \
-  "Missing badminton ball checkpoint: $ball_checkpoint. Upload yolo11s-ball.pt to $WEIGHTS_DIR or correct GOOD_BADMINTON_STREAM_BALL_MODEL."
-for tennis_key in GOOD_TENNIS_STREAM_BALL_MODEL GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL; do
-  tennis_checkpoint="$(sed -n "s/^${tennis_key}=//p" "$ENV_FILE" | tail -n 1 | tr -d '\r')"
-  if [[ -n "$tennis_checkpoint" && ! -f "$tennis_checkpoint" ]]; then
-    fail "Tennis YOLO checkpoint not found for ${tennis_key}: $tennis_checkpoint"
+prepare_packaged_weights() {
+  rm -rf "$CANDIDATE_WEIGHTS_DIR"
+  mkdir -p "$CANDIDATE_WEIGHTS_DIR"
+  "$PYTHON_BIN" - "$PACKAGE_WEIGHTS_MANIFEST" "$PACKAGE_WEIGHTS_DIR" "$CANDIDATE_WEIGHTS_DIR" <<'PY'
+import hashlib
+import json
+import shutil
+import sys
+from pathlib import Path
+
+manifest_path, package_dir, candidate_dir = map(Path, sys.argv[1:])
+allowed = {"yolo11n-pose.pt", "yolo11s-ball.pt", "tennis-ball.pt"}
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if manifest.get("schema_version") != "complete-model-release.v1":
+    raise SystemExit("Unsupported model manifest schema")
+entries = manifest.get("weights")
+if not isinstance(entries, list):
+    raise SystemExit("Model manifest weights must be a list")
+by_name = {}
+for entry in entries:
+    if not isinstance(entry, dict):
+        raise SystemExit("Model manifest entry must be an object")
+    name, digest, size = entry.get("path"), entry.get("sha256"), entry.get("bytes")
+    if name not in allowed or name in by_name:
+        raise SystemExit("Model manifest has an unexpected or duplicate checkpoint")
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdefABCDEF" for c in digest):
+        raise SystemExit(f"Model manifest SHA-256 is invalid for {name}")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+        raise SystemExit(f"Model manifest byte count is invalid for {name}")
+    by_name[name] = entry
+if set(by_name) != allowed:
+    raise SystemExit("Complete release must contain exactly the three required checkpoints")
+if {item.name for item in package_dir.iterdir()} != allowed | {"manifest.json"}:
+    raise SystemExit("Package weights directory contains an unexpected file")
+for name in sorted(allowed):
+    source = package_dir / name
+    if not source.is_file():
+        raise SystemExit(f"Checkpoint is not a regular file: {name}")
+    payload = source.read_bytes()
+    entry = by_name[name]
+    if len(payload) != entry["bytes"]:
+        raise SystemExit(f"Checkpoint byte count does not match manifest: {name}")
+    if hashlib.sha256(payload).hexdigest().lower() != entry["sha256"].lower():
+        raise SystemExit(f"Checkpoint SHA-256 does not match manifest: {name}")
+    shutil.copy2(source, candidate_dir / name)
+shutil.copy2(manifest_path, candidate_dir / "manifest.json")
+PY
+}
+
+required_checkpoints_present() {
+  local pose_checkpoint ball_checkpoint tennis_checkpoint tennis_key missing=0
+  pose_checkpoint="$(checkpoint_from_env GOOD_BADMINTON_STREAM_POSE_MODEL "$WEIGHTS_DIR/yolo11n-pose.pt")"
+  ball_checkpoint="$(checkpoint_from_env GOOD_BADMINTON_STREAM_BALL_MODEL "$WEIGHTS_DIR/yolo11s-ball.pt")"
+  if [[ ! -f "$pose_checkpoint" ]]; then
+    echo "Missing pose checkpoint: $pose_checkpoint" >&2
+    missing=1
   fi
-done
+  if [[ ! -f "$ball_checkpoint" ]]; then
+    echo "Missing badminton ball checkpoint: $ball_checkpoint" >&2
+    missing=1
+  fi
+  for tennis_key in GOOD_TENNIS_STREAM_BALL_MODEL GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL; do
+    tennis_checkpoint="$(sed -n "s/^${tennis_key}=//p" "$ENV_FILE" | tail -n 1 | tr -d '\r')"
+    if [[ -n "$tennis_checkpoint" && ! -f "$tennis_checkpoint" ]]; then
+      echo "Tennis YOLO checkpoint not found for ${tennis_key}: $tennis_checkpoint" >&2
+      missing=1
+    fi
+  done
+  return "$missing"
+}
+
+activate_packaged_weights() {
+  [[ "$HAS_PACKAGED_WEIGHTS" == "1" ]] || return 0
+  rm -rf "$PREVIOUS_WEIGHTS_DIR"
+  if [[ -d "$WEIGHTS_DIR" ]]; then
+    mv "$WEIGHTS_DIR" "$PREVIOUS_WEIGHTS_DIR"
+  fi
+  if ! mv "$CANDIDATE_WEIGHTS_DIR" "$WEIGHTS_DIR"; then
+    [[ -d "$PREVIOUS_WEIGHTS_DIR" ]] && mv "$PREVIOUS_WEIGHTS_DIR" "$WEIGHTS_DIR"
+    fail "Could not activate the verified model bundle"
+  fi
+  chmod 700 "$WEIGHTS_DIR"
+}
+
+restore_previous_weights() {
+  [[ "$HAS_PACKAGED_WEIGHTS" == "1" && -d "$PREVIOUS_WEIGHTS_DIR" ]] || return 0
+  rm -rf "$FAILED_WEIGHTS_DIR"
+  if [[ -e "$WEIGHTS_DIR" ]]; then
+    mv "$WEIGHTS_DIR" "$FAILED_WEIGHTS_DIR"
+  fi
+  mv "$PREVIOUS_WEIGHTS_DIR" "$WEIGHTS_DIR"
+}
+
+if [[ "$HAS_PACKAGED_WEIGHTS" == "1" ]]; then
+  if ! grep -q '^GOOD_TENNIS_STREAM_BALL_MODEL=' "$ENV_FILE"; then
+    printf 'GOOD_TENNIS_STREAM_BALL_MODEL=%s/tennis-ball.pt\n' "$WEIGHTS_DIR" >> "$ENV_FILE"
+  fi
+  prepare_packaged_weights
+elif ! required_checkpoints_present; then
+  fail "Missing required checkpoints. Upload them to $WEIGHTS_DIR or correct the corresponding environment variables."
+fi
 
 stop_existing_api() {
   local source_dir="$1"
@@ -244,6 +350,14 @@ chmod +x "$CANDIDATE_APP_DIR/deploy/start_gpu_api_container.sh" \
   "$CANDIDATE_APP_DIR/deploy/refresh_gpu_api_from_zip.sh"
 link_persistent_state "$CANDIDATE_APP_DIR"
 
+if [[ "$HAS_PACKAGED_WEIGHTS" == "1" ]]; then
+  activate_packaged_weights
+  if ! required_checkpoints_present; then
+    restore_previous_weights
+    fail "Verified model bundle conflicts with the current model environment configuration"
+  fi
+fi
+
 echo "[6/7] Switching application code with rollback retained..."
 stop_existing_api "$APP_DIR"
 if [[ -n "$LEGACY_APP_DIR" ]]; then
@@ -272,6 +386,7 @@ if payload.get("status") != "ok" or missing:
 restore_previous_api() {
   local reason="$1"
   stop_existing_api "$APP_DIR"
+  restore_previous_weights
   [[ -d "$PREVIOUS_APP_DIR" ]] || \
     fail "$reason; this was a first deployment, so no previous application exists. Candidate retained at $APP_DIR."
   rm -rf "$FAILED_APP_DIR"
