@@ -22,16 +22,18 @@ class FakePoseProcessor:
         return self.detections
 
 
-def person_with_ankles(left, right):
+def person_with_ankles(left, right, hips=((18, 30), (22, 30))):
     keypoints = np.zeros((17, 2), dtype=float)
     keypoints[5:15] = (20, 20)
+    keypoints[11] = hips[0]
+    keypoints[12] = hips[1]
     keypoints[15] = left
     keypoints[16] = right
     return keypoints
 
 
 class PlayerGroundPointTests(unittest.TestCase):
-    def test_uses_two_ankles_single_ankle_then_bbox_bottom(self):
+    def test_uses_pelvis_projection_then_degraded_pelvis_fallbacks(self):
         people = np.stack(
             [
                 person_with_ankles((10, 60), (30, 62)),
@@ -56,11 +58,15 @@ class PlayerGroundPointTests(unittest.TestCase):
 
         self.assertEqual(len(centroids), 3)
         np.testing.assert_allclose(centroids[0], [120, 261])
-        np.testing.assert_allclose(centroids[1], [140, 255])
-        np.testing.assert_allclose(centroids[2], [175, 258])
+        np.testing.assert_allclose(centroids[1], [120, 255])
+        np.testing.assert_allclose(centroids[2], [120, 258])
         self.assertEqual(
             [location["method"] for location in pose_data["locations"]],
-            ["ankles_midpoint", "single_ankle", "bbox_bottom_center"],
+            [
+                "pelvis_ground_projection",
+                "pelvis_single_ankle_ground_projection",
+                "pelvis_bbox_ground_projection",
+            ],
         )
         self.assertEqual(
             [location["degraded"] for location in pose_data["locations"]],
@@ -68,7 +74,7 @@ class PlayerGroundPointTests(unittest.TestCase):
         )
         self.assertAlmostEqual(pose_data["locations"][0]["confidence"], 0.72)
         self.assertAlmostEqual(pose_data["locations"][1]["confidence"], 0.54)
-        self.assertAlmostEqual(pose_data["locations"][2]["confidence"], 0.28)
+        self.assertAlmostEqual(pose_data["locations"][2]["confidence"], 0.252)
         self.assertEqual(pose_data["detections"][1]["source"], "far_roi")
         np.testing.assert_allclose(pose_data["detections"][2]["bbox"], [160, 205, 190, 258])
 
@@ -87,8 +93,23 @@ class PlayerGroundPointTests(unittest.TestCase):
         visualizer.detect_players(np.zeros((80, 100, 3), dtype=np.uint8), 0, 0)
         location = visualizer.get_current_pose_data()["locations"][0]
 
-        self.assertEqual(location["method"], "bbox_bottom_center")
-        self.assertAlmostEqual(location["confidence"], 0.21)
+        self.assertEqual(location["method"], "pelvis_bbox_ground_projection")
+        self.assertAlmostEqual(location["confidence"], 0.189)
+
+    def test_alternating_foot_positions_keep_body_centre_stable(self):
+        visualizer = PlayerPoseVisualizer(
+            rtmpose_processor=FakePoseProcessor(None, None, [])
+        )
+        left_step = person_with_ankles((5, 60), (35, 62))
+        right_step = person_with_ankles((15, 62), (45, 60))
+        scores = np.full(17, 0.9, dtype=float)
+
+        first = visualizer._select_ground_point(left_step, scores, [0, 0, 50, 65], 0.9)
+        second = visualizer._select_ground_point(right_step, scores, [0, 0, 50, 65], 0.9)
+
+        self.assertEqual(first["method"], "pelvis_ground_projection")
+        self.assertEqual(second["method"], "pelvis_ground_projection")
+        self.assertEqual(first["point"][0], second["point"][0])
 
     def test_far_baseline_margin_does_not_expand_lateral_boundary(self):
         mapper = CourtMapper([(0, 0), (100, 0), (100, 200), (0, 200)])

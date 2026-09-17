@@ -108,27 +108,28 @@ def create_app(
         options = _parse_options(options_json)
         try:
             profile = get_vision_profile(sport_id)
-            # The complete-video pipeline has a two-player match shape.  A
-            # tennis training session has a different roster/calibration path
-            # and must use the stream-session endpoint instead of being
-            # accepted as a misleading full-video job.
-            if profile.sport_id == "tennis" and options["session_mode"] != "singles_match":
-                raise ValueError(
-                    "full-video tennis requires session_mode=singles_match; "
-                    "use /api/v1/stream-sessions for single_player_training"
-                )
             resolved = VisionModeSynchronizer().synchronize(
                 {
                     "sport_id": profile.sport_id,
                     "session_mode": options["session_mode"],
-                    "expected_player_count": 2 if options["match_mode"] == "singles" else 4,
+                    "expected_player_count": (
+                        None
+                        if options["session_mode"] == "single_player_training"
+                        else 2 if options["match_mode"] == "singles" else 4
+                    ),
                     "shuttle_detector": options["shuttle_detector"],
                 }
             )
+            if profile.sport_id == "tennis" and options["match_mode"] != "singles":
+                raise ValueError("full-video tennis supports match_mode=singles only")
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         options["sport_id"] = resolved["sport_id"]
         options["session_mode"] = resolved["session_mode"]
+        options["far_player_enhancement"] = bool(
+            options["far_player_enhancement"]
+            and resolved["session_mode"] != "single_player_training"
+        )
         if x_idempotency_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", x_idempotency_key):
             raise HTTPException(status_code=422, detail="X-Idempotency-Key must be 16-128 safe characters")
         existing = manager.get_by_idempotency_key(x_idempotency_key)

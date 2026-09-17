@@ -178,7 +178,7 @@ class PlayerPoseVisualizer:
         return np.isfinite(score) and score >= self.keypoint_conf_threshold
 
     def _select_ground_point(self, keypoints, keypoint_scores=None, bbox=None, person_confidence=1.0):
-        """Select a court contact point and expose whether it used degraded evidence."""
+        """Project the pelvis centre to the visible ground-contact height."""
         points = np.asarray(keypoints, dtype=float)
         scores = None if keypoint_scores is None else np.asarray(keypoint_scores, dtype=float).reshape(-1)
         try:
@@ -186,8 +186,49 @@ class PlayerPoseVisualizer:
         except (TypeError, ValueError):
             base_confidence = 0.0
 
+        left_hip_visible = self._keypoint_is_visible(points[11], scores, 11)
+        right_hip_visible = self._keypoint_is_visible(points[12], scores, 12)
         left_visible = self._keypoint_is_visible(points[15], scores, 15)
         right_visible = self._keypoint_is_visible(points[16], scores, 16)
+
+        if left_hip_visible and right_hip_visible:
+            pelvis_x = float((points[11, 0] + points[12, 0]) / 2.0)
+            hip_confidence = 1.0 if scores is None else min(float(scores[11]), float(scores[12]))
+            if left_visible and right_visible:
+                ground_y = float((points[15, 1] + points[16, 1]) / 2.0)
+                ankle_confidence = 1.0 if scores is None else min(float(scores[15]), float(scores[16]))
+                return {
+                    "point": np.asarray([pelvis_x, ground_y], dtype=float),
+                    "method": "pelvis_ground_projection",
+                    "confidence": float(np.clip(base_confidence * min(hip_confidence, ankle_confidence), 0.0, 1.0)),
+                    "degraded": False,
+                }
+
+            if left_visible or right_visible:
+                ankle_index = 15 if left_visible else 16
+                ankle_confidence = 1.0 if scores is None else float(scores[ankle_index])
+                return {
+                    "point": np.asarray([pelvis_x, points[ankle_index, 1]], dtype=float),
+                    "method": "pelvis_single_ankle_ground_projection",
+                    "confidence": float(np.clip(base_confidence * min(hip_confidence, ankle_confidence) * 0.75, 0.0, 1.0)),
+                    "degraded": True,
+                }
+
+            if bbox is not None:
+                bbox_values = np.asarray(bbox, dtype=float).reshape(-1)
+                if (
+                    bbox_values.size >= 4
+                    and np.isfinite(bbox_values[:4]).all()
+                    and bbox_values[2] > bbox_values[0]
+                    and bbox_values[3] > bbox_values[1]
+                ):
+                    return {
+                        "point": np.asarray([pelvis_x, bbox_values[3]], dtype=float),
+                        "method": "pelvis_bbox_ground_projection",
+                        "confidence": float(np.clip(base_confidence * hip_confidence * 0.35, 0.0, 1.0)),
+                        "degraded": True,
+                    }
+
         if left_visible and right_visible:
             point = (points[15, :2] + points[16, :2]) / 2.0
             ankle_confidence = 1.0 if scores is None else min(float(scores[15]), float(scores[16]))

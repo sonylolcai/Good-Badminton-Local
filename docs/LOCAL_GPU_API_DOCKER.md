@@ -28,4 +28,6 @@ docker compose --env-file .gpu-api.local.env -f docker-compose.local.yml down
 不要加 `-v`，除非明确要删除本地 API 任务状态。
 
 网球完整视频任务必须在 `options_json` 中显式传入
-`"session_mode":"singles_match"`；单人训练应使用 `/api/v1/stream-sessions`。
+`"session_mode":"singles_match"` 或 `"session_mode":"single_player_training"`，且
+`"match_mode":"singles"`。单人训练使用完整场地四角标定，只锁定近端 1 名运动员，
+并自动关闭远端球员增强；需要分片持续分析时仍使用 `/api/v1/stream-sessions`。

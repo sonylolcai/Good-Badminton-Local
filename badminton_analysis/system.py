@@ -88,12 +88,33 @@ class BadmintonAnalysisSystem:
                  movement_rally_settle_seconds=0.7, generate_annotated_video=False,
                  browser_video_reencode=False, sport_id='badminton',
                  court_dimensions=(6.1, 13.4), calibration_world_points_m=None,
-                 coordinate_system_id='standard_badminton_court_m'):
+                 coordinate_system_id='standard_badminton_court_m',
+                 session_mode='match', expected_player_count=None,
+                 athlete_observation_region='full_court_athletes',
+                 athlete_observation_margin_m=0.35,
+                 athlete_observation_lateral_margin_m=None,
+                 athlete_observation_baseline_margin_m=None):
         self.video_path = video_path
         self.sport_id = str(sport_id)
         self.court_dimensions = tuple(float(value) for value in court_dimensions)
         self.calibration_world_points_m = calibration_world_points_m
         self.coordinate_system_id = str(coordinate_system_id)
+        self.session_mode = str(session_mode)
+        self.expected_player_count = (
+            None if expected_player_count is None else int(expected_player_count)
+        )
+        self.athlete_observation_region = str(athlete_observation_region)
+        self.athlete_observation_margin_m = float(athlete_observation_margin_m)
+        self.athlete_observation_lateral_margin_m = (
+            self.athlete_observation_margin_m
+            if athlete_observation_lateral_margin_m is None
+            else float(athlete_observation_lateral_margin_m)
+        )
+        self.athlete_observation_baseline_margin_m = (
+            self.athlete_observation_margin_m
+            if athlete_observation_baseline_margin_m is None
+            else float(athlete_observation_baseline_margin_m)
+        )
         self.show_display = show_display
         self.language = language
         self.template_path = template_path
@@ -414,6 +435,12 @@ class BadmintonAnalysisSystem:
             court_dimensions=self.court_dimensions,
             world_points_m=self.calibration_world_points_m,
             coordinate_system_id=self.coordinate_system_id,
+            session_mode=self.session_mode,
+            expected_player_count=self.expected_player_count,
+            athlete_observation_region=self.athlete_observation_region,
+            athlete_observation_margin_m=self.athlete_observation_margin_m,
+            athlete_observation_lateral_margin_m=self.athlete_observation_lateral_margin_m,
+            athlete_observation_baseline_margin_m=self.athlete_observation_baseline_margin_m,
         )
         self._write_metadata(fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height)
         
@@ -515,7 +542,7 @@ class BadmintonAnalysisSystem:
                     "imgsz": self.pose_imgsz if self.pose_family == "yolo-pose" else None,
                     "conf": self.pose_conf if self.pose_family == "yolo-pose" else None,
                     "detection_plan": (
-                        "full_640+far_roi_640"
+                        f"full_{self.pose_imgsz}+far_roi_{self.pose_imgsz}"
                         if self.pose_family == "yolo-pose" and self.far_player_enhancement
                         else f"full_{self.pose_imgsz}"
                         if self.pose_family == "yolo-pose"
@@ -583,6 +610,12 @@ class BadmintonAnalysisSystem:
                     "zone_policy": "zone_id is transient court space; never identity, team, or side",
                     "legacy_compatibility": "players.upper/lower retained for existing consumers only",
                     "match_mode": self.match_mode,
+                    "session_mode": self.session_mode,
+                    "analysis_scope": (
+                        "near_court_single_player"
+                        if self.session_mode == "single_player_training"
+                        else "full_court_match"
+                    ),
                     "max_players_per_team": 1 if self.match_mode == 'singles' else 2,
                     "backend": self.tracker_backend,
                     "bytetrack_enabled": self.tracker_backend == 'bytetrack',
@@ -592,7 +625,11 @@ class BadmintonAnalysisSystem:
                         else {
                             "enabled": self.lock_match_roster,
                             "status": "not_initialized",
-                            "expected_player_count": 2 if self.match_mode == "singles" else 4,
+                            "expected_player_count": (
+                                self.expected_player_count
+                                if self.expected_player_count is not None
+                                else 2 if self.match_mode == "singles" else 4
+                            ),
                         }
                     ),
                     "state_policy": "detected is a measurement; predicted/missing are explicit temporal states and not detector facts",
