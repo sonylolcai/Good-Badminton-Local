@@ -59,6 +59,12 @@ class ShuttlecockTracker:
 
         if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
             self.ultra_device = 0
+        elif (
+            torch is not None
+            and getattr(getattr(torch, "backends", None), "mps", None)
+            and torch.backends.mps.is_available()
+        ):
+            self.ultra_device = "mps"
         else:
             self.ultra_device = "cpu"
 

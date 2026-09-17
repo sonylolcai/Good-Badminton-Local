@@ -160,6 +160,9 @@ class PersonOnlyTracker:
             require_association_keys=(
                 tracker_backend == "bytetrack" and self.lock_match_roster
             ),
+            athlete_observation_margin_m=self.athlete_observation_margin_m,
+            athlete_observation_lateral_margin_m=self.athlete_observation_lateral_margin_m,
+            athlete_observation_baseline_margin_m=self.athlete_observation_baseline_margin_m,
         )
         self._registry: dict[str, dict] = {}
         self._last_frame_index = -1

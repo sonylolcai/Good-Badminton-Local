@@ -46,6 +46,13 @@ class YOLOPoseProcessor:
 
                 if torch.cuda.is_available():
                     selected = 0
+                elif (
+                    getattr(getattr(torch, "backends", None), "mps", None)
+                    and torch.backends.mps.is_available()
+                ):
+                    # Ultralytics accepts the literal device name on Apple
+                    # Silicon. Keep CUDA first for existing GPU deployments.
+                    selected = "mps"
             except Exception:
                 selected = "cpu"
             self.device = selected

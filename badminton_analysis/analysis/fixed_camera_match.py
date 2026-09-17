@@ -10,6 +10,7 @@ keeps future doubles rules outside the visual tracking layer.
 from copy import deepcopy
 from dataclasses import dataclass, field
 from math import hypot
+from statistics import median
 from typing import Optional, Tuple
 
 from ..court.mapper import CourtMapper
@@ -25,10 +26,11 @@ TRACKER_STATE_VERSION = "court-multi-object-tracker.v1"
 # evidence drawn on screen, and it must not turn small foot-point jitter into
 # apparent movement.  These limits deliberately affect display only; raw
 # per-frame positions remain available in detections.jsonl for audit.
-DISPLAY_SPEED_WINDOW_SECONDS = 0.5
+DISPLAY_SPEED_WINDOW_SECONDS = 1.0
 DISPLAY_SPEED_MAX_OBSERVATION_GAP_SECONDS = 0.15
-DISPLAY_SPEED_STEP_DEAD_ZONE_M = 0.05
-DISPLAY_SPEED_DEAD_ZONE_MPS = 0.35
+DISPLAY_SPEED_MIN_OBSERVATION_SPAN_SECONDS = 0.4
+DISPLAY_SPEED_DEAD_ZONE_MPS = 0.2
+DISPLAY_SPEED_EDGE_MEDIAN_SAMPLES = 3
 
 # Ultralytics YOLO Pose emits the standard 17-point COCO skeleton.  The raw
 # order is declared once in metadata rather than repeated beside every frame,
@@ -186,6 +188,9 @@ class CourtMultiObjectTracker:
         roster_discovery_seconds=8.0,
         roster_reacquire_seconds=1.0,
         require_association_keys=False,
+        athlete_observation_margin_m=0.35,
+        athlete_observation_lateral_margin_m=None,
+        athlete_observation_baseline_margin_m=None,
     ):
         if match_mode not in {"singles", "doubles", "person_only"}:
             raise ValueError("match_mode must be 'singles', 'doubles', or 'person_only'")
@@ -196,6 +201,25 @@ class CourtMultiObjectTracker:
             max_retained_missing_frames or max(self.max_missed_frames * 10, self.max_missed_frames + 1)
         )
         self.max_speed_mps = float(max_speed_mps)
+        self.athlete_observation_margin_m = max(
+            0.0, float(athlete_observation_margin_m)
+        )
+        self.athlete_observation_lateral_margin_m = max(
+            0.0,
+            float(
+                self.athlete_observation_margin_m
+                if athlete_observation_lateral_margin_m is None
+                else athlete_observation_lateral_margin_m
+            ),
+        )
+        self.athlete_observation_baseline_margin_m = max(
+            0.0,
+            float(
+                self.athlete_observation_margin_m
+                if athlete_observation_baseline_margin_m is None
+                else athlete_observation_baseline_margin_m
+            ),
+        )
         self.match_mode = match_mode
         self.max_players_per_team = (
             1 if match_mode == "singles" else 2 if match_mode == "doubles" else None
@@ -272,7 +296,12 @@ class CourtMultiObjectTracker:
         observations = [
             item for item in observations
             if item.get("court_xy") is not None
-            and self.court_space.contains(item["court_xy"], margin_m=0.35)
+            and self.court_space.contains_athlete(
+                item["court_xy"],
+                margin_m=self.athlete_observation_margin_m,
+                lateral_margin_m=self.athlete_observation_lateral_margin_m,
+                baseline_margin_m=self.athlete_observation_baseline_margin_m,
+            )
         ]
         if self.lock_match_roster and self.roster_status != "locked":
             if not has_fresh_observations:
@@ -504,7 +533,7 @@ class CourtMultiObjectTracker:
         # happens to be near an old court coordinate is how one player gets
         # copied into another player's permanent slot.
         candidates = []
-        if not self.require_association_keys:
+        if not self.require_association_keys or self.expected_roster_count == 1:
             for track_id, track in self.tracks.items():
                 if track_id not in unmatched_track_ids:
                     continue
@@ -542,7 +571,11 @@ class CourtMultiObjectTracker:
         # teammates returning on the same end remain unassigned rather than
         # being guessed, and the recovered association is explicitly low
         # confidence for downstream analytics.
-        if not self.require_association_keys:
+        # A one-person locked roster has no same-side identity ambiguity: the
+        # only accepted near-court observation can safely reclaim the only
+        # durable ID after ByteTrack restarts its local key. Multi-person
+        # ByteTrack rosters keep the stricter key-only policy.
+        if not self.require_association_keys or self.expected_roster_count == 1:
             for track_id, index in self._unambiguous_long_gap_recoveries(
                 unmatched_track_ids,
                 unmatched_observations,
@@ -939,7 +972,25 @@ class CourtMultiObjectTracker:
         # Never calculate a current speed across a detector gap.  A returning
         # pose is real evidence, but its movement during the unseen interval
         # is unknown and must not be reconstructed for a screen statistic.
-        if observation_gap_seconds > DISPLAY_SPEED_MAX_OBSERVATION_GAP_SECONDS:
+        previous_method = track.last_evidence.get("method")
+        current_method = observation.get("location_method")
+        previous_source = track.last_evidence.get("source")
+        current_source = observation.get("source")
+        method_changed = bool(
+            previous_method
+            and current_method
+            and str(previous_method) != str(current_method)
+        )
+        source_changed = bool(
+            previous_source
+            and current_source
+            and str(previous_source) != str(current_source)
+        )
+        if (
+            observation_gap_seconds > DISPLAY_SPEED_MAX_OBSERVATION_GAP_SECONDS
+            or method_changed
+            or source_changed
+        ):
             track.court_observation_history = []
         track.court_observation_history.append((int(frame_index), new_xy))
         earliest_frame = int(frame_index - self.fps * DISPLAY_SPEED_WINDOW_SECONDS)
@@ -989,17 +1040,21 @@ class CourtMultiObjectTracker:
 
         ``predicted`` and ``missing`` track records deliberately return no
         speed.  For a current detection, only a short uninterrupted sequence
-        of real court observations is used.  Individual steps within five
-        centimetres are treated as localisation noise; a remaining speed below
-        0.35 m/s is shown as stationary rather than as a false slow walk.
+        of real court observations is used.  The position at each edge of the
+        window is a coordinate-wise median, and current speed is the net body
+        translation between those robust endpoints.  This prevents alternating
+        localisation jitter from accumulating into a false walking speed.
         """
         base = {
             "current_speed_mps": None,
             "status": "not_currently_measured",
             "window_seconds": DISPLAY_SPEED_WINDOW_SECONDS,
+            "minimum_observation_span_seconds": DISPLAY_SPEED_MIN_OBSERVATION_SPAN_SECONDS,
             "dead_zone_mps": DISPLAY_SPEED_DEAD_ZONE_MPS,
             "measurement_count": 0,
-            "source": "fresh_spatial_track_measurements_only",
+            "source": "robust_endpoint_net_displacement",
+            "position_source": track.last_evidence.get("method"),
+            "inference_source": track.last_evidence.get("source"),
         }
         if not is_current_measurement:
             return base
@@ -1008,21 +1063,33 @@ class CourtMultiObjectTracker:
         if len(history) < 2:
             base["status"] = "not_enough_fresh_measurements"
             return base
-        start_frame, _start_xy = history[0]
-        end_frame, _end_xy = history[-1]
-        elapsed_seconds = (int(end_frame) - int(start_frame)) / self.fps
+        observation_span_seconds = (
+            float(history[-1][0]) - float(history[0][0])
+        ) / self.fps
+        if observation_span_seconds < DISPLAY_SPEED_MIN_OBSERVATION_SPAN_SECONDS:
+            base["status"] = "not_enough_fresh_measurements"
+            return base
+        edge_count = min(
+            DISPLAY_SPEED_EDGE_MEDIAN_SAMPLES,
+            max(1, len(history) // 2),
+        )
+        start_edge = history[:edge_count]
+        end_edge = history[-edge_count:]
+        start_frame = median(item[0] for item in start_edge)
+        end_frame = median(item[0] for item in end_edge)
+        start_xy = (
+            median(item[1][0] for item in start_edge),
+            median(item[1][1] for item in start_edge),
+        )
+        end_xy = (
+            median(item[1][0] for item in end_edge),
+            median(item[1][1] for item in end_edge),
+        )
+        elapsed_seconds = (float(end_frame) - float(start_frame)) / self.fps
         if elapsed_seconds <= 0:
             base["status"] = "not_enough_fresh_measurements"
             return base
-        distance_m = 0.0
-        for (left_frame, left_xy), (right_frame, right_xy) in zip(history, history[1:]):
-            step_seconds = (int(right_frame) - int(left_frame)) / self.fps
-            if step_seconds <= 0 or step_seconds > DISPLAY_SPEED_MAX_OBSERVATION_GAP_SECONDS:
-                base["status"] = "not_enough_fresh_measurements"
-                return base
-            step_distance = self._distance(left_xy, right_xy)
-            if step_distance >= DISPLAY_SPEED_STEP_DEAD_ZONE_M:
-                distance_m += step_distance
+        distance_m = self._distance(start_xy, end_xy)
         raw_speed_mps = distance_m / elapsed_seconds
         speed_mps = 0.0 if raw_speed_mps < DISPLAY_SPEED_DEAD_ZONE_MPS else raw_speed_mps
         base.update({
@@ -1030,6 +1097,7 @@ class CourtMultiObjectTracker:
             "status": "stationary" if speed_mps == 0.0 else "moving",
             "measured_distance_m": round(distance_m, 4),
             "measured_elapsed_seconds": round(elapsed_seconds, 4),
+            "endpoint_median_samples": edge_count,
         })
         return base
 
@@ -1059,7 +1127,7 @@ class CourtMultiObjectTracker:
         preserves the evidence when an overlap separates while avoiding a
         forced ID switch between two same-side doubles partners.
         """
-        if not self.lock_match_roster or self.match_mode != "doubles":
+        if not self.lock_match_roster or self.match_mode not in {"singles", "doubles"}:
             return []
 
         tracks_by_end = {}
@@ -1345,7 +1413,10 @@ class RallyStateMachine:
                 tracks,
                 elapsed_source_frames,
             )
-        has_players = len([track for track in tracks if track["status"] == "detected"]) >= 2
+        has_players = (
+            len([track for track in tracks if track["status"] == "detected"])
+            >= self.expected_player_count
+        )
         has_shuttle = shuttle is not None and shuttle.get("status") == "approximate"
         if has_shuttle:
             self._record_shuttle_position(frame_index, shuttle)
@@ -1571,12 +1642,20 @@ class FixedCameraMatchPipeline:
         court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH),
         world_points_m=None,
         coordinate_system_id="standard_badminton_court_m",
+        session_mode="match",
+        expected_player_count=None,
+        athlete_observation_region="full_court_athletes",
+        athlete_observation_margin_m=0.35,
+        athlete_observation_lateral_margin_m=None,
+        athlete_observation_baseline_margin_m=None,
     ):
         if match_mode not in {"singles", "doubles"}:
             raise ValueError(
                 "FixedCameraMatchPipeline handles singles/doubles rules; "
                 "use PersonOnlyTracker/PersonOnlyFrameProcessor for analysis_mode=person_only"
             )
+        if session_mode == "single_player_training" and match_mode != "singles":
+            raise ValueError("single_player_training requires match_mode=singles")
         if tracker_backend not in {"court_association", "bytetrack"}:
             raise ValueError("tracker_backend must be 'court_association' or 'bytetrack'")
         if tracker_backend == "bytetrack" and not enable_bytetrack:
@@ -1587,13 +1666,20 @@ class FixedCameraMatchPipeline:
             image_corners,
             court_dimensions=tuple(float(value) for value in court_dimensions),
             world_points_m=world_points_m,
+            athlete_observation_region=athlete_observation_region,
         )
         self.coordinate_system_id = str(coordinate_system_id)
+        self.session_mode = str(session_mode)
         self.net_image_line = net_image_line or [
             self.court_space.court_to_image((0.0, self.court_space.net_y_m)),
             self.court_space.court_to_image((self.court_space.width_m, self.court_space.net_y_m)),
         ]
         self.match_mode = match_mode
+        self.expected_player_count = int(
+            expected_player_count
+            if expected_player_count is not None
+            else 2 if match_mode == "singles" else 4
+        )
         self.tracker_backend = tracker_backend
         self.byte_tracker = (
             ByteTrackAdapter(fps=fps, tracker_factory=byte_tracker_factory)
@@ -1605,15 +1691,23 @@ class FixedCameraMatchPipeline:
             fps=fps,
             match_mode=match_mode,
             lock_match_roster=lock_match_roster,
-            expected_roster_count=2 if match_mode == "singles" else 4,
+            expected_roster_count=self.expected_player_count,
             roster_stable_frames=roster_stable_frames,
+            max_roster_count=(
+                self.expected_player_count
+                if self.session_mode == "single_player_training"
+                else 4
+            ),
             require_association_keys=tracker_backend == "bytetrack",
+            athlete_observation_margin_m=athlete_observation_margin_m,
+            athlete_observation_lateral_margin_m=athlete_observation_lateral_margin_m,
+            athlete_observation_baseline_margin_m=athlete_observation_baseline_margin_m,
         )
         self.shuttle = MonocularShuttleReconstructor()
         self.rallies = RallyStateMachine(
             fps=fps,
             shuttle_enabled=shuttle_enabled,
-            expected_player_count=2 if match_mode == "singles" else 4,
+            expected_player_count=self.expected_player_count,
             settle_window_seconds=movement_rally_settle_seconds,
         )
         self._last_frame = 0
@@ -1642,6 +1736,12 @@ class FixedCameraMatchPipeline:
             "coordinate_system": self.coordinate_system_id,
             "match": {
                 "mode": self.match_mode,
+                "session_mode": self.session_mode,
+                "analysis_scope": (
+                    "near_court_single_player"
+                    if self.session_mode == "single_player_training"
+                    else "full_court_match"
+                ),
                 "max_players_per_team": self.tracker.max_players_per_team,
                 "identity_policy": "track_id is persistent; court_end and zone_id are transient; team_id requires confirmation",
             },
@@ -1665,6 +1765,12 @@ class FixedCameraMatchPipeline:
             "team_claims": dict(self.tracker.team_claims),
             "match": {
                 "mode": self.match_mode,
+                "session_mode": self.session_mode,
+                "analysis_scope": (
+                    "near_court_single_player"
+                    if self.session_mode == "single_player_training"
+                    else "full_court_match"
+                ),
                 "max_players_per_team": self.tracker.max_players_per_team,
             },
             "tracking": {

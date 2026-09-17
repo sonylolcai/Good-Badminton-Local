@@ -646,12 +646,17 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
 
     roi_corners = compute_expanded_roi(corners, (frame_h, frame_w, 3))
     sport_id = "tennis" if options.get("sport_id") == "tennis" else "badminton"
-    from api.vision_profiles import get_vision_profile
+    from api.vision_profiles import FULL_COURT, get_vision_profile
     vision_profile = get_vision_profile(sport_id)
+    session_profile = vision_profile.mode(options.get("session_mode"))
     court_dimensions = tuple(float(value) for value in vision_profile.court_dimensions_m)
+    # Complete-video jobs receive four corners for the entire visible court.
+    # Training changes which athlete may enter the roster; it does not
+    # reinterpret full-court corners as a cropped near-half calibration.
+    full_court_scope = session_profile.calibration_scope(FULL_COURT)
     calibration_world_points_m = [
-        [0.0, 0.0], [court_dimensions[0], 0.0],
-        [court_dimensions[0], court_dimensions[1]], [0.0, court_dimensions[1]],
+        [float(point[0]), float(point[1])]
+        for point in full_court_scope.world_points_m
     ]
     mapper = CourtMapper(
         corners,
@@ -697,8 +702,15 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     analysis_sample_hz = float(options.get("analysis_sample_hz", options.get("pose_sample_hz", 10.0)))
     pose_conf = float(options.get("pose_conf", 0.15))
     far_player_enhancement = bool(options.get("far_player_enhancement", False))
+    if session_profile.session_mode == "single_player_training":
+        far_player_enhancement = False
     far_pose_roi = options.get("far_pose_roi", (0.12, 0.30, 0.86, 0.82))
     match_mode = options.get("match_mode", "singles")
+    expected_player_count = (
+        int(session_profile.expected_player_count)
+        if session_profile.expected_player_count is not None
+        else 2 if match_mode == "singles" else 4
+    )
     # ByteTrack only receives already-sampled pose detections. The shared
     # timestamp cadence remains the sole detector/tracker update budget.
     tracker_backend = options.get("tracker_backend", "bytetrack")
@@ -762,6 +774,12 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         court_dimensions=court_dimensions,
         calibration_world_points_m=calibration_world_points_m,
         coordinate_system_id=vision_profile.coordinate_system_id,
+        session_mode=session_profile.session_mode,
+        expected_player_count=expected_player_count,
+        athlete_observation_region=session_profile.athlete_observation_region,
+        athlete_observation_margin_m=session_profile.athlete_observation_margin_m,
+        athlete_observation_lateral_margin_m=session_profile.athlete_observation_lateral_margin_m,
+        athlete_observation_baseline_margin_m=session_profile.athlete_observation_baseline_margin_m,
     )
     system.keep_audio = keep_audio
     execution_metrics = system.process_video(

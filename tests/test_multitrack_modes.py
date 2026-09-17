@@ -95,23 +95,181 @@ class MultiTrackModeTests(unittest.TestCase):
         tracker = CourtMultiObjectTracker(CourtSpace(self.CORNERS), fps=10, max_missed_frames=2)
         tracker.update(1, [self._observation((2.0, 2.0), "pose_a")])
 
-        # Two one-centimetre foot-point changes are below the display dead
-        # zone. A standing player must display 0 rather than a false walk.
+        # A standing player must not produce an early two-frame estimate, and
+        # after the minimum observation span its centimetre-scale jitter must
+        # display 0 rather than a false walk.
         second = tracker.update(2, [self._observation((2.01, 2.0), "pose_a")])[0]
         third = tracker.update(3, [self._observation((2.02, 2.0), "pose_a")])[0]
-        self.assertEqual(second["motion"]["status"], "stationary")
-        self.assertEqual(second["motion"]["current_speed_mps"], 0.0)
-        self.assertEqual(third["motion"]["current_speed_mps"], 0.0)
+        fourth = tracker.update(4, [self._observation((2.01, 2.0), "pose_a")])[0]
+        stationary = tracker.update(5, [self._observation((2.00, 2.0), "pose_a")])[0]
+        self.assertEqual(second["motion"]["status"], "not_enough_fresh_measurements")
+        self.assertIsNone(second["motion"]["current_speed_mps"])
+        self.assertIsNone(third["motion"]["current_speed_mps"])
+        self.assertIsNone(fourth["motion"]["current_speed_mps"])
+        self.assertEqual(stationary["motion"]["current_speed_mps"], 0.0)
+        self.assertEqual(stationary["motion"]["window_seconds"], 1.0)
+        self.assertEqual(stationary["motion"]["dead_zone_mps"], 0.2)
 
-        moving = tracker.update(4, [self._observation((2.22, 2.0), "pose_a")])[0]
+        tracker.update(6, [self._observation((2.10, 2.0), "pose_a")])
+        tracker.update(7, [self._observation((2.20, 2.0), "pose_a")])
+        moving = tracker.update(8, [self._observation((2.30, 2.0), "pose_a")])[0]
         self.assertEqual(moving["status"], "detected")
         self.assertEqual(moving["motion"]["status"], "moving")
-        self.assertGreater(moving["motion"]["current_speed_mps"], 0.35)
+        self.assertGreater(moving["motion"]["current_speed_mps"], 0.2)
 
-        predicted = tracker.update(5, [])[0]
+        predicted = tracker.update(9, [])[0]
         self.assertEqual(predicted["status"], "predicted")
         self.assertIsNone(predicted["motion"]["current_speed_mps"])
         self.assertEqual(predicted["motion"]["status"], "not_currently_measured")
+
+    def test_track_current_speed_does_not_accumulate_back_and_forth_pose_jitter(self):
+        tracker = CourtMultiObjectTracker(CourtSpace(self.CORNERS), fps=10, max_missed_frames=2)
+        jitter = [
+            (2.00, 2.00),
+            (2.07, 2.00),
+            (2.00, 2.00),
+            (1.93, 2.00),
+            (2.00, 2.00),
+            (2.06, 2.00),
+        ]
+
+        result = None
+        for frame, point in enumerate(jitter, start=1):
+            result = tracker.update(frame, [self._observation(point, "pose_a")])[0]
+
+        self.assertEqual(result["motion"]["status"], "stationary")
+        self.assertEqual(result["motion"]["current_speed_mps"], 0.0)
+        self.assertEqual(result["motion"]["source"], "robust_endpoint_net_displacement")
+
+    def test_tennis_training_tracks_only_one_near_court_player(self):
+        corners = [(0, 0), (823, 0), (823, 2377), (0, 2377)]
+        pipeline = FixedCameraMatchPipeline(
+            corners,
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            roster_stable_frames=1,
+            shuttle_enabled=False,
+            court_dimensions=(8.23, 23.77),
+            world_points_m=((0.0, 0.0), (8.23, 0.0), (8.23, 23.77), (0.0, 23.77)),
+            coordinate_system_id="tennis_singles_court_m_v1",
+            session_mode="single_player_training",
+            expected_player_count=1,
+            athlete_observation_region="near_court_athlete",
+            athlete_observation_margin_m=0.35,
+            athlete_observation_lateral_margin_m=0.75,
+            athlete_observation_baseline_margin_m=3.0,
+        )
+
+        result = pipeline.update(
+            1,
+            [
+                self._observation((4.0, 5.0), "far_pose"),
+                self._observation((4.0, 18.0), "near_pose"),
+            ],
+            None,
+        )
+
+        self.assertEqual(result["match"]["session_mode"], "single_player_training")
+        self.assertEqual(result["match"]["analysis_scope"], "near_court_single_player")
+        self.assertEqual(result["match_roster"]["expected_player_count"], 1)
+        self.assertEqual(result["match_roster"]["status"], "locked")
+        self.assertEqual(len(result["tracks"]), 1)
+        self.assertEqual(result["tracks"][0]["association"]["key"], "near_pose")
+
+    def test_tennis_training_rejects_doubles_match_rules(self):
+        with self.assertRaisesRegex(
+            ValueError, "single_player_training requires match_mode=singles"
+        ):
+            FixedCameraMatchPipeline(
+                self.CORNERS,
+                fps=10,
+                match_mode="doubles",
+                session_mode="single_player_training",
+                expected_player_count=1,
+            )
+
+    def test_locked_training_roster_recovers_one_unambiguous_near_player(self):
+        corners = [(0, 0), (823, 0), (823, 2377), (0, 2377)]
+        pipeline = FixedCameraMatchPipeline(
+            corners,
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            roster_stable_frames=1,
+            shuttle_enabled=False,
+            court_dimensions=(8.23, 23.77),
+            session_mode="single_player_training",
+            expected_player_count=1,
+            athlete_observation_region="near_court_athlete",
+        )
+        initial = pipeline.update(
+            1, [self._observation((4.0, 18.0), "near_pose_a")], None
+        )
+        track_id = initial["tracks"][0]["track_id"]
+        for frame_index in range(2, 32):
+            pipeline.update(frame_index, [], None)
+
+        recovered = pipeline.update(
+            32, [self._observation((4.2, 18.1), "near_pose_b")], None
+        )
+
+        self.assertEqual(len(recovered["tracks"]), 1)
+        self.assertEqual(recovered["tracks"][0]["track_id"], track_id)
+        self.assertEqual(recovered["tracks"][0]["status"], "detected")
+        self.assertEqual(
+            recovered["tracks"][0]["association"]["source"],
+            "roster_end_recovery",
+        )
+
+    def test_one_person_bytetrack_roster_recovers_after_tracker_key_restart(self):
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS),
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            expected_roster_count=1,
+            max_roster_count=1,
+            roster_stable_frames=1,
+            require_association_keys=True,
+        )
+        tracker.update(1, [self._observation((3.0, 10.0), "bytetrack_1")])
+        for frame_index in range(2, 32):
+            tracker.update(frame_index, [])
+
+        recovered = tracker.update(
+            32, [self._observation((3.2, 10.1), "bytetrack_2")]
+        )
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["track_id"], "track_001")
+        self.assertEqual(recovered[0]["status"], "detected")
+        self.assertEqual(
+            recovered[0]["association"]["source"], "roster_end_recovery"
+        )
+
+    def test_one_person_bytetrack_roster_uses_metric_fallback_when_key_is_tentative(self):
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS),
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            expected_roster_count=1,
+            max_roster_count=1,
+            roster_stable_frames=1,
+            require_association_keys=True,
+        )
+        tracker.update(1, [self._observation((3.0, 10.0), "bytetrack_1")])
+
+        tentative = tracker.update(
+            2, [self._observation((3.1, 10.0), None)]
+        )
+
+        self.assertEqual(len(tentative), 1)
+        self.assertEqual(tentative[0]["status"], "detected")
+        self.assertEqual(
+            tentative[0]["association"]["source"], "court_association"
+        )
 
     def test_locked_singles_roster_waits_for_two_people_then_rejects_new_tracks(self):
         pipeline = FixedCameraMatchPipeline(
@@ -368,6 +526,25 @@ class MultiTrackModeTests(unittest.TestCase):
 
         self.assertEqual(len(rallies.completed), 1)
         self.assertEqual(rallies.completed[-1]["end_reason"], "shuttle_landed")
+
+    def test_single_player_training_can_start_a_shuttle_rally(self):
+        rallies = RallyStateMachine(
+            fps=10,
+            min_active_frames=4,
+            shuttle_enabled=True,
+            expected_player_count=1,
+        )
+        tracks = [
+            {
+                "track_id": "track_001",
+                "status": "detected",
+                "court_xy_m": [4.0, 18.0],
+            }
+        ]
+        shuttle = {"status": "approximate", "xyz_m": [4.0, 16.0, 1.0]}
+
+        self.assertEqual(rallies.update(1, tracks, shuttle, [])["state"], "candidate")
+        self.assertEqual(rallies.update(4, tracks, shuttle, [])["state"], "active")
 
     def test_person_only_rally_requires_all_players_stable_for_selected_window(self):
         rallies = RallyStateMachine(
