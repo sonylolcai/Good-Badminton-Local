@@ -6,6 +6,7 @@ not use these routes: they use the signed ``/api/v1/edge/*`` protocol.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +81,10 @@ class CaseGpuForwardingRequest(BaseModel):
 
 class CourtCaptureModeRequest(BaseModel):
     mode: CaptureMode
+
+
+class ReplaySaveRequest(BaseModel):
+    seconds: int = Field(default=20, ge=2, le=120)
 
 
 class ImagePoint(BaseModel):
@@ -202,6 +207,43 @@ def _edge_gateway_json(path: str) -> dict[str, Any]:
         return body
     except (HTTPError, URLError, TimeoutError, ValueError) as exc:
         raise HTTPException(status_code=502, detail={"code": "edge_gateway_unavailable", "message": f"无法读取业务网关状态：{exc}"}) from exc
+
+
+def _edge_gateway_operator_json(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    key = os.environ.get("GOOD_BADMINTON_EDGE_MASTER_KEY", "")
+    if not key:
+        raise HTTPException(status_code=503, detail={"code": "edge_gateway_not_configured", "message": "业务网关授权未配置。"})
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = UrlRequest(
+        f"{_edge_gateway_internal_url()}{path}", data=data, method=method,
+        headers={"Accept": "application/json", "Content-Type": "application/json", "X-Operator-Edge-Key": key},
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        if not isinstance(body, dict):
+            raise ValueError("edge gateway response was not an object")
+        return body
+    except HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            detail = {"code": "edge_gateway_error", "message": str(exc)}
+        raise HTTPException(status_code=exc.code, detail=detail.get("detail", detail)) from exc
+    except (URLError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail={"code": "edge_gateway_unavailable", "message": f"无法访问业务网关：{exc}"}) from exc
+
+
+def _edge_gateway_operator_video(path: str) -> tuple[bytes, str]:
+    key = os.environ.get("GOOD_BADMINTON_EDGE_MASTER_KEY", "")
+    if not key:
+        raise HTTPException(status_code=503, detail={"code": "edge_gateway_not_configured", "message": "业务网关授权未配置。"})
+    request = UrlRequest(f"{_edge_gateway_internal_url()}{path}", headers={"X-Operator-Edge-Key": key})
+    try:
+        with urlopen(request, timeout=30) as response:
+            return response.read(), response.headers.get_content_type()
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail={"code": "edge_gateway_unavailable", "message": f"无法读取保存的录像：{exc}"}) from exc
 
 
 @app.get("/api/v1/system/readiness")
@@ -357,6 +399,65 @@ def set_case_gpu_forwarding(
         "message": "已开启 GPU 推送；后续视频片段会送往 GPU。" if request.enabled
         else "已暂停 GPU 推送；视频预览仍会继续，已暂停期间的片段不会补推。",
     }
+
+
+def _case_for_replay(venue_id: str, court_id: str) -> dict[str, Any]:
+    db = get_db()
+    _require_venue(db, venue_id)
+    case = db.case_for_court(venue_id, court_id)
+    if not case:
+        raise HTTPException(status_code=409, detail={"code": "no_live_case", "message": "摄像头尚未上传可保存的视频片段。"})
+    return case
+
+
+def _replay_payload(case_id: str, replay: dict[str, Any], venue_id: str, court_id: str) -> dict[str, Any]:
+    return {
+        **replay,
+        "url": f"/api/v1/venues/{venue_id}/courts/{court_id}/case/replays/{replay['id']}",
+        "case_id": case_id,
+    }
+
+
+@app.post("/api/v1/venues/{venue_id}/courts/{court_id}/case/replays", status_code=status.HTTP_201_CREATED)
+def save_court_replay(
+    venue_id: Annotated[str, ApiPath(min_length=1)],
+    court_id: Annotated[str, ApiPath(min_length=1)],
+    request: ReplaySaveRequest,
+) -> dict[str, Any]:
+    """Save the latest contiguous recording window from this court's current case."""
+    case = _case_for_replay(venue_id, court_id)
+    payload = _edge_gateway_operator_json(
+        f"/api/v1/edge/sessions/{case['case_id']}/replays", method="POST", payload=request.model_dump(),
+    )
+    replay = payload.get("replay")
+    if not isinstance(replay, dict):
+        raise HTTPException(status_code=502, detail={"code": "edge_gateway_invalid_response", "message": "业务网关没有返回保存的录像。"})
+    return {"replay": _replay_payload(case["case_id"], replay, venue_id, court_id), "message": "已保存当前比赛片段。"}
+
+
+@app.get("/api/v1/venues/{venue_id}/courts/{court_id}/case/replays")
+def list_court_replays(
+    venue_id: Annotated[str, ApiPath(min_length=1)],
+    court_id: Annotated[str, ApiPath(min_length=1)],
+) -> dict[str, Any]:
+    case = _case_for_replay(venue_id, court_id)
+    payload = _edge_gateway_operator_json(f"/api/v1/edge/sessions/{case['case_id']}/replays")
+    replays = payload.get("replays")
+    if not isinstance(replays, list):
+        raise HTTPException(status_code=502, detail={"code": "edge_gateway_invalid_response", "message": "业务网关没有返回录像列表。"})
+    return {"case_id": case["case_id"], "replays": [_replay_payload(case["case_id"], replay, venue_id, court_id)
+                                                        for replay in replays if isinstance(replay, dict)]}
+
+
+@app.get("/api/v1/venues/{venue_id}/courts/{court_id}/case/replays/{replay_id}")
+def play_court_replay(
+    venue_id: Annotated[str, ApiPath(min_length=1)],
+    court_id: Annotated[str, ApiPath(min_length=1)],
+    replay_id: Annotated[str, ApiPath(min_length=21, max_length=21)],
+) -> Response:
+    case = _case_for_replay(venue_id, court_id)
+    video, media_type = _edge_gateway_operator_video(f"/api/v1/edge/sessions/{case['case_id']}/replays/{replay_id}")
+    return Response(content=video, media_type=media_type or "video/mp4", headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/v1/cases/{case_id}/gpu-events")

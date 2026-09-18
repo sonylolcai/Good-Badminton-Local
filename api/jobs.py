@@ -492,6 +492,27 @@ class AnalysisJobManager:
                     "size_bytes": path.stat().st_size,
                 }
 
+        for photo in result.get("candidate_photos", []):
+            if not isinstance(photo, dict):
+                continue
+            track_id = "".join(
+                character for character in str(photo.get("track_id") or "")
+                if character.isalnum() or character in "-_"
+            )
+            if not track_id:
+                continue
+            path = Path(str(photo.get("path") or "")).resolve()
+            try:
+                relative_path = path.relative_to(output_path)
+            except ValueError:
+                continue
+            if path.is_file():
+                artifacts[f"player_portrait_{track_id}"] = {
+                    "relative_path": relative_path.as_posix(),
+                    "media_type": self._media_type(path),
+                    "size_bytes": path.stat().st_size,
+                }
+
         images = []
         for index, candidate in enumerate(result.get("visualizations", [])):
             path = Path(candidate).resolve()

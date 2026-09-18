@@ -103,7 +103,7 @@ def _track_summary(entry, *, source_frames, fps):
         entry["usable_points"],
         key=lambda item: (item["frame"] is None, item["frame"] if item["frame"] is not None else 0),
     )
-    distance_m, accepted_segments, excluded_segments = _distance_from_measurements(points, fps)
+    distance_m, accepted_segments, excluded_segments, moving_time_sec, speeds = _distance_from_measurements(points, fps)
     confidence_values = [point["detection_confidence"] for point in points]
     location_values = [point["location_confidence"] for point in points]
     identity_values = [point["identity_confidence"] for point in points]
@@ -118,6 +118,9 @@ def _track_summary(entry, *, source_frames, fps):
         "mean_location_confidence": _mean_or_none(location_values),
         "mean_identity_confidence": _mean_or_none(identity_values),
         "movement_distance_m": round(distance_m, 3),
+        "movement_mean_speed_mps": round(distance_m / moving_time_sec, 3) if moving_time_sec else None,
+        "movement_peak_speed_mps": round(max(speeds), 3) if speeds else None,
+        "movement_time_sec": round(moving_time_sec, 3),
         "movement_segment_count": accepted_segments,
         "movement_segments_excluded": excluded_segments,
         "movement_policy": (
@@ -129,6 +132,8 @@ def _track_summary(entry, *, source_frames, fps):
 
 def _distance_from_measurements(points, fps, max_gap_seconds=0.5, max_speed_mps=10.0):
     distance_m = 0.0
+    moving_time_sec = 0.0
+    speeds = []
     accepted = 0
     excluded = 0
     rate = max(float(fps or 0), 1.0)
@@ -143,12 +148,16 @@ def _distance_from_measurements(points, fps, max_gap_seconds=0.5, max_speed_mps=
         left = previous["court_xy_m"]
         right = current["court_xy_m"]
         segment = math.hypot(right[0] - left[0], right[1] - left[1])
-        if segment / (delta_frames / rate) > max_speed_mps:
+        duration_sec = delta_frames / rate
+        speed_mps = segment / duration_sec
+        if speed_mps > max_speed_mps:
             excluded += 1
             continue
         distance_m += segment
+        moving_time_sec += duration_sec
+        speeds.append(speed_mps)
         accepted += 1
-    return distance_m, accepted, excluded
+    return distance_m, accepted, excluded, moving_time_sec, speeds
 
 
 def _render_track_heatmap(points, path, track_id, summary, language):

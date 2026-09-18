@@ -8,9 +8,12 @@ mistaken for an authenticated venue ingress endpoint.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import math
 import os
 import shutil
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,6 +95,131 @@ class RollingPreviewStore:
             return None
         segments = sorted(session_root.glob("*.mp4"), key=lambda path: path.name)
         return segments[-1] if segments else None
+
+
+class SessionRecordingStore:
+    """Persist independently playable MP4 chunks and seal a full recording."""
+
+    def __init__(self, root: Path, *, ffmpeg_path: str | None = None) -> None:
+        self.root = Path(root)
+        self.ffmpeg_path = ffmpeg_path or os.environ.get("GOOD_BADMINTON_FFMPEG", "").strip() or shutil.which("ffmpeg")
+
+    def _session_root(self, session_id: str) -> Path:
+        return self.root / str(uuid.UUID(session_id))
+
+    def store(self, session_id: str, segment_index: int, content_type: str, video: bytes) -> None:
+        if content_type != "video/mp4":
+            return
+        segment_root = self._session_root(session_id) / "segments"
+        segment_root.mkdir(parents=True, exist_ok=True)
+        target = segment_root / f"{int(segment_index):08d}.mp4"
+        digest = hashlib.sha256(video).hexdigest()
+        if target.exists():
+            if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                raise ValueError("recording path already contains a different segment")
+            return
+        temporary = target.with_suffix(".uploading")
+        temporary.write_bytes(video)
+        temporary.replace(target)
+
+    def complete(self, session_id: str, expected_last_segment_index: int) -> dict[str, Any]:
+        session_root = self._session_root(session_id)
+        segment_root = session_root / "segments"
+        expected = set(range(int(expected_last_segment_index) + 1))
+        segments = self._segments(segment_root)
+        missing = sorted(expected.difference(segments))
+        if missing:
+            return {"status": "incomplete", "missing_segment_indexes": missing}
+        recording_path = session_root / "recording.mp4"
+        self._assemble(session_root, [segments[index] for index in sorted(expected)], recording_path)
+        # ponytail: recordings are retained until an explicit retention policy is agreed; add lifecycle cleanup when storage use requires it.
+        return {
+            "status": "completed",
+            "file_name": "recording.mp4",
+            "segment_count": len(expected),
+            "sha256": hashlib.sha256(recording_path.read_bytes()).hexdigest(),
+        }
+
+    def save_latest_replay(self, session_id: str, seconds: int) -> dict[str, Any]:
+        session_root = self._session_root(session_id)
+        segments = self._segments(session_root / "segments")
+        if not segments:
+            raise ValueError("no browser-playable MP4 segments have arrived yet")
+        end = max(segments)
+        count = max(1, math.ceil(int(seconds) / 2))
+        indexes = [end]
+        while len(indexes) < count and indexes[0] - 1 in segments:
+            indexes.insert(0, indexes[0] - 1)
+        replay_id = f"{indexes[0]:08d}-{indexes[-1]:08d}.mp4"
+        replay_path = session_root / "replays" / replay_id
+        self._assemble(session_root, [segments[index] for index in indexes], replay_path)
+        return {
+            "id": replay_id,
+            "start_segment_index": indexes[0],
+            "end_segment_index": indexes[-1],
+            "segment_count": len(indexes),
+            "estimated_duration_seconds": len(indexes) * 2,
+        }
+
+    def list_replays(self, session_id: str) -> list[dict[str, Any]]:
+        replay_root = self._session_root(session_id) / "replays"
+        if not replay_root.is_dir():
+            return []
+        replays = []
+        for path in sorted(replay_root.glob("*.mp4"), reverse=True):
+            try:
+                start, end = path.stem.split("-", maxsplit=1)
+                replays.append({
+                    "id": path.name,
+                    "start_segment_index": int(start),
+                    "end_segment_index": int(end),
+                    "segment_count": int(end) - int(start) + 1,
+                    "estimated_duration_seconds": (int(end) - int(start) + 1) * 2,
+                })
+            except ValueError:
+                continue
+        return replays
+
+    def replay_path(self, session_id: str, replay_id: str) -> Path:
+        if not replay_id.endswith(".mp4") or len(replay_id) != 21:
+            raise ValueError("invalid replay id")
+        path = self._session_root(session_id) / "replays" / replay_id
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+
+    @staticmethod
+    def _segments(root: Path) -> dict[int, Path]:
+        return {
+            int(path.stem): path
+            for path in root.glob("*.mp4")
+            if path.stem.isdigit()
+        } if root.is_dir() else {}
+
+    def _assemble(self, session_root: Path, segments: list[Path], output: Path) -> None:
+        if output.is_file():
+            return
+        if not self.ffmpeg_path:
+            raise RuntimeError("ffmpeg is required to assemble the retained recording")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        manifest = session_root / f"{output.stem}.concat.txt"
+        manifest.write_text(
+            "".join(f"file '{path.relative_to(session_root).as_posix()}'\\n" for path in segments),
+            encoding="utf-8",
+        )
+        temporary = output.with_name(f"{output.stem}.{uuid.uuid4().hex}.partial.mp4")
+        try:
+            completed = subprocess.run(
+                [self.ffmpeg_path, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(manifest), "-c", "copy", "-movflags", "+faststart", str(temporary)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False,
+            )
+            if completed.returncode != 0 or not temporary.is_file():
+                detail = (completed.stderr or f"ffmpeg did not create {output.name}").strip()[-1000:]
+                raise RuntimeError(f"ffmpeg could not assemble the retained recording: {detail}")
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 class GpuRelay(Protocol):
@@ -396,6 +524,7 @@ def create_edge_app(
     *,
     edge_master_key: str | None = None,
     preview_store: RollingPreviewStore | None = None,
+    recording_store: SessionRecordingStore | None = None,
 ) -> FastAPI:
     """Create the deployable ingress app; callers inject DB and GPU adapters."""
 
@@ -403,6 +532,10 @@ def create_edge_app(
     if len(master_key.encode("utf-8")) < 32:
         raise ValueError("GOOD_BADMINTON_EDGE_MASTER_KEY must contain at least 32 bytes")
     app = FastAPI(title="Good-Badminton Edge Ingest Gateway", version="1.0")
+
+    def authenticate_operator(key: str) -> None:
+        if not hmac.compare_digest(key, master_key):
+            raise _http_error(403, "operator request is not authorized")
 
     def authenticate(
         *, method: str, path: str, device_id: str, camera_id: str, payload: dict[str, Any],
@@ -529,6 +662,8 @@ def create_edge_app(
             if stored.get("calibration_id") and segment_metadata["court_corners"] != stored["court_corners"]:
                 raise EdgeContractError("terminal court_corners do not match the server-validated calibration")
             record = repository.receive_segment(stored, segment_metadata)
+            if recording_store:
+                recording_store.store(session_id, segment_index, segment_metadata["content_type"], video)
             if record["status"] == "forwarded":
                 return {"status": "accepted", "reused": True, "gpu_receipt": record["gpu_receipt"]}
             if preview_store:
@@ -586,6 +721,10 @@ def create_edge_app(
             authenticate(method="POST", path=f"/api/v1/edge/sessions/{session_id}/complete", device_id=payload["device_id"],
                 camera_id=payload["camera_id"], payload=payload, timestamp=x_edge_timestamp, nonce=x_edge_nonce,
                 digest=x_edge_payload_sha256, signature=x_edge_signature)
+            recording = (
+                recording_store.complete(session_id, payload["expected_last_segment_index"])
+                if recording_store else {"status": "not_configured"}
+            )
             # A pilot court is allowed to stop a capture before the operator
             # enables GPU forwarding.  It has no upstream GPU session to
             # complete, but the edge session must still leave the active-set
@@ -595,11 +734,12 @@ def create_edge_app(
                 receipt = {"status": "cancelled", "reason": "gpu_forwarding_was_not_enabled"}
                 repository.mark_completed(session_id, "cancelled", receipt)
                 return {"status": "accepted", "edge_ingest_session_id": session_id,
-                        "gpu_status": "cancelled", "gpu_receipt": receipt}
+                        "gpu_status": "cancelled", "gpu_receipt": receipt, "recording": recording}
             receipt = relay.complete(stored, payload["expected_last_segment_index"], payload["allow_partial"])
             gpu_status = str(receipt.get("status") or "processing")
             repository.mark_completed(session_id, gpu_status, receipt)
-            return {"status": "accepted", "edge_ingest_session_id": session_id, "gpu_status": gpu_status, "gpu_receipt": receipt}
+            return {"status": "accepted", "edge_ingest_session_id": session_id, "gpu_status": gpu_status,
+                    "gpu_receipt": receipt, "recording": recording}
         except HTTPException:
             raise
         except (EdgeContractError, ValueError) as exc:
@@ -633,6 +773,43 @@ def create_edge_app(
             raise _http_error(404, "no browser-playable preview segment has arrived yet")
         return FileResponse(segment_path, media_type="video/mp4", headers={"Cache-Control": "no-store"})
 
+    @app.post("/api/v1/edge/sessions/{session_id}/replays", status_code=201)
+    def save_replay(session_id: str, body: dict[str, Any], x_operator_edge_key: str = Header(...)):
+        authenticate_operator(x_operator_edge_key)
+        if not repository.session(session_id):
+            raise _http_error(404, "edge ingest session was not found")
+        seconds = body.get("seconds", 20)
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or not 2 <= seconds <= 120:
+            raise _http_error(422, "seconds must be an integer between 2 and 120")
+        if not recording_store:
+            raise _http_error(503, "recording storage is not configured")
+        try:
+            return {"replay": recording_store.save_latest_replay(session_id, seconds)}
+        except ValueError as exc:
+            raise _http_error(409, str(exc)) from exc
+
+    @app.get("/api/v1/edge/sessions/{session_id}/replays")
+    def list_replays(session_id: str, x_operator_edge_key: str = Header(...)):
+        authenticate_operator(x_operator_edge_key)
+        if not repository.session(session_id):
+            raise _http_error(404, "edge ingest session was not found")
+        if not recording_store:
+            raise _http_error(503, "recording storage is not configured")
+        return {"replays": recording_store.list_replays(session_id)}
+
+    @app.get("/api/v1/edge/sessions/{session_id}/replays/{replay_id}")
+    def play_replay(session_id: str, replay_id: str, x_operator_edge_key: str = Header(...)):
+        authenticate_operator(x_operator_edge_key)
+        if not repository.session(session_id):
+            raise _http_error(404, "edge ingest session was not found")
+        if not recording_store:
+            raise _http_error(503, "recording storage is not configured")
+        try:
+            return FileResponse(recording_store.replay_path(session_id, replay_id), media_type="video/mp4",
+                                headers={"Cache-Control": "private, no-store"})
+        except (ValueError, FileNotFoundError):
+            raise _http_error(404, "saved replay was not found") from None
+
     @app.get("/api/v1/edge/sessions/{session_id}/gpu-events")
     def gpu_events(session_id: str, limit: int = 100):
         session = repository.session(session_id)
@@ -655,10 +832,12 @@ def create_production_edge_app() -> FastAPI:
     database_url = os.environ.get("GOOD_BADMINTON_BUSINESS_DATABASE_URL", "")
     staging_root = Path(os.environ.get("GOOD_BADMINTON_EDGE_STAGING_DIR", "outputs/edge_staging"))
     preview_root = Path(os.environ.get("GOOD_BADMINTON_EDGE_PREVIEW_DIR", "outputs/edge_preview"))
+    recording_root = Path(os.environ.get("GOOD_BADMINTON_EDGE_RECORDING_DIR", "outputs/edge_recordings"))
     return create_edge_app(
         PostgresEdgeRepository(database_url),
         StreamSessionGpuRelay(staging_root),
         preview_store=RollingPreviewStore(preview_root),
+        recording_store=SessionRecordingStore(recording_root),
     )
 
 

@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import base64
@@ -63,6 +65,27 @@ class GpuApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_court_detection_imports_without_tkinter(self):
+        script = """
+import builtins
+original_import = builtins.__import__
+def headless_import(name, *args, **kwargs):
+    if name == 'tkinter' or name.startswith('tkinter.'):
+        raise ImportError('tkinter intentionally unavailable')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = headless_import
+from badminton_analysis.pipeline import prepare_court_from_video
+assert prepare_court_from_video
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_court_detection_returns_detected_corners_for_a_video(self):
         self.app.state.court_detector = lambda _path: {

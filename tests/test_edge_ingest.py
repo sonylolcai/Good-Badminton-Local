@@ -1,4 +1,5 @@
 import hashlib
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -7,7 +8,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from business_gateway.edge_api import RollingPreviewStore, create_edge_app
+from business_gateway.edge_api import RollingPreviewStore, SessionRecordingStore, create_edge_app
 from business_gateway.edge_contract import (
     EDGE_NONCE_HEADER,
     EDGE_PAYLOAD_SHA256_HEADER,
@@ -106,6 +107,30 @@ class FakeRelay:
         return {"status": "finalized", "expected_last_segment_index": expected_last_segment_index, "allow_partial": allow_partial}
 
 
+class FakeRecordingStore:
+    def __init__(self):
+        self.stored = []
+        self.completed = []
+
+    def store(self, session_id, segment_index, content_type, video):
+        self.stored.append((session_id, segment_index, content_type, video))
+
+    def complete(self, session_id, expected_last_segment_index):
+        self.completed.append((session_id, expected_last_segment_index))
+        return {"status": "completed", "file_name": "recording.mp4", "segment_count": expected_last_segment_index + 1}
+
+    def save_latest_replay(self, session_id, seconds):
+        self.stored.append((session_id, "replay", seconds, b""))
+        return {"id": "00000000-00000000.mp4", "start_segment_index": 0, "end_segment_index": 0,
+                "segment_count": 1, "estimated_duration_seconds": 2}
+
+    def list_replays(self, _session_id):
+        return []
+
+    def replay_path(self, _session_id, _replay_id):
+        raise FileNotFoundError
+
+
 class EdgeIngestApiTests(unittest.TestCase):
     def setUp(self):
         self.repository = FakeRepository()
@@ -161,6 +186,10 @@ class EdgeIngestApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409, response.text)
 
     def test_segment_is_authenticated_then_relayed_without_terminal_court_override(self):
+        recording = FakeRecordingStore()
+        self.client = TestClient(create_edge_app(
+            self.repository, self.relay, edge_master_key=MASTER_KEY, recording_store=recording,
+        ))
         start_path = f"/api/v1/edge/devices/{DEVICE_ID}/sessions"
         start = {
             "schema_version": EDGE_SCHEMA_VERSION,
@@ -203,6 +232,7 @@ class EdgeIngestApiTests(unittest.TestCase):
         self.assertEqual(response.json()["gpu_analysis_session_id"], "ssn_edge_test_0001")
         self.assertEqual(len(self.relay.calls), 1)
         self.assertEqual(self.relay.calls[0][0]["court_id"], COURT_ID)
+        self.assertEqual(recording.stored, [(session_id, 0, "video/mp4", video)])
 
     def test_reused_nonce_is_rejected_before_relay(self):
         path = f"/api/v1/edge/devices/{DEVICE_ID}/heartbeats"
@@ -303,13 +333,58 @@ class EdgeIngestApiTests(unittest.TestCase):
         self.assertIn("no validated calibration", response.json()["detail"]["message"])
 
     def test_signed_completion_records_terminal_gpu_state(self):
+        recording = FakeRecordingStore()
+        self.client = TestClient(create_edge_app(
+            self.repository, self.relay, edge_master_key=MASTER_KEY, recording_store=recording,
+        ))
         session = self.repository.create_session(self.repository.binding(DEVICE_ID, CAMERA_ID), {"analysis_sample_hz": 10})
         path = f"/api/v1/edge/sessions/{session['id']}/complete"
         body = {"schema_version": EDGE_SCHEMA_VERSION, "device_id": DEVICE_ID, "camera_id": CAMERA_ID, "timestamp": "", "nonce": "", "expected_last_segment_index": 0, "allow_partial": False}
         response = self.client.post(path, json=body, headers=self._headers("POST", path, body, "complete_nonce_001"))
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(response.json()["gpu_status"], "finalized")
+        self.assertEqual(response.json()["recording"]["status"], "completed")
+        self.assertEqual(recording.completed, [(session["id"], 0)])
         self.assertEqual(session["completed"][0], "finalized")
+
+    def test_operator_replay_save_requires_the_server_secret(self):
+        recording = FakeRecordingStore()
+        self.client = TestClient(create_edge_app(
+            self.repository, self.relay, edge_master_key=MASTER_KEY, recording_store=recording,
+        ))
+        session = self.repository.create_session(self.repository.binding(DEVICE_ID, CAMERA_ID), {"analysis_sample_hz": 10})
+        path = f"/api/v1/edge/sessions/{session['id']}/replays"
+        denied = self.client.post(path, json={"seconds": 20})
+        self.assertEqual(denied.status_code, 422)
+        saved = self.client.post(path, json={"seconds": 20}, headers={"X-Operator-Edge-Key": MASTER_KEY})
+        self.assertEqual(saved.status_code, 201, saved.text)
+        self.assertEqual(saved.json()["replay"]["id"], "00000000-00000000.mp4")
+
+    def test_recording_store_seals_contiguous_segments_without_reencoding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session_id = str(uuid.uuid4())
+            store = SessionRecordingStore(Path(directory), ffmpeg_path="ffmpeg")
+            store.store(session_id, 0, "video/mp4", b"first")
+            store.store(session_id, 1, "video/mp4", b"second")
+
+            def concat(command, **_kwargs):
+                manifest = Path(command[command.index("-i") + 1])
+                output = Path(command[-1])
+                self.assertEqual(
+                    manifest.read_text(encoding="utf-8"),
+                    "file 'segments/00000000.mp4'\\nfile 'segments/00000001.mp4'\\n",
+                )
+                output.write_bytes(b"firstsecond")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            from unittest.mock import patch
+            with patch("business_gateway.edge_api.subprocess.run", side_effect=concat) as run:
+                receipt = store.complete(session_id, 1)
+            self.assertEqual(receipt["status"], "completed")
+            self.assertEqual(receipt["segment_count"], 2)
+            self.assertEqual((Path(directory) / session_id / "recording.mp4").read_bytes(), b"firstsecond")
+            self.assertIn("-c", run.call_args.args[0])
+            self.assertEqual(run.call_args.args[0][run.call_args.args[0].index("-c") + 1], "copy")
 
 
 if __name__ == "__main__":

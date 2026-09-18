@@ -90,8 +90,9 @@ find "$APP_DIR" -type d -exec chmod g+s {} +
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
   usermod -a -G "$RUN_GROUP" "$SUDO_USER"
 fi
+command -v ffmpeg >/dev/null || { echo "ffmpeg is required to retain complete session recordings." >&2; exit 1; }
 install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 0750 \
-  /var/lib/good-badminton/edge-staging /var/lib/good-badminton/edge-preview
+  /var/lib/good-badminton/edge-staging /var/lib/good-badminton/edge-preview /var/lib/good-badminton/edge-recordings
 
 PYTHON_BIN="$APP_DIR/.venv-business/bin/python"
 if [[ ! -x "$PYTHON_BIN" ]]; then

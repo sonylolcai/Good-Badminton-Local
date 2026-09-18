@@ -30,6 +30,10 @@ PLAYER_RESULT_HEADERS = [
     "数据质量",
 ]
 
+_MIN_PHOTO_DETECTION_CONFIDENCE = 0.80
+_MIN_PHOTO_LOCATION_CONFIDENCE = 0.80
+_MIN_PHOTO_IDENTITY_CONFIDENCE = 0.80
+
 TENNIS_PLAYER_RESULT_HEADERS = [
     "匿名视觉 Track ID",
     "追踪状态",
@@ -232,8 +236,21 @@ def _best_detected_observations(path: Path) -> dict[str, dict[str, Any]]:
                 bbox = evidence.get("bbox_xyxy")
                 if not track_id or not _valid_bbox(bbox):
                     continue
-                score = _number(track.get("confidence")) or 0.0
-                score *= _number(evidence.get("confidence")) or 0.0
+                detection_confidence = _number(track.get("confidence")) or 0.0
+                location_confidence = _number(evidence.get("confidence")) or 0.0
+                association = dict(track.get("association") or {})
+                identity_confidence = _number(association.get("identity_confidence")) or 0.0
+                if (
+                    detection_confidence < _MIN_PHOTO_DETECTION_CONFIDENCE
+                    or location_confidence < _MIN_PHOTO_LOCATION_CONFIDENCE
+                    or identity_confidence < _MIN_PHOTO_IDENTITY_CONFIDENCE
+                ):
+                    continue
+                score = (
+                    0.45 * detection_confidence
+                    + 0.35 * location_confidence
+                    + 0.20 * identity_confidence
+                )
                 if score <= float(best.get(track_id, {}).get("score", -1.0)):
                     continue
                 best[track_id] = {

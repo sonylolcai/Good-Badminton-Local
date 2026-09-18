@@ -101,6 +101,16 @@ export interface GpuExecutionEvent {
   payload?: Record<string, unknown>;
 }
 
+export interface ReplayClip {
+  id: string;
+  case_id: string;
+  start_segment_index: number;
+  end_segment_index: number;
+  segment_count: number;
+  estimated_duration_seconds: number;
+  url: string;
+}
+
 export interface VenueOperationsResponse {
   summary: { camera_connected: number; active_cases: number; total_courts: number };
   courts: CourtOperation[];

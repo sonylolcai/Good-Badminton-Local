@@ -3,7 +3,7 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
-  CaptureMode, Court, CourtOperation, CourtStatus, GpuExecutionEvent, operatorApiBaseUrl,
+  CaptureMode, Court, CourtOperation, CourtStatus, GpuExecutionEvent, operatorApiBaseUrl, ReplayClip,
   readApiError, Venue, VenueOperationsResponse,
 } from '@/lib/operator-api';
 import { formatChinaTime } from '@/lib/utils';
@@ -26,6 +26,7 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
   const [courts, setCourts] = useState(initialCourts);
   const [operations, setOperations] = useState<CourtOperation[]>([]);
   const [events, setEvents] = useState<Record<string, GpuExecutionEvent[]>>({});
+  const [replays, setReplays] = useState<Record<string, ReplayClip[]>>({});
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
   const [message, setMessage] = useState('');
@@ -40,14 +41,21 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
       if (!response.ok) throw new Error(await readApiError(response));
       const payload = await response.json() as VenueOperationsResponse;
       setOperations(payload.courts);
-      const activeCases = payload.courts.map((item) => item.case).filter((item): item is NonNullable<CourtOperation['case']> => Boolean(item?.gpu_analysis_session_id));
-      const loaded = await Promise.all(activeCases.map(async (caseItem) => {
-        const eventResponse = await fetch(`${operatorApiBaseUrl}/api/v1/cases/${caseItem.id}/gpu-events?limit=8`, { cache: 'no-store' });
-        if (!eventResponse.ok) return [caseItem.id, []] as const;
-        const eventPayload = await eventResponse.json() as { events?: GpuExecutionEvent[]; persisted_events?: GpuExecutionEvent[] };
-        return [caseItem.id, eventPayload.events?.length ? eventPayload.events : (eventPayload.persisted_events ?? [])] as const;
+      const activeCases = payload.courts.flatMap((item) => item.case ? [{ courtId: item.court.id, caseItem: item.case }] : []);
+      const loaded = await Promise.all(activeCases.map(async ({ courtId, caseItem }) => {
+        const [eventResponse, replayResponse] = await Promise.all([
+          caseItem.gpu_analysis_session_id ? fetch(`${operatorApiBaseUrl}/api/v1/cases/${caseItem.id}/gpu-events?limit=8`, { cache: 'no-store' }) : null,
+          fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/courts/${courtId}/case/replays`, { cache: 'no-store' }),
+        ]);
+        const eventPayload = eventResponse?.ok ? await eventResponse.json() as { events?: GpuExecutionEvent[]; persisted_events?: GpuExecutionEvent[] } : {};
+        const replayPayload = replayResponse.ok ? await replayResponse.json() as { replays?: ReplayClip[] } : {};
+        return [caseItem.id, {
+          events: eventPayload.events?.length ? eventPayload.events : (eventPayload.persisted_events ?? []),
+          replays: replayPayload.replays ?? [],
+        }] as const;
       }));
-      setEvents(Object.fromEntries(loaded));
+      setEvents(Object.fromEntries(loaded.map(([caseId, data]) => [caseId, data.events])));
+      setReplays(Object.fromEntries(loaded.map(([caseId, data]) => [caseId, data.replays])));
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : '实时场地状态读取失败。');
     }
@@ -101,6 +109,22 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
     finally { setBusy(null); }
   }
 
+  async function saveReplay(operation: CourtOperation) {
+    const activeCase = operation.case;
+    if (!activeCase) return;
+    setBusy(`replay-${activeCase.id}`); setError('');
+    try {
+      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/courts/${operation.court.id}/case/replays`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seconds: 20 }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response));
+      const payload = await response.json() as { replay: ReplayClip; message: string };
+      setReplays((current) => ({ ...current, [activeCase.id]: [payload.replay, ...(current[activeCase.id] ?? []).filter((item) => item.id !== payload.replay.id)] }));
+      setMessage(payload.message);
+    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : '比赛片段保存失败。'); }
+    finally { setBusy(null); }
+  }
+
   async function addCourt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy('new'); setError('');
     try {
@@ -129,10 +153,10 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
         <table className="min-w-[1320px] w-full text-left border-collapse"><thead><tr className="bg-slate-50 border-b border-slate-200">
           <th className="py-4 px-5 text-sm font-semibold text-slate-600">场地 / 可用性</th><th className="py-4 px-5 text-sm font-semibold text-slate-600">摄像头连接</th><th className="py-4 px-5 text-sm font-semibold text-slate-600">实时视频 / 采集</th><th className="py-4 px-5 text-sm font-semibold text-slate-600">当前 case</th><th className="py-4 px-5 text-sm font-semibold text-slate-600">GPU 推送</th><th className="py-4 px-5 text-sm font-semibold text-slate-600">GPU 状态与输出</th>
         </tr></thead><tbody>{courts.length === 0 ? <tr><td colSpan={6} className="py-8 text-center text-slate-500">该球馆尚未注册场地。</td></tr> : courts.map((court) => {
-          const operation = operationByCourt.get(court.id); const activeCase = operation?.case; const caseEvents = activeCase ? events[activeCase.id] ?? [] : [];
+          const operation = operationByCourt.get(court.id); const activeCase = operation?.case; const caseEvents = activeCase ? events[activeCase.id] ?? [] : []; const caseReplays = activeCase ? replays[activeCase.id] ?? [] : [];
           return <tr key={court.id} className="align-top border-b border-slate-100"><td className="py-5 px-5"><p className="font-semibold text-slate-900">{court.name}</p><p className="mt-1 text-xs text-slate-500">{court.code}</p><select aria-label={`${court.name} 状态`} disabled={busy !== null} value={court.status} onChange={(event) => changeStatus(court, event.target.value as CourtStatus)} className="mt-3 border border-slate-300 rounded-lg px-2 py-1.5 text-sm"><option value="active">可用</option><option value="maintenance">维护</option><option value="inactive">停用</option></select></td>
             <td className="py-5 px-5"><div>{statePill(Boolean(operation?.camera.connected), '已连接', '未连接')}</div><p className="mt-2 text-xs text-slate-500">{operation?.camera.camera_code ?? '未绑定摄像头'}</p><p className="mt-1 text-xs text-slate-400">{operation?.camera.camera_heartbeat_at ? `心跳 ${formatChinaTime(operation.camera.camera_heartbeat_at)}` : '等待心跳'}</p></td>
-            <td className="py-5 px-5"><div className="w-48"><div>{statePill(operation?.capture.mode !== 'idle', operation?.capture.mode === 'record' ? '采集中' : '预览中', '未采集')}</div>{activeCase?.preview_url && operation?.camera.connected ? <div className="mt-3"><video key={`${activeCase.id}-${previewTick}`} src={`${activeCase.preview_url}?t=${previewTick}`} autoPlay muted playsInline controls className="aspect-video w-full rounded-lg bg-slate-950 object-cover" /><p className="mt-2 text-xs text-slate-500">业务服务器短时预览（约 2–5 秒）</p>{operation.camera.calibration_status !== 'validated' && operation.capture.mode === 'preview' && <button type="button" onClick={() => setCalibratingCourtId(court.id)} className="mt-2 rounded-lg bg-amber-100 px-3 py-2 text-xs font-medium text-amber-900 hover:bg-amber-200">标注场地线</button>}</div> : <p className="mt-3 text-sm text-slate-500">{operation?.camera.connected ? operation?.capture.mode === 'idle' ? '由后台开启后才上传视频' : '等待首个可播放视频片段' : '摄像头连接后可预览'}</p>}<div className="mt-3 flex flex-wrap gap-2">{operation?.capture.mode === 'idle' ? <><button disabled={!operation?.camera.connected || busy !== null} onClick={() => { if (operation) void setCaptureMode(operation, 'preview'); }} className="rounded-lg bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50">{busy === court.id ? '请求中…' : '开启预览'}</button><button disabled={!operation?.camera.connected || busy !== null} onClick={() => { if (operation) void setCaptureMode(operation, 'record'); }} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50">开始采集</button></> : <button disabled={busy !== null} onClick={() => { if (operation) void setCaptureMode(operation, 'idle'); }} className="rounded-lg bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50">{busy === court.id ? '停止中…' : '停止视频'}</button>}</div></div>{calibratingCourtId === court.id && operation && <CourtCalibrationPanel venueId={venue.id} operation={operation} onClose={() => setCalibratingCourtId(null)} onSaved={async (savedMessage) => { setMessage(savedMessage); await loadOperations(); }} />}</td>
+            <td className="py-5 px-5"><div className="w-48"><div>{statePill(operation?.capture.mode !== 'idle', operation?.capture.mode === 'record' ? '采集中' : '预览中', '未采集')}</div>{activeCase?.preview_url && operation?.camera.connected ? <div className="mt-3"><video key={`${activeCase.id}-${previewTick}`} src={`${activeCase.preview_url}?t=${previewTick}`} autoPlay muted playsInline controls className="aspect-video w-full rounded-lg bg-slate-950 object-cover" /><p className="mt-2 text-xs text-slate-500">业务服务器短时预览（约 2–5 秒）</p>{operation.camera.calibration_status !== 'validated' && operation.capture.mode === 'preview' && <button type="button" onClick={() => setCalibratingCourtId(court.id)} className="mt-2 rounded-lg bg-amber-100 px-3 py-2 text-xs font-medium text-amber-900 hover:bg-amber-200">标注场地线</button>}</div> : <p className="mt-3 text-sm text-slate-500">{operation?.camera.connected ? operation?.capture.mode === 'idle' ? '由后台开启后才上传视频' : '等待首个可播放视频片段' : '摄像头连接后可预览'}</p>}<div className="mt-3 flex flex-wrap gap-2">{operation?.capture.mode === 'idle' ? <><button disabled={!operation?.camera.connected || busy !== null} onClick={() => { if (operation) void setCaptureMode(operation, 'preview'); }} className="rounded-lg bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50">{busy === court.id ? '请求中…' : '开启预览'}</button><button disabled={!operation?.camera.connected || busy !== null} onClick={() => { if (operation) void setCaptureMode(operation, 'record'); }} className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50">开始采集</button></> : <button disabled={busy !== null} onClick={() => { if (operation) void setCaptureMode(operation, 'idle'); }} className="rounded-lg bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50">{busy === court.id ? '停止中…' : '停止视频'}</button>}</div>{activeCase && <div className="mt-3 border-t border-slate-200 pt-3"><button disabled={!operation?.camera.connected || activeCase.received_segment_count === 0 || busy !== null} onClick={() => { if (operation) void saveReplay(operation); }} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50">{busy === `replay-${activeCase.id}` ? '保存中…' : '保存最近 20 秒'}</button>{caseReplays.map((replay) => <details key={replay.id} className="mt-2 text-xs text-slate-600"><summary className="cursor-pointer">回放 {replay.estimated_duration_seconds} 秒</summary><video src={`${operatorApiBaseUrl}${replay.url}`} controls preload="metadata" className="mt-2 aspect-video w-full rounded bg-slate-950" /></details>)}</div>}</div>{calibratingCourtId === court.id && operation && <CourtCalibrationPanel venueId={venue.id} operation={operation} onClose={() => setCalibratingCourtId(null)} onSaved={async (savedMessage) => { setMessage(savedMessage); await loadOperations(); }} />}</td>
             <td className="py-5 px-5">{activeCase ? <><code className="block max-w-52 break-all rounded bg-slate-100 px-2 py-1 text-xs text-slate-700">{activeCase.id}</code><p className="mt-2 text-xs text-slate-600">{activeCase.status} · 收到 {activeCase.received_segment_count} 段</p>{activeCase.last_received_at && <p className="mt-1 text-xs text-slate-400">最近接收 {formatChinaTime(activeCase.last_received_at)}</p>}</> : <p className="text-sm text-slate-500">终端尚未创建 case</p>}</td>
             <td className="py-5 px-5">{activeCase ? <>{operation?.camera.calibration_status === 'validated' ? <><div>{statePill(activeCase.gpu_forwarding_enabled, '推送中', '已暂停')}</div><button disabled={!operation?.camera.connected || busy !== null} onClick={() => { if (operation) void toggleGpu(operation); }} className={`mt-3 rounded-lg px-3 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50 ${activeCase.gpu_forwarding_enabled ? 'bg-rose-50 text-rose-700 hover:bg-rose-100' : 'bg-indigo-600 text-white hover:bg-indigo-700'}`}>{busy === activeCase.id ? '更新中…' : activeCase.gpu_forwarding_enabled ? '停止推送' : '推送到 GPU'}</button></> : <p className="text-sm text-amber-700">先根据预览保存并验证四角，随后重新开始采集。</p>}<p className="mt-2 text-xs text-slate-500">已转发 {activeCase.forwarded_segment_count} 段</p></> : <p className="text-sm text-slate-500">建立 case 后可控制</p>}</td>
             <td className="py-5 px-5"><div className="max-w-80">{activeCase ? <><p className="text-sm font-medium text-slate-800">{activeCase.gpu_status ?? (activeCase.gpu_forwarding_enabled ? '等待 GPU 回执' : '未推送')}</p>{activeCase.gpu_analysis_session_id && <p className="mt-1 break-all text-xs text-slate-500">GPU: {activeCase.gpu_analysis_session_id}</p>}{activeCase.error && <p className="mt-2 text-xs text-rose-700">{activeCase.error.message}</p>}<div className="mt-3 max-h-28 overflow-auto rounded-lg bg-slate-950 p-2 font-mono text-xs text-slate-100">{caseEvents.length ? caseEvents.slice(0, 4).map((item, index) => <p key={item.event_id ?? `${index}-${eventText(item)}`} className="mb-1 break-words">{item.occurred_at && <span className="text-slate-400">[{formatChinaTime(item.occurred_at)}] </span>}<span className="text-emerald-300">[{item.level ?? 'info'}]</span> {eventText(item)}</p>) : <p className="text-slate-400">尚无 GPU 执行事件</p>}</div></> : <p className="text-sm text-slate-500">暂无 GPU 输出</p>}</div></td>

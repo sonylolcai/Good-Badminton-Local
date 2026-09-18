@@ -49,6 +49,10 @@ services:
     volumes:
       - edge_staging:/var/lib/good-badminton/edge-staging
       - edge_preview:/var/lib/good-badminton/edge-preview
+      - edge_recordings:/var/lib/good-badminton/edge-recordings
+      - /opt/good-badminton/bin/ffmpeg:/opt/good-badminton/bin/ffmpeg:ro
+    environment:
+      GOOD_BADMINTON_FFMPEG: /opt/good-badminton/bin/ffmpeg
     depends_on:
       postgres:
         condition: service_healthy
@@ -94,3 +98,4 @@ volumes:
   good_badminton_postgres:
   edge_staging:
   edge_preview:
+  edge_recordings:

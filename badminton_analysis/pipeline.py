@@ -811,6 +811,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         )
 
     position_evidence_summary = None
+    candidate_photos = []
     if visualize_positions and has_detections:
         visualizations_t0 = time.perf_counter()
         _emit_analysis_stage(state_cb, "post_processing", "position_visualizations")
@@ -855,6 +856,15 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
                 "已经生成位置检测数据，但图表渲染失败。请打开右下角后台输出查看详情。"
             )
         record_pipeline_component("position_visualizations", visualizations_t0)
+        try:
+            from webui.player_results import extract_full_video_candidate_photos
+            candidate_photos = extract_full_video_candidate_photos(
+                video_path,
+                system.detections_path,
+                output_dir,
+            )
+        except Exception as exc:
+            warnings.append(f"高置信运动员截图未生成：{exc}")
 
     web_video_path = None
     if generate_annotated_video:
@@ -902,6 +912,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         "movement_rallies": (getattr(system, "offline_artifacts", None) or {}).get("rallies_path"),
         "movement_rally_window_sweep": (getattr(system, "offline_artifacts", None) or {}).get("rally_window_sweep_path"),
         "position_evidence_summary": position_evidence_summary,
+        "candidate_photos": candidate_photos,
         "derived": getattr(system, "offline_artifacts", None),
         "execution_metrics": execution_metrics,
         "visualizations": [],

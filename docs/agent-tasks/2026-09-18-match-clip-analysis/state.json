@@ -1,0 +1,23 @@
+{
+  "schema_version": "long-task.v1",
+  "task_id": "2026-09-18-match-clip-analysis",
+  "status": "needs_revision",
+  "repositories": [
+    {
+      "path": "S:\\Code Base\\MiniProgram\\bdTeach\\Good-Badminton",
+      "baseline_commit": "bb3ae98c84be9a8230a15415fec0e651d7bf9e7e",
+      "branch": "feat/tennis-gpu-modes"
+    }
+  ],
+  "approvals": {"plan": null, "tests": null},
+  "current_task": null,
+  "commits": [],
+  "checks": [
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m unittest tests.test_edge_ingest tests.test_operator_api -v",
+      "result": "passed: 22 tests",
+      "recorded_at": "2026-09-18T17:38:45.9207873+08:00"
+    }
+  ],
+  "updated_at": "2026-09-18T17:38:45.9207873+08:00"
+}

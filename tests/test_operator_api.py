@@ -51,6 +51,9 @@ class FakeDatabase:
         self.capture_update = (venue_id, court_id, mode)
         return {"court_id": court_id, "mode": mode, "revision": 1, "updated_at": "2026-09-01T00:00:00Z"}
 
+    def case_for_court(self, venue_id, court_id):
+        return {"case_id": "case-1", "venue_id": venue_id, "court_id": court_id}
+
     def calibration_candidate(self, venue_id, court_id, payload):
         self.calibration_candidate_request = (venue_id, court_id, payload)
         return {"camera_id": "camera-1", "method": payload["mode"], "court_corners": [[10, 20], [90, 20], [100, 100], [0, 100]], "evidence": payload}
@@ -117,6 +120,15 @@ class OperatorApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["capture"]["mode"], "preview")
         self.assertEqual(self.database.capture_update, ("venue-1", "court-1", "preview"))
+
+    def test_operator_can_save_a_recent_replay_for_the_current_court_case(self):
+        replay = {"id": "00000002-00000011.mp4", "start_segment_index": 2, "end_segment_index": 11,
+                  "segment_count": 10, "estimated_duration_seconds": 20}
+        with patch("operator_api.main._edge_gateway_operator_json", return_value={"replay": replay}) as gateway:
+            response = self.client.post("/api/v1/venues/venue-1/courts/court-1/case/replays", json={"seconds": 20})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["replay"]["url"], "/api/v1/venues/venue-1/courts/court-1/case/replays/00000002-00000011.mp4")
+        gateway.assert_called_once_with("/api/v1/edge/sessions/case-1/replays", method="POST", payload={"seconds": 20})
 
     def test_public_preview_origin_is_separate_from_internal_edge_origin(self):
         with patch.dict("os.environ", {

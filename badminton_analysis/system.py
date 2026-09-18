@@ -2,8 +2,6 @@ import ast
 import os
 import tempfile
 import json
-from tkinter import filedialog
-import tkinter as tk
 import time
 import argparse
 
@@ -1069,6 +1067,9 @@ class BadmintonAnalysisSystem:
             return self.template_path
 
         try:
+            import tkinter as tk
+            from tkinter import filedialog
+
             root = tk.Tk()
             root.withdraw()
             template_path = filedialog.askopenfilename(

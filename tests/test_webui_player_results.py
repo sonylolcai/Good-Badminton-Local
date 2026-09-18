@@ -1,9 +1,26 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from webui.player_results import build_player_result_display
+from webui.player_results import _best_detected_observations, build_player_result_display
 
 
 class PlayerResultDisplayTests(unittest.TestCase):
+    def test_full_video_portrait_requires_high_detection_location_and_identity_confidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            detections = Path(temporary) / "detections.jsonl"
+            detections.write_text("\n".join([
+                json.dumps({"frame": 1, "time_sec": 0.1, "spatial": {"tracks": [
+                    {"track_id": "track_low", "status": "detected", "confidence": 0.91, "association": {"identity_confidence": 0.79}, "location_evidence": {"confidence": 0.91, "bbox_xyxy": [1, 1, 90, 180]}},
+                    {"track_id": "track_high", "status": "detected", "confidence": 0.91, "association": {"identity_confidence": 0.92}, "location_evidence": {"confidence": 0.89, "bbox_xyxy": [1, 1, 90, 180]}},
+                ]}}),
+                "",
+            ]), encoding="utf-8")
+            observations = _best_detected_observations(detections)
+
+        self.assertEqual(list(observations), ["track_high"])
+
     def test_merges_stream_photo_status_with_real_movement_evidence(self):
         gallery, rows, detail = build_player_result_display(
             {

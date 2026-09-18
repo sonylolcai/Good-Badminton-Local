@@ -6,9 +6,31 @@ from pathlib import Path
 from business_gateway.metrics.detections_reader import (
     collect_track_position_evidence,
 )
+from badminton_analysis.visualization.spatial_player_positions import _track_summary
 
 
 class SpatialPlayerPositionsTests(unittest.TestCase):
+    def test_speed_summary_uses_only_contiguous_high_confidence_measurements(self):
+        summary = _track_summary(
+            {
+                "usable_points": [
+                    {"frame": 0, "court_xy_m": [0.0, 0.0], "detection_confidence": 0.9, "location_confidence": 0.9, "identity_confidence": 0.9},
+                    {"frame": 10, "court_xy_m": [1.0, 0.0], "detection_confidence": 0.9, "location_confidence": 0.9, "identity_confidence": 0.9},
+                    {"frame": 20, "court_xy_m": [3.0, 0.0], "detection_confidence": 0.9, "location_confidence": 0.9, "identity_confidence": 0.9},
+                ],
+                "track_rows": 3,
+                "state_counts": {"detected": 3},
+                "excluded": {},
+            },
+            source_frames=3,
+            fps=30,
+        )
+
+        self.assertEqual(summary["movement_distance_m"], 3.0)
+        self.assertEqual(summary["movement_time_sec"], 0.667)
+        self.assertEqual(summary["movement_mean_speed_mps"], 4.5)
+        self.assertEqual(summary["movement_peak_speed_mps"], 6.0)
+
     def test_four_tracks_are_separated_and_only_high_confidence_measurements_are_usable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             detections = Path(temp_dir) / "detections.jsonl"
