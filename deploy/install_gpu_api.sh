@@ -5,8 +5,6 @@ set -euo pipefail
 # intentionally does not deploy business databases, users, SSO, or frontend.
 DEFAULT_APP_DIR="$HOME/good-badminton-gpu-api"
 APP_DIR="${1:-$DEFAULT_APP_DIR}"
-BRANCH="${2:-}"
-REPOSITORY="${GOOD_BADMINTON_REPOSITORY:-https://github.com/sonylolcai/Good-Badminton-Local.git}"
 SERVICE_NAME="good-badminton-gpu-api"
 STATE_DIR="${GOOD_BADMINTON_STATE_DIR:-${APP_DIR}-state}"
 ENV_FILE="${STATE_DIR}/.gpu-api.env"
@@ -45,22 +43,11 @@ else
 fi
 echo "Using PyTorch ${PYTORCH_CUDA_INDEX} wheels for NVIDIA driver ${driver_version}."
 
-if [[ "${GOOD_BADMINTON_SKIP_GIT_SYNC:-0}" == "1" ]]; then
-  [[ -f "$APP_DIR/api/app.py" ]] || {
-    echo "GOOD_BADMINTON_SKIP_GIT_SYNC=1 requires an extracted project at $APP_DIR" >&2
-    exit 1
-  }
-  echo "Skipping Git sync; deploying the extracted source at $APP_DIR."
-elif [[ -z "$BRANCH" ]]; then
-  echo "Pass a reviewed shared-GPU branch as argument 2, or set GOOD_BADMINTON_SKIP_GIT_SYNC=1 for an extracted ZIP package." >&2
-  exit 64
-elif [[ ! -d "$APP_DIR/.git" ]]; then
-  GIT_TERMINAL_PROMPT=0 git clone --branch "$BRANCH" --single-branch "$REPOSITORY" "$APP_DIR"
-else
-  GIT_TERMINAL_PROMPT=0 git -C "$APP_DIR" fetch origin "$BRANCH"
-  git -C "$APP_DIR" switch "$BRANCH"
-  GIT_TERMINAL_PROMPT=0 git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
-fi
+[[ -f "$APP_DIR/api/app.py" ]] || {
+  echo "Extract the uploaded complete GPU package into $APP_DIR before installation." >&2
+  exit 1
+}
+echo "Installing the extracted GPU package at $APP_DIR."
 
 if [[ "${GOOD_BADMINTON_USE_SYSTEM_TORCH:-0}" == "1" ]]; then
   # Official rental images often bundle a CUDA-enabled Conda PyTorch but block
@@ -139,7 +126,15 @@ ln -s "$ENV_FILE" "$APP_DIR/.gpu-api.env"
 ln -s "$DATA_DIR" "$APP_DIR/api_data"
 ln -s "$WEIGHTS_DIR" "$APP_DIR/weights"
 
-"$PYTHON_BIN" -m unittest tests.test_gpu_api -v
+PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" - <<'PY'
+import tempfile
+
+from api.app import create_app
+
+with tempfile.TemporaryDirectory() as data_dir:
+    app = create_app(data_dir=data_dir, start_worker=False)
+    assert app.title == "Good-Badminton multi-sport GPU API"
+PY
 
 service_file="/etc/systemd/system/${SERVICE_NAME}.service"
 if command -v systemctl >/dev/null && systemctl show-environment >/dev/null 2>&1; then

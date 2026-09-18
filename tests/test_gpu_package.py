@@ -49,6 +49,8 @@ class GpuPackageTests(unittest.TestCase):
         self.assertTrue(all(name.startswith(PACKAGE_ROOT) for name in names))
         self.assertTrue(all("\\" not in name for name in names))
         self.assertIn(f"{PACKAGE_ROOT}api/app.py", names)
+        self.assertIn(f"{PACKAGE_ROOT}deploy/install_gpu_api.sh", names)
+        self.assertIn(f"{PACKAGE_ROOT}deploy/good-badminton-gpu-api.service", names)
         self.assertIn(f"{PACKAGE_ROOT}deploy/start_gpu_api_container.sh", names)
         forbidden_prefixes = (
             "evaluation/",
@@ -135,7 +137,9 @@ class GpuPackageTests(unittest.TestCase):
         self.assertIn("$STATE_DIR/.venv/bin/python", refresh)
         self.assertIn("$STATE_DIR/.venv", installer)
         self.assertNotIn("fixed-camera-singles-spatial-tracking", installer)
-        self.assertIn("Pass a reviewed shared-GPU branch", installer)
+        self.assertIn("Extract the uploaded complete GPU package", installer)
+        self.assertNotIn("git clone", installer)
+        self.assertNotIn("GOOD_BADMINTON_SKIP_GIT_SYNC", installer)
         self.assertIn("EnvironmentFile=__ENV_FILE__", service)
         self.assertIn('PREVIOUS_APP_DIR="$STATE_DIR/previous-app"', refresh)
         self.assertIn("restore_previous_api", refresh)

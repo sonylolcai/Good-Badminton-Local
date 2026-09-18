@@ -142,75 +142,12 @@ GOOD_BADMINTON_GPU_API_KEY=<从 GPU 实例 .gpu-api.env 读取的密钥>
 
 真正的边传边解析需要独立的实时会话协议：摄像头产生可独立解码的短 GOP 分片（推荐 1–2 秒 fMP4 或 WebRTC）、服务器维护跨分片的追踪状态/时间戳、迟到分片处理和最终回合汇总。它不能只靠当前完整文件 API 改成 chunked upload 完成。首版批处理仍保留完整视频上传，以保证标定、轨迹和热力图汇总一致；后续可在不破坏 `/jobs` 的前提下新增 `/stream-sessions`。
 
-## 服务器安装
+## 服务器安装（已由上传 ZIP 流程取代）
 
-前置条件：NVIDIA 驱动、Python 3、Git、FFmpeg、可使用 `sudo` 的 Linux 用户。安装脚本会按驱动版本自动安装 PyTorch CUDA 12.1（驱动 535+）或 CUDA 12.4（驱动 550+）wheel；不要求镜像工具包标签恰好为 CUDA 12.4。先将当前分支推送到你的 fork：
-
-```powershell
-git push -u origin fixed-camera-singles-spatial-tracking
-```
-
-在 GPU 实例内执行：
-
-```bash
-git clone --branch fixed-camera-singles-spatial-tracking https://github.com/sonylolcai/Good-Badminton-Local.git ~/good-badminton
-cd ~/good-badminton
-chmod +x deploy/install_gpu_api.sh
-./deploy/install_gpu_api.sh ~/good-badminton fixed-camera-singles-spatial-tracking
-```
-
-### GitHub HTTPS 受限时：官方源码包兜底
-
-若实例无法连接 `github.com:443`，先测试官方下载域名：
-
-```bash
-curl -IL --connect-timeout 10 --max-time 20 \
-  https://codeload.github.com/sonylolcai/Good-Badminton-Local/zip/refs/heads/fixed-camera-singles-spatial-tracking
-```
-
-能返回 `200` 或 `302` 时，使用同一分支的源码包部署（不需要 Git，也不会跳转到任何第三方镜像）：
-
-```bash
-test ! -e ~/good-badminton-source || { echo "~/good-badminton-source already exists; choose a new empty directory."; exit 1; }
-curl -fL --retry 2 \
-  https://codeload.github.com/sonylolcai/Good-Badminton-Local/zip/refs/heads/fixed-camera-singles-spatial-tracking \
-  -o /tmp/good-badminton-source.zip
-unzip -q /tmp/good-badminton-source.zip -d ~
-mv ~/Good-Badminton-Local-fixed-camera-singles-spatial-tracking ~/good-badminton-source
-cd ~/good-badminton-source
-chmod +x deploy/install_gpu_api.sh
-GOOD_BADMINTON_SKIP_GIT_SYNC=1 ./deploy/install_gpu_api.sh ~/good-badminton-source fixed-camera-singles-spatial-tracking
-```
-
-若 `codeload.github.com` 同样无法访问，不要使用不受控的第三方 GitHub 镜像。请通过云平台的文件上传功能上传本分支的源码包，或为实例配置平台提供的 HTTP/HTTPS 代理，然后重复该流程。
-
-脚本会安装与驱动兼容的 CUDA PyTorch、其他项目依赖、创建只允许当前用户读取的 `.gpu-api.env` 并运行 API 测试。存在可用 systemd 时，它会配置 systemd 服务；多数租赁 GPU 容器没有 systemd 时，则自动以后台 `uvicorn` 进程启动，并在项目目录记录 `.gpu-api.pid` 和 `gpu-api.log`。密钥只存在 `.gpu-api.env`，不要提交、截图或发到聊天中。
-
-### 无公网但镜像已自带 GPU PyTorch
-
-一些租赁实例禁止访问 `download.pytorch.org`，却已有可用的 CUDA PyTorch。先确认 `python3 -c 'import torch; print(torch.cuda.is_available())'` 输出 `True`。将其余 Linux x86_64 / Python 3.12 依赖 wheel 上传到一个目录（例如 `/root/good-badminton-wheelhouse`）后，执行：
-
-```bash
-GOOD_BADMINTON_SKIP_GIT_SYNC=1 \
-GOOD_BADMINTON_USE_SYSTEM_TORCH=1 \
-GOOD_BADMINTON_WHEELHOUSE=/root/good-badminton-wheelhouse \
-./deploy/install_gpu_api.sh /root/good-badminton-source fixed-camera-singles-spatial-tracking
-```
-
-此模式不会创建隔离 venv 或下载/覆盖镜像的 PyTorch；其他依赖仅从上传的 wheel 目录安装，缺包会明确失败而不会访问公网。
-
-启动后在实例内检查：
-
-```bash
-curl http://127.0.0.1:8080/api/v1/health
-sudo journalctl -u good-badminton-gpu-api -f
-```
-
-容器模式请改为：
-
-```bash
-tail -f /root/good-badminton-source/gpu-api.log
-```
+本节旧有的 Git 拉取命令不再用于共享多运动 GPU 服务。新服务器一律通过云平台
+文件上传完整发布包；按 [共享多运动 GPU 包运行手册](docs/GPU_MULTI_SPORT_PACKAGE.md)
+执行“全新 GPU 服务器：仅通过文件上传首次部署”。业务与评测服务仍各自在其
+自身服务器配置 GPU URL/API Key，前端不直连 GPU。
 
 ## 业务服务器联调
 

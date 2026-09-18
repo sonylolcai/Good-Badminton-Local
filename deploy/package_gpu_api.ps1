@@ -25,6 +25,8 @@ $requiredFiles = @(
     '.gpu-api.env.example',
     'requirements.txt',
     'simhei.ttf',
+    'deploy/good-badminton-gpu-api.service',
+    'deploy/install_gpu_api.sh',
     'deploy/install_lap.sh',
     'deploy/refresh_gpu_api_from_zip.sh',
     'deploy/run_tracknet_v3_ab.sh',
@@ -138,6 +140,8 @@ try {
     foreach ($relativePath in @(
         'api/app.py',
         'api/vision_profiles.py',
+        'deploy/good-badminton-gpu-api.service',
+        'deploy/install_gpu_api.sh',
         'deploy/refresh_gpu_api_from_zip.sh',
         'deploy/start_gpu_api_container.sh',
         'deploy/stop_gpu_api_container.sh'
@@ -175,17 +179,18 @@ try {
     Write-Host "Created GPU deployment package: $($item.FullName)"
     Write-Host "Size: $([math]::Round($item.Length / 1MB, 2)) MiB"
     if ($IncludeWeights) {
-        Write-Host 'Complete release: three checked model files plus manifest; no secrets or job data.'
+        Write-Host 'Complete release: bootstrap installer, three checked model files plus manifest; no secrets or job data.'
         Write-Host 'Upload it to /root/good-badminton-gpu-api-full-release.zip, then run:'
         Write-Host 'bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh /root/good-badminton-gpu-api-full-release.zip'
         Write-Host 'First deployment only:'
+        Write-Host 'unzip -q /root/good-badminton-gpu-api-full-release.zip -d /root'
+        Write-Host 'bash /root/good-badminton-gpu-api/deploy/install_gpu_api.sh'
         Write-Host 'unzip -p /root/good-badminton-gpu-api-full-release.zip good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash -s -- /root/good-badminton-gpu-api-full-release.zip'
     }
     else {
         Write-Host 'Upload it to /root/good-badminton-gpu-api-upload.zip, then run:'
         Write-Host 'bash /root/good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh'
-        Write-Host 'First deployment only:'
-        Write-Host 'unzip -p /root/good-badminton-gpu-api-upload.zip good-badminton-gpu-api/deploy/refresh_gpu_api_from_zip.sh | bash -s --'
+        Write-Host 'Source-only packages require an existing GPU runtime and weights.'
     }
 }
 finally {
