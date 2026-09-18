@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import base64
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -81,7 +82,30 @@ class GpuApiTests(unittest.TestCase):
             {
                 "corners": [[10, 20], [30, 20], [30, 40], [10, 40]],
                 "preview_data_url": None,
+                "template_data_url": None,
             },
+        )
+
+    def test_court_detection_returns_the_original_selected_frame_for_a_run(self):
+        template = Path(self.temp_dir.name) / "court.png"
+        template.write_bytes(b"raw-template-frame")
+        self.app.state.court_detector = lambda _path: {
+            "corners": [[10, 20], [30, 20], [30, 40], [10, 40]],
+            "preview_bgr": None,
+            "template_path": str(template),
+        }
+
+        response = self.client.post(
+            "/api/v1/court/detect",
+            headers={"X-API-Key": "test-api-key"},
+            files={"video": ("match.mp4", b"video-bytes", "video/mp4")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        template_url = response.json()["template_data_url"]
+        self.assertEqual(
+            base64.b64decode(template_url.split(",", 1)[1]),
+            b"raw-template-frame",
         )
 
     def test_valid_upload_creates_a_queued_job_with_stable_status_url(self):

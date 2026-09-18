@@ -93,7 +93,21 @@ def create_app(
             encoded, data = cv2.imencode(".jpg", result["preview_bgr"])
             if encoded:
                 preview_data_url = "data:image/jpeg;base64," + base64.b64encode(data.tobytes()).decode("ascii")
-        return {"corners": result.get("corners") or [], "preview_data_url": preview_data_url}
+        template_data_url = None
+        template_path = Path(result.get("template_path") or "")
+        if template_path.is_file() and template_path.suffix.lower() in IMAGE_EXTENSIONS:
+            media_type = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".bmp": "image/bmp",
+            }[template_path.suffix.lower()]
+            template_data_url = f"data:{media_type};base64," + base64.b64encode(template_path.read_bytes()).decode("ascii")
+        return {
+            "corners": result.get("corners") or [],
+            "preview_data_url": preview_data_url,
+            "template_data_url": template_data_url,
+        }
 
     @app.post("/api/v1/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_api_key)])
     async def create_job(
