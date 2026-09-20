@@ -1,7 +1,7 @@
 {
   "schema_version": "long-task.v1",
   "task_id": "2026-09-20-service-repository-split",
-  "status": "implementing",
+  "status": "completed",
   "repositories": [
     {
       "path": "S:\\Code Base\\MiniProgram\\bdTeach\\Good-Badminton",
@@ -15,8 +15,16 @@
     }
   ],
   "approvals": {"plan": "user approved: 批准; revision approved: ok", "tests": "user approved: 批准测试; revision approved: 批准修订测试"},
-  "current_task": "T1",
-  "commits": [],
+  "current_task": null,
+  "commits": [
+    "00dc37a docs(architecture): record service repository split plan",
+    "ca8aff0 feat(venue): extract venue gateway service",
+    "05175b2 feat(business): extract business control plane",
+    "f976505 fix(business): keep environment template clean",
+    "2bb075b feat(clients): extract mini program and operator web",
+    "f0399e2 refactor(gpu): isolate visual analysis service",
+    "6f41cb7 chore(gpu): remove retired web UI dependency list"
+  ],
   "checks": [
     {
       "id": "B-01",
@@ -48,5 +56,5 @@
       "detail": "The revised test finds the existing venue repository, while the business layout and clean GPU worktree are not ready; it proves the revised target has not yet been implemented."
     }
   ],
-  "updated_at": "2026-09-20T00:20:00+08:00"
+  "updated_at": "2026-09-20T01:20:00+08:00"
 }
