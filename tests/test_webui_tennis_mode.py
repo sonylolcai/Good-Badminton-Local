@@ -10,6 +10,7 @@ import gradio as gr
 from webui.app import (
     _APP_CSS,
     _SPORT_MODE_CLIENT_SYNC,
+    _full_video_upload_update,
     configure_processing_target,
     configure_sport_mode,
     configure_sport_presentation,
@@ -17,9 +18,80 @@ from webui.app import (
     ensure_court_for_analysis,
     run_analysis_with_upload_mode,
 )
+from webui.pipeline import resolve_full_video_models
 
 
 class TennisWebUiModeTests(unittest.TestCase):
+    def test_full_video_result_inserts_stream_status_before_player_outputs(self):
+        update = tuple(range(15)) + ("player-gallery", "player-rows", "player-detail")
+
+        wrapped = _full_video_upload_update(update)
+
+        self.assertEqual(wrapped[:15], update[:15])
+        self.assertEqual(wrapped[15]["mode"], "full_video_direct_gpu")
+        self.assertEqual(wrapped[16:], update[15:])
+
+    def test_full_video_tennis_rejects_badminton_only_ball_detector(self):
+        with self.assertRaisesRegex(ValueError, "not allowed"):
+            resolve_full_video_models(
+                "tennis",
+                {"session_mode": "singles_match", "shuttle_detector": "tracknet_v3"},
+            )
+
+    def test_full_video_badminton_keeps_selected_match_policy(self):
+        resolved = resolve_full_video_models(
+            "badminton",
+            {
+                "shuttle_detector": "none",
+                "match_mode": "doubles",
+                "lock_match_roster": False,
+            },
+        )
+
+        self.assertEqual(resolved["match_mode"], "doubles")
+        self.assertFalse(resolved["lock_match_roster"])
+
+    def test_full_video_tennis_uses_profile_pose_and_dedicated_ball_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pose = Path(directory) / "tennis-pose.pt"
+            ball = Path(directory) / "tennis-ball.pt"
+            pose.write_bytes(b"pose")
+            ball.write_bytes(b"ball")
+            with patch.dict(
+                "os.environ",
+                {
+                    "GOOD_TENNIS_STREAM_POSE_MODEL": str(pose),
+                    "GOOD_TENNIS_STREAM_BALL_MODEL": str(ball),
+                },
+                clear=False,
+            ):
+                resolved = resolve_full_video_models(
+                    "tennis",
+                    {"session_mode": "singles_match", "shuttle_detector": "yolo"},
+                )
+
+        self.assertEqual(resolved["pose_model_path"], str(pose))
+        self.assertEqual(resolved["ball_model_path"], str(ball))
+        self.assertEqual(resolved["ball_tracker_class"].__name__, "TennisBallTracker")
+        self.assertEqual(resolved["ball_observation_identity"]["ball_kind"], "tennis_ball")
+        self.assertFalse(resolved["ball_observation_identity"]["experimental"])
+        self.assertEqual(resolved["match_mode"], "singles")
+        self.assertTrue(resolved["lock_match_roster"])
+
+    def test_full_video_tennis_training_uses_profiled_near_half_configuration(self):
+        resolved = resolve_full_video_models(
+            "tennis",
+            {
+                "session_mode": "single_player_training",
+                "calibration_scope": "near_half_court",
+                "shuttle_detector": "none",
+            },
+        )
+
+        self.assertEqual(resolved["expected_player_count"], 1)
+        self.assertEqual(resolved["calibration_scope"], "near_half_court")
+        self.assertEqual(resolved["athlete_observation_region"], "near_court_athlete")
+
     def test_tennis_browser_mode_sync_hides_badminton_only_controls(self):
         self.assertIn("dataset.goodSportMode", _SPORT_MODE_CLIENT_SYNC)
         for element_id in (

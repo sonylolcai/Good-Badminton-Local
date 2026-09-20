@@ -12,6 +12,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from api.stream_runtime import resolve_tennis_ball_model_spec
+from api.vision_profiles import get_vision_profile
 from badminton_analysis.cancellation import AnalysisCancelled, raise_if_cancelled
 from badminton_analysis.court.mapper import (
     CourtMapper,
@@ -34,6 +36,71 @@ _SAFE_OUTPUT_STEM_PATTERN = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 _dependencies_loaded = False
 _TRACKNET_EVENT_PREFIX = "GOOD_BADMINTON_TRACKNET_EVENT="
+
+
+def resolve_full_video_models(sport_id, options):
+    """Use the fixed sport profile for full-video model and tracker selection."""
+    sport_id = "tennis" if sport_id == "tennis" else "badminton"
+    profile = get_vision_profile(sport_id)
+    mode = profile.mode(options.get("session_mode"))
+    scope = mode.calibration_scope(
+        options.get("calibration_scope") or mode.default_calibration_scope
+    )
+    detector = options.get("shuttle_detector", "yolo")
+    if detector not in profile.allowed_ball_detectors:
+        raise ValueError(
+            f"shuttle_detector={detector} is not allowed for sport_id={sport_id}"
+        )
+    match_policy = {
+        "match_mode": "singles" if sport_id == "tennis" else options.get("match_mode", "singles"),
+        "lock_match_roster": True if mode.expected_player_count is not None else bool(options.get("lock_match_roster", True)),
+        "session_mode": mode.session_mode,
+        "expected_player_count": mode.expected_player_count,
+        "calibration_scope": scope.scope_id,
+        "calibration_world_points_m": [list(point) for point in scope.world_points_m],
+        "athlete_observation_region": mode.athlete_observation_region,
+        "athlete_observation_margin_m": mode.athlete_observation_margin_m,
+        "athlete_observation_lateral_margin_m": mode.athlete_observation_lateral_margin_m,
+        "athlete_observation_baseline_margin_m": mode.athlete_observation_baseline_margin_m,
+    }
+    project_root = Path(__file__).resolve().parents[1]
+    if sport_id == "tennis":
+        pose_path = str(
+            os.environ.get("GOOD_TENNIS_STREAM_POSE_MODEL")
+            or project_root / "weights" / profile.default_pose_checkpoint
+        ).strip()
+        if detector == "yolo":
+            ball_spec = resolve_tennis_ball_model_spec()
+            return {
+                **match_policy,
+                "pose_model_path": pose_path,
+                "ball_model_path": str(ball_spec["path"]),
+                "ball_tracker_class": ball_spec["tracker_class"],
+                "ball_observation_identity": {
+                    "ball_kind": str(ball_spec["ball_kind"]),
+                    "detector_mode": str(ball_spec["detector_mode"]),
+                    "experimental": bool(ball_spec["experimental"]),
+                },
+            }
+        return {
+            **match_policy,
+            "pose_model_path": pose_path,
+            "ball_model_path": None,
+            "ball_tracker_class": None,
+            "ball_observation_identity": None,
+        }
+
+    return {
+        **match_policy,
+        "pose_model_path": options.get("yolo_pose_model") or "weights/yolo11n-pose.pt",
+        "ball_model_path": options.get("ball_model") or "weights/yolo11s-ball.pt",
+        "ball_tracker_class": None,
+        "ball_observation_identity": {
+            "ball_kind": "shuttlecock",
+            "detector_mode": "badminton_yolo",
+            "experimental": False,
+        },
+    }
 
 
 def _emit_analysis_stage(callback, phase, stage, details=None):
@@ -644,13 +711,10 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
 
     roi_corners = compute_expanded_roi(corners, (frame_h, frame_w, 3))
     sport_id = "tennis" if options.get("sport_id") == "tennis" else "badminton"
-    from api.vision_profiles import get_vision_profile
     vision_profile = get_vision_profile(sport_id)
+    model_config = resolve_full_video_models(sport_id, options)
     court_dimensions = tuple(float(value) for value in vision_profile.court_dimensions_m)
-    calibration_world_points_m = [
-        [0.0, 0.0], [court_dimensions[0], 0.0],
-        [court_dimensions[0], court_dimensions[1]], [0.0, court_dimensions[1]],
-    ]
+    calibration_world_points_m = model_config["calibration_world_points_m"]
     mapper = CourtMapper(
         corners,
         court_dimensions=court_dimensions,
@@ -671,8 +735,6 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     language = options.get("language", "zh")
     pose_family = options.get("pose_family", "yolo-pose")
     pose_mode = options.get("pose_mode", "balanced")
-    yolo_pose_model = options.get("yolo_pose_model", "weights/yolo11n-pose.pt")
-    ball_model = options.get("ball_model", "weights/yolo11s-ball.pt")
     keep_audio = options.get("audio", True)
     generate_annotated_video = bool(options.get("generate_annotated_video", False))
     browser_video_reencode = bool(options.get("browser_video_reencode", False))
@@ -696,16 +758,18 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     pose_conf = float(options.get("pose_conf", 0.15))
     far_player_enhancement = bool(options.get("far_player_enhancement", False))
     far_pose_roi = options.get("far_pose_roi", (0.12, 0.30, 0.86, 0.82))
-    match_mode = options.get("match_mode", "singles")
     # ByteTrack only receives already-sampled pose detections. The shared
     # timestamp cadence remains the sole detector/tracker update budget.
     tracker_backend = options.get("tracker_backend", "bytetrack")
     enable_bytetrack = bool(options.get("enable_bytetrack", True))
-    lock_match_roster = bool(options.get("lock_match_roster", True))
     roster_stable_frames = int(options.get("roster_stable_frames", 2))
     shuttle_detector = options.get("shuttle_detector", "yolo")
     if shuttle_detector not in {"none", "yolo", "tracknet_v3"}:
         raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
+    match_mode = model_config["match_mode"]
+    lock_match_roster = model_config["lock_match_roster"]
+    yolo_pose_model = model_config["pose_model_path"]
+    ball_model = model_config["ball_model_path"]
     movement_rally_settle_seconds = float(options.get("movement_rally_settle_seconds", 0.7))
     enable_huji_play_state = bool(options.get("enable_huji_play_state", True))
     tracknet_measurements_path = None
@@ -760,6 +824,15 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         court_dimensions=court_dimensions,
         calibration_world_points_m=calibration_world_points_m,
         coordinate_system_id=vision_profile.coordinate_system_id,
+        session_mode=model_config["session_mode"],
+        expected_player_count=model_config["expected_player_count"],
+        calibration_scope=model_config["calibration_scope"],
+        ball_tracker_class=model_config["ball_tracker_class"],
+        ball_observation_identity=model_config["ball_observation_identity"],
+        athlete_observation_region=model_config["athlete_observation_region"],
+        athlete_observation_margin_m=model_config["athlete_observation_margin_m"],
+        athlete_observation_lateral_margin_m=model_config["athlete_observation_lateral_margin_m"],
+        athlete_observation_baseline_margin_m=model_config["athlete_observation_baseline_margin_m"],
     )
     system.keep_audio = keep_audio
     execution_metrics = system.process_video(

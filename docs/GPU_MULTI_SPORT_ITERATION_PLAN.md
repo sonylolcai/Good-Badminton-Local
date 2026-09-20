@@ -1,6 +1,6 @@
 # GPU 双运动独立部署迭代方案
 
-状态：R2（固定运动入口与人物模式拆分）已在 `feat/tennis-gpu-modes` 实施；纯 GPU 入口、模式同步模块和固定运动启动脚本已补齐。网球球模型、独立发布包和 WebUI 仍待后续迭代。
+状态：固定运动入口、模式同步、独立发布包和 WebUI 路由已实现；固定入口同时提供整视频任务与分片流接口。
 范围：GPU 视觉分析与配套 WebUI 适配
 不在范围：自动计分、胜负、排名、业务报告、能量估算、人工身份认领规则
 
@@ -92,10 +92,10 @@ webui/
 视觉解析：api/stream_runtime.py + shared tracker/pose/geometry
     │ 只产生匿名人物、姿态、位置、球候选、质量和运行追踪
     ▼
-纯 GPU HTTP：apps/<sport>_gpu/app.py + api/gpu_stream_app.py
+GPU HTTP：apps/<sport>_gpu/app.py + api/app.py
 ```
 
-纯入口没有 `/api/v1/jobs`，也不导入整文件任务、WebUI pipeline、击球/回合/报告或渲染模块。`api.app` 只作为旧羽毛球整文件流程的兼容 façade，不能作为新的 GPU 部署启动目标。
+固定运动入口通过 `api.app.create_app(profile)` 同时暴露 `/api/v1/jobs` 和分片流接口，但不包含业务判分、报告或大模型教练逻辑。`api.gpu_stream_app` 继续保留为只需要分片观测时的裁剪入口。
 
 ## 4. 运动适配接口
 
@@ -251,7 +251,7 @@ good-tennis-gpu-api-<version>.zip
 
 共享部署实现可以放在 `deploy/common/`，由两个小型运动脚本提供固定目录、进程名称和包身份。部署清单必须写入 `sport_id`；更新脚本在停止旧进程前验证包的运动身份，拒绝错误包。
 
-当前可复现的纯 GPU 启动命令如下。两个网球视觉会话模式是**同一个网球进程内的会话配置**，不应各启一个服务；这样业务端不能靠切换进程来改变视觉约束。
+当前可复现的固定运动 GPU 启动命令如下。两个网球视觉会话模式是**同一个网球进程内的会话配置**，不应各启一个服务；这样业务端不能靠切换进程来改变视觉约束。
 
 ```bash
 # 羽毛球：固定 apps.badminton_gpu.app:app
@@ -261,11 +261,11 @@ bash deploy/start_badminton_gpu_container.sh /root/good-badminton-gpu-api
 bash deploy/start_tennis_gpu_container.sh /root/good-tennis-gpu-api
 ```
 
-旧命令 `start_gpu_api_container.sh` 仅向后兼容地转发至羽毛球纯入口。共享启动器只允许上述两个 entry point，拒绝 `api.app:app` 或任意外部模块路径。
+旧命令 `start_gpu_api_container.sh` 仅向后兼容地转发至羽毛球固定入口。共享启动器只允许上述两个 entry point，拒绝可由环境变量任意指定模块。
 
 ### 7.3 发布包裁剪
 
-GPU 生产包使用源码白名单，不再复制整个仓库。纯流式生产包不包含：
+GPU 生产包使用源码白名单，不再复制整个仓库。固定运动生产包不包含：
 
 - `business_gateway/`
 - 运动指标、报告和人工复核实现
@@ -390,12 +390,12 @@ GPU 生产包使用源码白名单，不再复制整个仓库。纯流式生产�
 当前事实：
 
 - 流式 GPU 入口已经以匿名人物/姿态和可选羽毛球观测为主。
-- 现有 `stream-session.v1` 只接受 `person_only`，运动字段尚不存在。
+- `stream-session.v1` 以 `person_only` 为视觉模式，并由固定入口校验 `sport_id` 与会话模式。
 - 本分支已将 `expected_player_count=1` 与最小 1 人 roster 支持下沉到共享追踪；固定 sport/profile 会继续限制羽毛球为 2/4 人、网球单打为 2 人、网球训练为 1 人。
-- 当前人物位置会在场地外约 0.35 米被过滤，不适合直接套用到网球。
+- 人物过滤已支持独立的边线和底线扩展；网球当前分别为 0.75 米和 3 米。
 - 当前羽毛球和人物处理共用 `analysis_sample_hz`。
 - 当前自动场地线检测与场地叠加是羽毛球专属实现。
-- 当前发布和更新脚本的目录、包名、权重名及进程名是羽毛球专属。
+- 发布和更新脚本已按羽毛球、网球固定目录、包名和入口校验部署身份。
 
 待验证：
 

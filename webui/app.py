@@ -690,7 +690,9 @@ def run_full_analysis(analysis_ready, video_file, template_path, corners,
                 output_dir=remote_output_dir,
                 remote_base_url=(
                     "local://webui-cpu"
-                    if force_local else remote_gpu_config(gpu_base_url)["base_url"]
+                    if force_local else remote_gpu_config(
+                        gpu_base_url, sport_id=options["sport_id"]
+                    )["base_url"]
                 ),
             )
 
@@ -1031,11 +1033,12 @@ def run_local_stream_replay(
 def _full_video_upload_update(update):
     """Keep the stream-status panel explicit for a direct full-file upload."""
 
-    return (*update, {
+    stream_status = {
         "mode": "full_video_direct_gpu",
         "status": "idle",
         "hint": "当前任务按完整视频直接提交到 GPU。",
-    })
+    }
+    return (*update[:15], stream_status, *update[15:])
 
 
 def _two_second_segment_upload_update(stream_status):

@@ -140,6 +140,41 @@ class GpuSportProfileTests(unittest.TestCase):
         self.assertTrue(court.contains_athlete((4.0, 23.77 + 2.5), **margins))
         self.assertFalse(court.contains_athlete((-1.0, 12.0), **margins))
 
+    def test_tennis_tracker_keeps_player_inside_configured_baseline_extension(self):
+        resolved = self.tennis_modes.synchronize(
+            self.configuration(session_mode="singles_match")
+        )
+        tracker = PersonOnlyTracker(
+            [(0, 0), (100, 0), (100, 100), (0, 100)],
+            fps=10,
+            min_confirmed_detections=1,
+            court_dimensions_m=resolved["court_dimensions_m"],
+            calibration_world_points_m=resolved["calibration_world_points_m"],
+            athlete_observation_region=resolved["athlete_observation_region"],
+            athlete_observation_margin_m=resolved["athlete_observation_margin_m"],
+            athlete_observation_lateral_margin_m=resolved[
+                "athlete_observation_lateral_margin_m"
+            ],
+            athlete_observation_baseline_margin_m=resolved[
+                "athlete_observation_baseline_margin_m"
+            ],
+            sport_id="tennis",
+            session_mode="singles_match",
+            coordinate_system_id=TENNIS_PROFILE.coordinate_system_id,
+        )
+
+        snapshot = tracker.update(
+            1,
+            [{
+                "court_xy": [4.0, 24.77],
+                "image_xy": [50.0, 105.0],
+                "confidence": 0.9,
+            }],
+            source_time_sec=0.1,
+        )
+
+        self.assertEqual(len(snapshot["tracks"]), 1)
+
     def test_training_tracker_locks_one_person_and_checkpoint_rejects_other_mode(self):
         resolved = self.tennis_modes.synchronize(
             self.configuration(session_mode="single_player_training")
@@ -185,8 +220,46 @@ class GpuSportProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "vision profile does not match"):
             incompatible.restore_state(state)
 
+    def test_tennis_v2_checkpoint_restores_with_its_legacy_uniform_margin(self):
+        resolved = self.tennis_modes.synchronize(
+            self.configuration(session_mode="singles_match")
+        )
+        settings = {
+            "fps": 10,
+            "court_dimensions_m": resolved["court_dimensions_m"],
+            "calibration_world_points_m": resolved["calibration_world_points_m"],
+            "athlete_observation_region": resolved["athlete_observation_region"],
+            "athlete_observation_margin_m": resolved["athlete_observation_margin_m"],
+            "athlete_observation_lateral_margin_m": resolved[
+                "athlete_observation_lateral_margin_m"
+            ],
+            "athlete_observation_baseline_margin_m": resolved[
+                "athlete_observation_baseline_margin_m"
+            ],
+            "sport_id": "tennis",
+            "session_mode": "singles_match",
+            "coordinate_system_id": TENNIS_PROFILE.coordinate_system_id,
+        }
+        source = PersonOnlyTracker(
+            [(0, 0), (100, 0), (100, 100), (0, 100)], **settings
+        )
+        state = source.snapshot_state()
+        state["state_version"] = "person-only.v2"
+        state.pop("athlete_observation_lateral_margin_m")
+        state.pop("athlete_observation_baseline_margin_m")
+
+        restored = PersonOnlyTracker(
+            [(0, 0), (100, 0), (100, 100), (0, 100)], **settings
+        )
+        restored.restore_state(state)
+
+        self.assertEqual(restored.athlete_observation_lateral_margin_m, 0.35)
+        self.assertEqual(restored.athlete_observation_baseline_margin_m, 0.35)
+
     def test_tennis_app_health_and_runtime_are_profile_fixed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"GOOD_GPU_BUILD_SHA": "test-build"}, clear=False
+        ):
             app = create_app(
                 data_dir=Path(directory),
                 start_worker=False,
@@ -199,6 +272,8 @@ class GpuSportProfileTests(unittest.TestCase):
                 response.json()["supported_session_modes"],
                 ["singles_match", "single_player_training"],
             )
+            self.assertEqual(response.json()["build_sha"], "test-build")
+            self.assertEqual(response.json()["model_manifest"]["status"], "missing")
 
             request = create_request()
             request["configuration"].update(
@@ -208,6 +283,54 @@ class GpuSportProfileTests(unittest.TestCase):
             factory.validate_session_request(request)
             self.assertEqual(request["configuration"]["expected_player_count"], 1)
             self.assertEqual(request["configuration"]["shuttle_detector"], "none")
+
+    def test_fixed_tennis_app_accepts_a_tennis_full_video_job(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"GOOD_BADMINTON_API_KEY": "test-key"}, clear=False
+        ):
+            app = create_app(
+                data_dir=Path(directory),
+                start_worker=False,
+                vision_profile=TENNIS_PROFILE,
+            )
+            response = TestClient(app).post(
+                "/api/v1/jobs",
+                headers={
+                    "X-API-Key": "test-key",
+                    "X-Idempotency-Key": "tennis-full-video-0001",
+                },
+                files={
+                    "video": ("match.mp4", b"video", "video/mp4"),
+                    "template": ("court.png", b"image", "image/png"),
+                },
+                data={
+                    "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                    "options_json": '{"sport_id":"tennis","session_mode":"single_player_training","calibration_scope":"near_half_court","shuttle_detector":"none"}',
+                },
+            )
+
+            self.assertEqual(response.status_code, 202)
+            stored = app.state.job_manager.get_job(response.json()["job_id"])
+            self.assertEqual(stored["options"]["sport_id"], "tennis")
+            self.assertEqual(stored["options"]["session_mode"], "single_player_training")
+            self.assertEqual(stored["options"]["calibration_scope"], "near_half_court")
+
+            wrong_sport = TestClient(app).post(
+                "/api/v1/jobs",
+                headers={
+                    "X-API-Key": "test-key",
+                    "X-Idempotency-Key": "tennis-full-video-0002",
+                },
+                files={
+                    "video": ("match.mp4", b"video", "video/mp4"),
+                    "template": ("court.png", b"image", "image/png"),
+                },
+                data={
+                    "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                    "options_json": '{"sport_id":"badminton","shuttle_detector":"none"}',
+                },
+            )
+            self.assertEqual(wrong_sport.status_code, 422)
 
     def test_pure_gpu_app_exposes_stream_contract_without_job_or_business_state(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(

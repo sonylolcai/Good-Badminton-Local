@@ -128,6 +128,9 @@ class PlayerTrackingEvidenceTests(unittest.TestCase):
                 "gap_frames": 1,
                 "source": "constant_velocity",
                 "accepted": False,
+                "ball_kind": "experimental_badminton_ball_candidate",
+                "detector_mode": "experimental_badminton_yolo",
+                "experimental": True,
             },
         )
 
@@ -136,6 +139,9 @@ class PlayerTrackingEvidenceTests(unittest.TestCase):
         self.assertEqual(shuttle["status"], "predicted")
         self.assertAlmostEqual(shuttle["confidence"], 0.48)
         self.assertEqual(shuttle["gap_frames"], 1)
+        self.assertEqual(shuttle["ball_kind"], "experimental_badminton_ball_candidate")
+        self.assertEqual(shuttle["detector_mode"], "experimental_badminton_yolo")
+        self.assertTrue(shuttle["experimental"])
 
     def test_writes_spatial_contract_alongside_legacy_slots(self):
         writer = _Writer()

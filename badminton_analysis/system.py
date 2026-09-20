@@ -88,12 +88,31 @@ class BadmintonAnalysisSystem:
                  movement_rally_settle_seconds=0.7, generate_annotated_video=False,
                  browser_video_reencode=False, sport_id='badminton',
                  court_dimensions=(6.1, 13.4), calibration_world_points_m=None,
-                 coordinate_system_id='standard_badminton_court_m'):
+                 coordinate_system_id='standard_badminton_court_m',
+                 session_mode='match', expected_player_count=None,
+                 calibration_scope='full_court', athlete_observation_region='full_court_athletes',
+                 ball_tracker_class=None, ball_observation_identity=None,
+                 athlete_observation_margin_m=0.35,
+                 athlete_observation_lateral_margin_m=None,
+                 athlete_observation_baseline_margin_m=None):
         self.video_path = video_path
         self.sport_id = str(sport_id)
         self.court_dimensions = tuple(float(value) for value in court_dimensions)
         self.calibration_world_points_m = calibration_world_points_m
         self.coordinate_system_id = str(coordinate_system_id)
+        self.session_mode = str(session_mode)
+        self.expected_player_count = (
+            int(expected_player_count)
+            if expected_player_count is not None
+            else (2 if match_mode == 'singles' else 4)
+        )
+        self.calibration_scope = str(calibration_scope)
+        self.athlete_observation_region = str(athlete_observation_region)
+        self.ball_tracker_class = ball_tracker_class
+        self.ball_observation_identity = dict(ball_observation_identity or {})
+        self.athlete_observation_margin_m = float(athlete_observation_margin_m)
+        self.athlete_observation_lateral_margin_m = athlete_observation_lateral_margin_m
+        self.athlete_observation_baseline_margin_m = athlete_observation_baseline_margin_m
         self.show_display = show_display
         self.language = language
         self.template_path = template_path
@@ -232,11 +251,18 @@ class BadmintonAnalysisSystem:
         self.end_time = None
         
 
-        self.shuttlecock_tracker = ShuttlecockTracker(
+        tracker_class = self.ball_tracker_class or ShuttlecockTracker
+        tracker_options = {
+            "show_trajectory": self.show_shuttlecock_trajectory,
+            "show_performance_stats": False,
+        }
+        if tracker_class is ShuttlecockTracker:
+            tracker_options["trajectory_length"] = 30
+            if self.shuttle_detector == 'yolo':
+                tracker_options["required_class_names"] = ("badminton",)
+        self.shuttlecock_tracker = tracker_class(
             yolo_ball_model=self.yolo_ball_model,
-            trajectory_length=30,
-            show_trajectory=self.show_shuttlecock_trajectory,
-            show_performance_stats=False
+            **tracker_options,
         )
         
         self.player_pose_visualizer = PlayerPoseVisualizer(
@@ -414,6 +440,13 @@ class BadmintonAnalysisSystem:
             court_dimensions=self.court_dimensions,
             world_points_m=self.calibration_world_points_m,
             coordinate_system_id=self.coordinate_system_id,
+            session_mode=self.session_mode,
+            expected_player_count=self.expected_player_count,
+            calibration_scope=self.calibration_scope,
+            athlete_observation_region=self.athlete_observation_region,
+            athlete_observation_margin_m=self.athlete_observation_margin_m,
+            athlete_observation_lateral_margin_m=self.athlete_observation_lateral_margin_m,
+            athlete_observation_baseline_margin_m=self.athlete_observation_baseline_margin_m,
         )
         self._write_metadata(fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height)
         
@@ -468,6 +501,7 @@ class BadmintonAnalysisSystem:
     def _write_metadata(self, fps, total_frames, video_duration, template_path, corners, roi_corners, mid_height):
         metadata = {
             "schema_version": SCHEMA_VERSION,
+            "sport_id": self.sport_id,
             "video": {
                 "path": self.video_path,
                 "name": self.video_name,
@@ -494,6 +528,7 @@ class BadmintonAnalysisSystem:
                         if self.shuttle_detector == 'tracknet_v3'
                         else "yolo_model_confidence"
                     ),
+                    **self.ball_observation_identity,
                 },
                 "play_state": {
                     "requested": self.enable_huji_play_state and self.shuttle_detector != 'none',
@@ -592,7 +627,7 @@ class BadmintonAnalysisSystem:
                         else {
                             "enabled": self.lock_match_roster,
                             "status": "not_initialized",
-                            "expected_player_count": 2 if self.match_mode == "singles" else 4,
+                            "expected_player_count": self.expected_player_count,
                         }
                     ),
                     "state_policy": "detected is a measurement; predicted/missing are explicit temporal states and not detector facts",
@@ -690,10 +725,15 @@ class BadmintonAnalysisSystem:
             self._record_execution_metric("shuttle_trajectory", time.perf_counter() - ball_t0)
         elif self.shuttle_detector == 'yolo':
             ball_t0 = time.perf_counter()
-            detected_ball_position = self.shuttlecock_tracker.detect_ball(frame, roi_corners=roi_corners)
+            ball_roi_corners = None if self.sport_id == 'tennis' else roi_corners
+            detected_ball_position = self.shuttlecock_tracker.detect_ball(
+                frame, roi_corners=ball_roi_corners
+            )
             self._record_execution_metric("shuttle_inference", time.perf_counter() - ball_t0)
             trajectory_t0 = time.perf_counter()
-            ball_position = self.shuttlecock_tracker.update_trajectory(detected_ball_position, roi_corners)
+            ball_position = self.shuttlecock_tracker.update_trajectory(
+                detected_ball_position, ball_roi_corners
+            )
             self._record_execution_metric("shuttle_trajectory", time.perf_counter() - trajectory_t0)
         else:
             # An operator opt-out is not a missing/predicted ball track.
@@ -706,11 +746,15 @@ class BadmintonAnalysisSystem:
 
         pose_data = self.player_pose_visualizer.get_current_pose_data() or {}
         spatial_t0 = time.perf_counter()
+        ball_detection_state = {
+            **self.shuttlecock_tracker.get_last_detection(),
+            **self.ball_observation_identity,
+        }
         spatial_state = self.fixed_camera_match.update(
             frame_index=frame_count,
             observations=self._spatial_observations(pose_data.get("detections", [])),
             shuttlecock=self._spatial_shuttle_input(
-                ball_position, self.shuttlecock_tracker.get_last_detection()
+                ball_position, ball_detection_state
             ),
             has_fresh_observations=True,
         )
@@ -726,7 +770,7 @@ class BadmintonAnalysisSystem:
             point_right_hands,
             detect_frame_count,
             pose_detections=pose_data.get("detections"),
-            ball_detection=self.shuttlecock_tracker.get_last_detection(),
+            ball_detection=ball_detection_state,
             spatial_state=spatial_state,
         )
         player_elapsed = time.perf_counter() - player_t0

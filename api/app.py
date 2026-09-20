@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.responses import FileResponse
 
 from .jobs import AnalysisJobManager
+from .release_identity import release_identity
 from .stream_runtime import StreamProcessorFactory
 from .stream_routes import register_stream_routes
 from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile, get_vision_profile
@@ -66,6 +67,7 @@ def create_app(
             "worker_running": manager.worker_running,
             "stream_worker_running": stream_manager.worker_running,
             "api_auth_configured": bool(os.environ.get("GOOD_BADMINTON_API_KEY")),
+            **release_identity(),
         }
 
     register_stream_routes(
@@ -84,7 +86,32 @@ def create_app(
         x_idempotency_key: Optional[str] = Header(default=None),
     ):
         corners = _parse_corners(court_corners)
-        options = _parse_options(options_json)
+        options = _parse_options(options_json, sport_id=vision_profile.sport_id)
+        if options["sport_id"] != vision_profile.sport_id:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"sport_id={options['sport_id']} does not match fixed "
+                    f"GPU sport_id={vision_profile.sport_id}"
+                ),
+            )
+        if options["shuttle_detector"] not in vision_profile.allowed_ball_detectors:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"shuttle_detector={options['shuttle_detector']} is not allowed for "
+                    f"sport_id={vision_profile.sport_id}"
+                ),
+            )
+        try:
+            mode = vision_profile.mode(options["session_mode"])
+            scope = mode.calibration_scope(
+                options["calibration_scope"] or mode.default_calibration_scope
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        options["session_mode"] = mode.session_mode
+        options["calibration_scope"] = scope.scope_id
         if x_idempotency_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", x_idempotency_key):
             raise HTTPException(status_code=422, detail="X-Idempotency-Key must be 16-128 safe characters")
         existing = manager.get_by_idempotency_key(x_idempotency_key)
@@ -237,7 +264,7 @@ def _parse_corners(value):
     return normalized
 
 
-def _parse_options(value):
+def _parse_options(value, *, sport_id="badminton"):
     try:
         received = json.loads(value)
     except json.JSONDecodeError as exc:
@@ -294,6 +321,9 @@ def _parse_options(value):
         # Opaque business-session reference only. Participant check IDs remain
         # on the business service and never become visual identity evidence.
         "match_session_ref": None,
+        "sport_id": str(sport_id),
+        "session_mode": None,
+        "calibration_scope": None,
     }
     unsupported = set(received).difference(defaults)
     if unsupported:

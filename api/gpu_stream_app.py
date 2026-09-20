@@ -19,6 +19,7 @@ from .stream_routes import register_stream_routes
 from .stream_runtime import StreamProcessorFactory
 from .stream_sessions import StreamSessionManager
 from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile
+from .release_identity import release_identity
 
 
 def create_gpu_stream_app(
@@ -64,6 +65,7 @@ def create_gpu_stream_app(
             "contract_versions": ["stream-session.v1"],
             "stream_worker_running": stream_manager.worker_running,
             "api_auth_configured": bool(os.environ.get("GOOD_BADMINTON_API_KEY")),
+            **release_identity(),
         }
 
     register_stream_routes(

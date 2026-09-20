@@ -243,6 +243,32 @@ class PersonOnlyTrackingTests(unittest.TestCase):
         self.assertEqual(continued["tracks"][0]["track_id"], initial["tracks"][0]["track_id"])
         self.assertEqual(continued["tracks"][0]["lifecycle_state"], "active")
 
+    def test_legacy_v1_badminton_checkpoint_restores_open_track_continuity(self):
+        tracker = self.tracker()
+        initial = tracker.update(1, [self.observation((1.0, 1.0), "a")])
+        tracker.update(2, [self.observation((1.1, 1.0), "a")])
+        state = tracker.snapshot_state()
+        state["state_version"] = "person-only.v1"
+        for field in (
+            "sport_id",
+            "session_mode",
+            "calibration_scope",
+            "coordinate_system_id",
+            "court_dimensions_m",
+            "calibration_world_points_m",
+            "athlete_observation_region",
+            "athlete_observation_margin_m",
+            "athlete_observation_lateral_margin_m",
+            "athlete_observation_baseline_margin_m",
+        ):
+            state.pop(field, None)
+
+        restored = self.tracker()
+        restored.restore_state(state)
+        continued = restored.update(3, [self.observation((1.2, 1.0), "a")])
+
+        self.assertEqual(continued["tracks"][0]["track_id"], initial["tracks"][0]["track_id"])
+
     def test_bytetrack_key_can_recover_without_court_only_uncertainty(self):
         tracker = self.tracker(
             tracker_backend="bytetrack",

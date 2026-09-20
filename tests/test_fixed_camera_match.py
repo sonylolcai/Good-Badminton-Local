@@ -8,6 +8,24 @@ from badminton_analysis.analysis.fixed_camera_match import (
 
 
 class FixedCameraMatchTests(unittest.TestCase):
+    def test_pipeline_keeps_tennis_player_behind_baseline_with_configured_margin(self):
+        pipeline = FixedCameraMatchPipeline(
+            [(0, 0), (100, 0), (100, 100), (0, 100)],
+            fps=10,
+            court_dimensions=(8.23, 23.77),
+            world_points_m=[[0, 0], [8.23, 0], [8.23, 23.77], [0, 23.77]],
+            athlete_observation_lateral_margin_m=0.75,
+            athlete_observation_baseline_margin_m=3.0,
+        )
+
+        snapshot = pipeline.update(
+            1,
+            [{"court_xy": [4.0, 24.77], "image_xy": [50.0, 105.0], "confidence": 0.9}],
+            None,
+        )
+
+        self.assertEqual(len(snapshot["tracks"]), 1)
+
     def test_zone_is_defined_in_court_coordinates_for_two_camera_views(self):
         rear = CourtSpace([(100, 80), (540, 80), (620, 620), (20, 620)])
         oblique = CourtSpace([(280, 45), (660, 160), (530, 640), (80, 470)])

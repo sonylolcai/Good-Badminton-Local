@@ -157,6 +157,9 @@ class PersonOnlyTracker:
             max_roster_count=self.max_roster_count,
             roster_discovery_seconds=self.roster_discovery_seconds,
             roster_reacquire_seconds=self.roster_reacquire_seconds,
+            athlete_observation_margin_m=self.athlete_observation_margin_m,
+            athlete_observation_lateral_margin_m=self.athlete_observation_lateral_margin_m,
+            athlete_observation_baseline_margin_m=self.athlete_observation_baseline_margin_m,
             require_association_keys=(
                 tracker_backend == "bytetrack" and self.lock_match_roster
             ),
@@ -453,7 +456,11 @@ class PersonOnlyTracker:
         }
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
-        if not isinstance(state, Mapping) or state.get("state_version") != PERSON_ONLY_SCHEMA_VERSION:
+        if not isinstance(state, Mapping) or state.get("state_version") not in {
+            "person-only.v1",
+            "person-only.v2",
+            PERSON_ONLY_SCHEMA_VERSION,
+        }:
             raise ValueError("unsupported person_only checkpoint")
         if state.get("tracker_backend") != self.tracker_backend:
             raise ValueError("person_only checkpoint tracker backend does not match")
@@ -469,10 +476,42 @@ class PersonOnlyTracker:
             "athlete_observation_lateral_margin_m": self.athlete_observation_lateral_margin_m,
             "athlete_observation_baseline_margin_m": self.athlete_observation_baseline_margin_m,
         }
-        restored_geometry = {
-            key: state.get(key)
-            for key in expected_geometry
-        }
+        if state.get("state_version") == "person-only.v1":
+            legacy_geometry = {
+                "sport_id": "badminton",
+                "session_mode": "match",
+                "calibration_scope": "full_court",
+                "coordinate_system_id": "standard_badminton_court_m",
+                "court_dimensions_m": [6.1, 13.4],
+                "calibration_world_points_m": None,
+                "athlete_observation_region": "full_court_athletes",
+                "athlete_observation_margin_m": 0.35,
+                "athlete_observation_lateral_margin_m": 0.35,
+                "athlete_observation_baseline_margin_m": 0.35,
+            }
+            restored_geometry = legacy_geometry
+        elif state.get("state_version") == "person-only.v2":
+            common_fields = tuple(
+                key for key in expected_geometry
+                if key not in {
+                    "athlete_observation_lateral_margin_m",
+                    "athlete_observation_baseline_margin_m",
+                }
+            )
+            if ({key: state.get(key) for key in common_fields}
+                    != {key: expected_geometry[key] for key in common_fields}):
+                raise ValueError("person_only checkpoint vision profile does not match")
+            legacy_margin = max(0.0, float(state["athlete_observation_margin_m"]))
+            self.athlete_observation_lateral_margin_m = legacy_margin
+            self.athlete_observation_baseline_margin_m = legacy_margin
+            self._tracker.athlete_observation_lateral_margin_m = legacy_margin
+            self._tracker.athlete_observation_baseline_margin_m = legacy_margin
+            restored_geometry = expected_geometry
+        else:
+            restored_geometry = {
+                key: state.get(key)
+                for key in expected_geometry
+            }
         if restored_geometry != expected_geometry:
             raise ValueError("person_only checkpoint vision profile does not match")
         if bool(state.get("lock_match_roster", False)) != self.lock_match_roster:

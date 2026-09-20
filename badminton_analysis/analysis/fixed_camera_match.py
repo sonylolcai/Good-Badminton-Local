@@ -186,6 +186,9 @@ class CourtMultiObjectTracker:
         roster_discovery_seconds=8.0,
         roster_reacquire_seconds=1.0,
         require_association_keys=False,
+        athlete_observation_margin_m=0.35,
+        athlete_observation_lateral_margin_m=None,
+        athlete_observation_baseline_margin_m=None,
     ):
         if match_mode not in {"singles", "doubles", "person_only"}:
             raise ValueError("match_mode must be 'singles', 'doubles', or 'person_only'")
@@ -232,6 +235,17 @@ class CourtMultiObjectTracker:
         # preserve.  The court-only fallback intentionally remains usable for
         # deterministic tests and backwards-compatible callers.
         self.require_association_keys = bool(require_association_keys)
+        self.athlete_observation_margin_m = max(0.0, float(athlete_observation_margin_m))
+        self.athlete_observation_lateral_margin_m = (
+            self.athlete_observation_margin_m
+            if athlete_observation_lateral_margin_m is None
+            else max(0.0, float(athlete_observation_lateral_margin_m))
+        )
+        self.athlete_observation_baseline_margin_m = (
+            self.athlete_observation_margin_m
+            if athlete_observation_baseline_margin_m is None
+            else max(0.0, float(athlete_observation_baseline_margin_m))
+        )
         # Keep the normal short prediction window unchanged, then allow one
         # additional bounded window for a real detection to reclaim a locked
         # roster ID. Beyond this, a location-only guess is not trustworthy.
@@ -272,7 +286,12 @@ class CourtMultiObjectTracker:
         observations = [
             item for item in observations
             if item.get("court_xy") is not None
-            and self.court_space.contains(item["court_xy"], margin_m=0.35)
+            and self.court_space.contains_athlete(
+                item["court_xy"],
+                margin_m=self.athlete_observation_margin_m,
+                lateral_margin_m=self.athlete_observation_lateral_margin_m,
+                baseline_margin_m=self.athlete_observation_baseline_margin_m,
+            )
         ]
         if self.lock_match_roster and self.roster_status != "locked":
             if not has_fresh_observations:
@@ -1571,6 +1590,13 @@ class FixedCameraMatchPipeline:
         court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH),
         world_points_m=None,
         coordinate_system_id="standard_badminton_court_m",
+        session_mode="match",
+        expected_player_count=None,
+        calibration_scope="full_court",
+        athlete_observation_region="full_court_athletes",
+        athlete_observation_margin_m=0.35,
+        athlete_observation_lateral_margin_m=None,
+        athlete_observation_baseline_margin_m=None,
     ):
         if match_mode not in {"singles", "doubles"}:
             raise ValueError(
@@ -1587,8 +1613,16 @@ class FixedCameraMatchPipeline:
             image_corners,
             court_dimensions=tuple(float(value) for value in court_dimensions),
             world_points_m=world_points_m,
+            athlete_observation_region=athlete_observation_region,
         )
         self.coordinate_system_id = str(coordinate_system_id)
+        self.session_mode = str(session_mode)
+        self.calibration_scope = str(calibration_scope)
+        self.expected_player_count = (
+            int(expected_player_count)
+            if expected_player_count is not None
+            else (2 if match_mode == "singles" else 4)
+        )
         self.net_image_line = net_image_line or [
             self.court_space.court_to_image((0.0, self.court_space.net_y_m)),
             self.court_space.court_to_image((self.court_space.width_m, self.court_space.net_y_m)),
@@ -1605,15 +1639,18 @@ class FixedCameraMatchPipeline:
             fps=fps,
             match_mode=match_mode,
             lock_match_roster=lock_match_roster,
-            expected_roster_count=2 if match_mode == "singles" else 4,
+            expected_roster_count=self.expected_player_count,
             roster_stable_frames=roster_stable_frames,
             require_association_keys=tracker_backend == "bytetrack",
+            athlete_observation_margin_m=athlete_observation_margin_m,
+            athlete_observation_lateral_margin_m=athlete_observation_lateral_margin_m,
+            athlete_observation_baseline_margin_m=athlete_observation_baseline_margin_m,
         )
         self.shuttle = MonocularShuttleReconstructor()
         self.rallies = RallyStateMachine(
             fps=fps,
             shuttle_enabled=shuttle_enabled,
-            expected_player_count=2 if match_mode == "singles" else 4,
+            expected_player_count=self.expected_player_count,
             settle_window_seconds=movement_rally_settle_seconds,
         )
         self._last_frame = 0

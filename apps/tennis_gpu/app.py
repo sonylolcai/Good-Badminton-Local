@@ -1,9 +1,9 @@
-"""Fixed tennis entry point for the pure GPU visual-observation process."""
+"""Fixed tennis entry point for full-video and streaming GPU analysis."""
 
-from api.gpu_stream_app import create_gpu_stream_app
+from api.app import create_app
 from api.vision_profiles import TENNIS_PROFILE
 
 
-app = create_gpu_stream_app(vision_profile=TENNIS_PROFILE)
+app = create_app(vision_profile=TENNIS_PROFILE)
 
 __all__ = ["app"]

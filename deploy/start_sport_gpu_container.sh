@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Shared container launcher for the two fixed-sport pure GPU services.  The
-# wrapper scripts below pass a literal, allow-listed entry point; this script
-# never accepts api.app or an arbitrary Python module as a production target.
+# Shared container launcher for the two fixed-sport GPU services. The wrapper
+# scripts pass a literal, allow-listed entry point; this script never accepts
+# an arbitrary Python module as a production target.
 APP_DIR="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ENTRYPOINT="${2:?missing fixed GPU entry point}"
 SPORT_ID="${3:?missing sport identity}"
@@ -21,8 +21,8 @@ case "${SPORT_ID}:${ENTRYPOINT}" in
 esac
 
 [[ -f "$ENV_FILE" ]] || { echo "Missing API environment file: $ENV_FILE" >&2; exit 1; }
-[[ -f "$APP_DIR/api/gpu_stream_app.py" ]] || {
-  echo "Not a pure GPU stream package: $APP_DIR" >&2
+[[ -f "$APP_DIR/api/app.py" ]] || {
+  echo "Not a full GPU analysis package: $APP_DIR" >&2
   exit 1
 }
 set -a

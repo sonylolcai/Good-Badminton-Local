@@ -41,7 +41,7 @@ $packageRoot = Join-Path $stagingRoot $packageName
 # experiments.  We only need source code and deployment files for an upgrade.
 $requiredExtraFiles = @(
     'deploy/refresh_gpu_api_from_zip.sh',
-    # Fixed-sport pure GPU launchers must be present even when this archive is
+    # Fixed-sport GPU launchers must be present even when this archive is
     # built before the current working tree has been committed.
     'deploy/start_sport_gpu_container.sh',
     'deploy/start_badminton_gpu_container.sh',
@@ -49,12 +49,6 @@ $requiredExtraFiles = @(
     'deploy/install_lap.sh',
     'deploy/package_gpu_api.ps1',
     'deploy/run_performance_gate.sh',
-    'deploy/setup_tracknet_v3_ab.sh',
-    'deploy/run_tracknet_v3_ab.sh',
-    # TrackNet is the selectable primary shuttle source on the current branch.
-    # These adapters are application code, not external model source or weights.
-    'badminton_analysis/detection/tracknet_v3.py',
-    'badminton_analysis/analysis/huji_play_state.py',
     # The package is built from a working tree while several runtime modules
     # may be newly created before their review commit. Keep direct API imports
     # explicit so deployment never omits a required local module merely because
@@ -64,18 +58,9 @@ $requiredExtraFiles = @(
     # The asynchronous GPU job worker imports this pipeline directly. Keep it
     # explicit so a healthy API cannot be packaged without its analysis entry.
     'webui/pipeline.py',
-    'evaluation/shuttle_tracknet_ab/fast_predict_tracknet_v3.py',
-    'evaluation/shuttle_tracknet_ab/run_tracknet_v3.py',
     # The performance gate is intentionally dependency-free and is run after
     # a relevant GPU deployment against the completed job trace.
-    'evaluation/performance/__init__.py',
-    'evaluation/performance/performance_gate.py',
-    'evaluation/performance/rtx_3090_production_v1.json',
-    'evaluation/performance/README.md',
-    # Local continuity-test instructions are intentionally shipped with the
-    # source archive so the GPU and business operators use one session/order
-    # contract when validating a new deployment.
-    'docs/STREAM_CONTINUITY_TEST.md'
+    'requirements.txt'
 )
 
 $trackNetABFiles = @(
@@ -112,6 +97,22 @@ function Copy-SourceFile {
     }
 }
 
+function Test-DeployableSourcePath {
+    param([Parameter(Mandatory = $true)][string]$RelativePath)
+
+    $path = $RelativePath.Replace('\\', '/')
+    if ($path -match '^(business_gateway|operator_api|webui-next|tests|docs|evaluation|weights|api_data|outputs|videos|\.venv|venv|__pycache__)/' -or $path -match '^deploy/(venue-gateway|venue-gateway-windows|business-server)/') {
+        return $false
+    }
+    if ($path -like 'apps/*' -and -not $path.StartsWith("apps/$Sport`_gpu/", [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    if ($Sport -eq 'tennis' -and $path -match '^badminton_analysis/(detection/tracknet_v3|analysis/huji_play_state)\.py$') {
+        return $false
+    }
+    return $path -match '^(api|apps|badminton_analysis|good_badminton_contracts|webui|deploy)/' -or $path -eq 'requirements.txt'
+}
+
 try {
     New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 
@@ -121,12 +122,9 @@ try {
     }
 
     foreach ($relativePath in $trackedFiles) {
-        # Deployment never transports persisted or generated data.  The server
-        # owns these paths under /root/good-badminton-gpu-api-state instead.
-        if ($relativePath -match '^(\.venv|venv|weights|api_data|outputs|videos|__pycache__)/') {
-            continue
+        if (Test-DeployableSourcePath -RelativePath $relativePath) {
+            Copy-SourceFile -RelativePath $relativePath
         }
-        Copy-SourceFile -RelativePath $relativePath
     }
 
     foreach ($relativePath in $requiredExtraFiles) {
@@ -149,10 +147,9 @@ try {
         'api/',
         'apps/',
         'badminton_analysis/',
-        'business_gateway/',
         'good_badminton_contracts/',
         'webui/',
-        'evaluation/performance/'
+        'deploy/'
     )
     $untrackedFiles = & git -C $repoRoot ls-files --others --exclude-standard
     if ($LASTEXITCODE -ne 0) {
@@ -163,11 +160,14 @@ try {
         $isDeployable = $deployableUntrackedPrefixes | Where-Object {
             $normalizedPath.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase)
         }
-        if ($isDeployable -and $normalizedPath -match '\.(py|json|ya?ml)$') {
+        if ($isDeployable -and (Test-DeployableSourcePath -RelativePath $normalizedPath) -and $normalizedPath -match '\.(py|json|ya?ml)$') {
             Copy-SourceFile -RelativePath $normalizedPath
         }
     }
     if ($IncludeTrackNetABTools) {
+        if ($Sport -ne 'badminton') {
+            throw 'IncludeTrackNetABTools is only valid with -Sport badminton.'
+        }
         foreach ($relativePath in $trackNetABFiles) {
             Copy-SourceFile -RelativePath $relativePath
         }
@@ -179,7 +179,7 @@ try {
     $sportLauncher = Join-Path $packageRoot 'deploy/start_sport_gpu_container.sh'
     $analysisPipeline = Join-Path $packageRoot 'webui/pipeline.py'
     if (-not (Test-Path -LiteralPath $apiEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $pureStreamEntry -PathType Leaf) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or -not (Test-Path -LiteralPath $sportLauncher -PathType Leaf) -or -not (Test-Path -LiteralPath $analysisPipeline -PathType Leaf)) {
-        throw 'Package validation failed: legacy API, pure stream API, launchers, or legacy pipeline is missing.'
+        throw 'Package validation failed: analysis API, stream API, launchers, or analysis pipeline is missing.'
     }
 
     $absoluteOutputPath = [System.IO.Path]::GetFullPath($OutputPath)

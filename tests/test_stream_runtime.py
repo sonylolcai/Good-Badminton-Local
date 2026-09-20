@@ -219,6 +219,16 @@ class StreamRuntimeTests(unittest.TestCase):
         restored, _ = self.factory()(session)
         restored.restore_state(state)
 
+    def test_badminton_yolo_rejects_tennis_ball_checkpoint_labels(self):
+        session = create_request()
+        session["configuration"]["shuttle_detector"] = "yolo"
+        factory = self.factory(
+            ball_model_factory=lambda _path: _BallModel(names={0: "tennis_ball"})
+        )
+
+        with self.assertRaisesRegex(ValueError, r"missing required class \[badminton\]"):
+            factory(session)
+
     def test_tracknet_mode_requires_and_uses_explicit_temporal_adapter(self):
         session = create_request()
         session["configuration"]["shuttle_detector"] = "tracknet_v3"
@@ -273,6 +283,39 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual(ball.data["model_identity"]["model_kind"], "ball")
         self.assertEqual(len(ball.data["model_identity"]["model_sha256"]), 64)
         self.assertNotIn("shuttle_observation", [event.event_type for event in events])
+
+    def test_tennis_ball_detection_is_not_cropped_to_player_calibration_corners(self):
+        checkpoint = self.root / "tennis-ball-yolo.pt"
+        checkpoint.write_bytes(b"test checkpoint")
+        session = create_request()
+        session["court_corners"] = [[10, 40], [54, 40], [54, 63], [10, 63]]
+        session["configuration"].update(
+            {
+                "sport_id": "tennis",
+                "session_mode": "single_player_training",
+                "shuttle_detector": "yolo",
+                "expected_player_count": 1,
+                "max_roster_count": 1,
+            }
+        )
+        factory = self.factory(
+            vision_profile=TENNIS_PROFILE,
+            ball_model_factory=lambda _path: _BallModel(names={0: "tennis_ball"}),
+        )
+
+        with patch.dict(
+            "os.environ", {"GOOD_TENNIS_STREAM_BALL_MODEL": str(checkpoint)}, clear=False
+        ):
+            measurement, _ = factory(session)
+            events = list(
+                measurement.process_frame(
+                    np.zeros((64, 64, 3), dtype=np.uint8), self.context()
+                )
+            )
+
+        ball = next(event for event in events if event.event_type == "ball_observation")
+        self.assertEqual(ball.evidence_state, "detected")
+        self.assertEqual(ball.data["measurement"]["image"], [32.0, 30.0])
 
     def test_tennis_yolo_uses_badminton_label_only_as_explicit_experiment(self):
         checkpoint = self.root / "tennis-ball-yolo.pt"

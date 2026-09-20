@@ -42,6 +42,40 @@ _MODEL_CACHE: dict[tuple[str, str], Any] = {}
 _MODEL_CACHE_LOCK = threading.RLock()
 
 
+def resolve_tennis_ball_model_spec() -> dict[str, object]:
+    """Resolve the dedicated tennis checkpoint or the labelled trial model."""
+    configured = str(os.environ.get("GOOD_TENNIS_STREAM_BALL_MODEL") or "").strip()
+    if configured:
+        if not Path(configured).is_file():
+            raise ValueError(f"tennis YOLO ball checkpoint not found: {configured}")
+        return {
+            "path": configured,
+            "tracker_class": TennisBallTracker,
+            "ball_kind": "tennis_ball",
+            "detector_mode": "dedicated_tennis_yolo",
+            "experimental": False,
+        }
+
+    project_root = Path(__file__).resolve().parents[1]
+    experimental = str(
+        os.environ.get("GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL")
+        or project_root / "weights" / "yolo11s-ball.pt"
+    ).strip()
+    if not Path(experimental).is_file():
+        raise ValueError(
+            "tennis experimental YOLO ball detection requires "
+            "GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL or weights/yolo11s-ball.pt; "
+            "choose shuttle_detector=none for pose-only analysis"
+        )
+    return {
+        "path": experimental,
+        "tracker_class": ExperimentalBadmintonBallTracker,
+        "ball_kind": "experimental_badminton_ball_candidate",
+        "detector_mode": "experimental_badminton_yolo",
+        "experimental": True,
+    }
+
+
 @lru_cache(maxsize=32)
 def _checkpoint_sha256(model_path: str) -> str | None:
     path = Path(model_path).expanduser().resolve()
@@ -323,9 +357,11 @@ class YoloTennisBallFrameProcessor(YoloShuttleFrameProcessor):
         detected = self.tracker.detect_ball(
             frame,
             conf=float(os.environ.get("GOOD_TENNIS_STREAM_BALL_CONF", "0.15")),
-            roi_corners=self.court_corners,
+            # Tennis-ball evidence uses the full source frame.  The calibrated
+            # court is a player/world-coordinate boundary, not a ball crop.
+            roi_corners=None,
         )
-        self.tracker.update_trajectory(detected, roi_corners=self.court_corners)
+        self.tracker.update_trajectory(detected, roi_corners=None)
         state = self.tracker.get_last_detection()
         status = str(state.get("status") or "missing")
         evidence = "detected" if status == "detected" else "missing"
@@ -495,36 +531,7 @@ class StreamProcessorFactory:
         checkpoint solely for an evidence-labelled trial.  The two outputs are
         intentionally not interchangeable in the event stream.
         """
-        configured = str(os.environ.get("GOOD_TENNIS_STREAM_BALL_MODEL") or "").strip()
-        if configured:
-            if not Path(configured).is_file():
-                raise ValueError(f"tennis YOLO ball checkpoint not found: {configured}")
-            return {
-                "path": configured,
-                "tracker_class": TennisBallTracker,
-                "ball_kind": "tennis_ball",
-                "detector_mode": "dedicated_tennis_yolo",
-                "experimental": False,
-            }
-
-        project_root = Path(__file__).resolve().parents[1]
-        experimental = str(
-            os.environ.get("GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL")
-            or project_root / "weights" / "yolo11s-ball.pt"
-        ).strip()
-        if not Path(experimental).is_file():
-            raise ValueError(
-                "tennis experimental YOLO ball detection requires "
-                "GOOD_TENNIS_EXPERIMENTAL_BALL_MODEL or weights/yolo11s-ball.pt; "
-                "choose shuttle_detector=none for pose-only analysis"
-            )
-        return {
-            "path": experimental,
-            "tracker_class": ExperimentalBadmintonBallTracker,
-            "ball_kind": "experimental_badminton_ball_candidate",
-            "detector_mode": "experimental_badminton_yolo",
-            "experimental": True,
-        }
+        return resolve_tennis_ball_model_spec()
 
     def __call__(self, session):
         self.validate_session_request(session)
@@ -683,7 +690,11 @@ class StreamProcessorFactory:
                 )
             )
             shuttle = YoloShuttleFrameProcessor(
-                ShuttlecockTracker(ball_model, show_trajectory=False),
+                ShuttlecockTracker(
+                    ball_model,
+                    show_trajectory=False,
+                    required_class_names=("badminton",),
+                ),
                 calibration["image_corners"],
                 model_identity=_model_identity(
                     ball_path,

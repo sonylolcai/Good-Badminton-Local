@@ -125,6 +125,9 @@ class PlayerTracker:
                     "raw_candidate_count": int(ball_detection.get("raw_candidate_count", 0)),
                     "filtered_rejections": dict(ball_detection.get("filtered_rejections", {})),
                     "rejection_reason": ball_detection.get("rejection_reason"),
+                    "ball_kind": ball_detection.get("ball_kind"),
+                    "detector_mode": ball_detection.get("detector_mode"),
+                    "experimental": bool(ball_detection.get("experimental", False)),
                 }
             )
 

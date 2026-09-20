@@ -155,9 +155,13 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
                         business_task_id=None, cancel_cb=None, gpu_base_url=None):
     """Submit, wait for, and retrieve one remote job into *output_dir*."""
     raise_if_cancelled(cancel_cb)
-    config = remote_gpu_config(gpu_base_url)
+    sport_id = _normalize_sport_id(options.get("sport_id"))
+    config = remote_gpu_config(gpu_base_url, sport_id=sport_id)
     if not config["api_key"]:
-        raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured in the WebUI process")
+        raise RemoteAnalysisError(
+            f"GOOD_{sport_id.upper()}_GPU_API_KEY is not configured in the WebUI process"
+        )
+    verify_remote_gpu_sport(sport_id, gpu_base_url)
 
     options = _remote_options(options)
     job = _submit_multipart(
@@ -617,7 +621,7 @@ def _remote_options(options):
     return {
         key: value
         for key, value in options.items()
-        if key not in {"yolo_pose_model", "ball_model"}
+        if key not in {"yolo_pose_model", "ball_model", "generate_promotion_video"}
     }
 
 
