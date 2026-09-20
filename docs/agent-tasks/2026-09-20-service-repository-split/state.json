@@ -1,0 +1,52 @@
+{
+  "schema_version": "long-task.v1",
+  "task_id": "2026-09-20-service-repository-split",
+  "status": "implementing",
+  "repositories": [
+    {
+      "path": "S:\\Code Base\\MiniProgram\\bdTeach\\Good-Badminton",
+      "baseline_commit": "932a0d2a54d4bc8e5a9d7341118c8d6ea8f0e854",
+      "branch": "feat/match-clip-delivery"
+    },
+    {
+      "path": "S:\\Code Base\\MiniProgram\\bdTeach\\Good-Badminton-Evaluation-Platform",
+      "baseline_commit": "1a7a235e9b8b10a37ceb9eae419d36454b3dcb9e",
+      "branch": "feat/evaluation-backend-separation"
+    }
+  ],
+  "approvals": {"plan": "user approved: 批准; revision approved: ok", "tests": "user approved: 批准测试; revision approved: 批准修订测试"},
+  "current_task": "T1",
+  "commits": [],
+  "checks": [
+    {
+      "id": "B-01",
+      "command": ".\\.venv\\Scripts\\python.exe -m unittest tests.test_gpu_code_boundary -v",
+      "result": "failed",
+      "detail": "HEAD already imports webui.player_results from badminton_analysis/pipeline.py; this is a pre-existing GPU/UI boundary failure."
+    },
+    {
+      "id": "B-02",
+      "command": "npm run check:boundaries",
+      "repository": "Good-Badminton-Evaluation-Platform",
+      "result": "passed"
+    },
+    {
+      "id": "RED-01",
+      "command": ".\\.venv\\Scripts\\python.exe -m unittest tests.test_service_repository_layout -v",
+      "result": "failed as expected",
+      "detail": "Four failures prove that the venue gateway, business API, clients, and GPU service repositories do not yet exist."
+    },
+    {
+      "id": "B-03",
+      "command": "git diff --check -- docs/agent-tasks/2026-09-20-service-repository-split tests/test_service_repository_layout.py",
+      "result": "passed"
+    },
+    {
+      "id": "RED-02",
+      "command": ".\\.venv\\Scripts\\python.exe -m unittest discover -s tests -p test_service_repository_layout.py -v",
+      "result": "failed as expected",
+      "detail": "The revised test finds the existing venue repository, while the business layout and clean GPU worktree are not ready; it proves the revised target has not yet been implemented."
+    }
+  ],
+  "updated_at": "2026-09-20T00:20:00+08:00"
+}
