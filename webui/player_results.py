@@ -204,7 +204,7 @@ def extract_full_video_candidate_photos(
                 "source_time_sec": observation["source_time_sec"],
                 "capture_quality": observation["score"],
                 "view_label": "未评估",
-                "selection_policy": "highest_detected_bbox_confidence_v1",
+                "selection_policy": "first_high_confidence_then_higher_score_v1",
             })
     finally:
         capture.release()

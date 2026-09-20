@@ -65,6 +65,27 @@ class SpatialPlayerPositionsTests(unittest.TestCase):
         self.assertEqual(evidence["tracks"]["track_002"]["excluded"]["low_location_confidence"], 1)
         self.assertEqual(evidence["tracks"]["track_003"]["excluded"]["low_identity_confidence"], 1)
 
+    def test_shuttle_only_rows_do_not_dilute_player_measurement_coverage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            detections = Path(temp_dir) / "detections.jsonl"
+            detections.write_text(
+                "\n".join([
+                    json.dumps(self._row(1, [self._track("track_001", (1.0, 1.0))])),
+                    json.dumps({
+                        "frame": 2,
+                        "sampling": {"pose_sampled": False, "shuttle_sampled": True},
+                        "shuttlecock": {"status": "detected", "accepted": True},
+                    }),
+                    "",
+                ]),
+                encoding="utf-8",
+            )
+
+            evidence = collect_track_position_evidence(detections)
+
+        self.assertEqual(evidence["source_frames"], 1)
+        self.assertEqual(evidence["tracks"]["track_001"]["track_rows"], 1)
+
     @staticmethod
     def _row(frame, tracks):
         return {"frame": frame, "spatial": {"tracks": tracks}}

@@ -696,10 +696,13 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     visualize_positions = options.get("visualize_positions", True)
     output_video_style = options.get("output_video_style", "annotated")
     pose_imgsz = int(options.get("pose_imgsz", 960))
-    # All evidence-producing components share this cadence.  The legacy pose
-    # option is retained as a fallback for saved tasks submitted before this
-    # option was introduced.
+    # Player evidence keeps one cadence. The legacy pose option remains a
+    # fallback for saved tasks submitted before this option was introduced.
     analysis_sample_hz = float(options.get("analysis_sample_hz", options.get("pose_sample_hz", 10.0)))
+    shuttle_sample_hz = options.get("shuttle_sample_hz")
+    shuttle_sample_hz = (
+        analysis_sample_hz if shuttle_sample_hz is None else float(shuttle_sample_hz)
+    )
     pose_conf = float(options.get("pose_conf", 0.15))
     far_player_enhancement = bool(options.get("far_player_enhancement", False))
     if session_profile.session_mode == "single_player_training":
@@ -756,6 +759,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         pose_imgsz=pose_imgsz,
         pose_sample_hz=analysis_sample_hz,
         analysis_sample_hz=analysis_sample_hz,
+        shuttle_sample_hz=shuttle_sample_hz,
         pose_conf=pose_conf,
         far_player_enhancement=far_player_enhancement,
         far_pose_roi=far_pose_roi,

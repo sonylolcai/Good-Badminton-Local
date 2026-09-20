@@ -81,7 +81,8 @@ class PlayerTracker:
             "lower": self._empty_player_record(),
         }
 
-    def _point_or_none(self, point, zero_is_none=False):
+    @staticmethod
+    def _point_or_none(point, zero_is_none=False):
         if point is None:
             return None
         try:
@@ -94,14 +95,10 @@ class PlayerTracker:
             return None
         return [float(x), float(y)]
 
-    def write_detection_record(self, frame_index, players_record, ball_image_position, detect_frame_count,
-                               ball_detection=None, spatial_state=None):
-        started = time.perf_counter()
-        if self.detection_writer is None:
-            return 0.0
-
+    @staticmethod
+    def build_shuttlecock_record(ball_image_position, ball_detection=None):
         shuttlecock_record = {
-            "image": self._point_or_none(ball_image_position, zero_is_none=True),
+            "image": PlayerTracker._point_or_none(ball_image_position, zero_is_none=True),
             "status": "missing",
             "confidence": None,
             "source": None,
@@ -127,6 +124,13 @@ class PlayerTracker:
                     "rejection_reason": ball_detection.get("rejection_reason"),
                 }
             )
+        return shuttlecock_record
+
+    def write_detection_record(self, frame_index, players_record, ball_image_position, detect_frame_count,
+                               ball_detection=None, spatial_state=None, shuttle_sampled=True):
+        started = time.perf_counter()
+        if self.detection_writer is None:
+            return 0.0
 
         record = {
             "schema_version": "2.0",
@@ -134,7 +138,8 @@ class PlayerTracker:
             "time_sec": round(frame_index / self.fps, 6) if self.fps else None,
             "detect_frame": int(detect_frame_count),
             "players": players_record,
-            "shuttlecock": shuttlecock_record,
+            "shuttlecock": self.build_shuttlecock_record(ball_image_position, ball_detection),
+            "sampling": {"pose_sampled": True, "shuttle_sampled": bool(shuttle_sampled)},
         }
         if spatial_state is not None:
             # The v1 upper/lower records are retained for existing consumers.
@@ -145,7 +150,8 @@ class PlayerTracker:
         return time.perf_counter() - started
 
     def update(self, frame_index, centroids, ball_image_position, left_hand_positions, right_hand_positions,
-               detect_frame_count, pose_detections=None, ball_detection=None, spatial_state=None):
+               detect_frame_count, pose_detections=None, ball_detection=None, spatial_state=None,
+               shuttle_sampled=True):
         started = time.perf_counter()
         players_record = self._initialize_player_record()
         pose_detections = pose_detections or []
@@ -196,6 +202,7 @@ class PlayerTracker:
             detect_frame_count,
             ball_detection=ball_detection,
             spatial_state=spatial_state,
+            shuttle_sampled=shuttle_sampled,
         )
         self.last_update_timing = {
             "player_tracking_seconds": max(0.0, time.perf_counter() - started - jsonl_write_seconds),

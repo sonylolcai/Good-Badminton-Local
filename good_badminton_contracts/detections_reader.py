@@ -54,7 +54,11 @@ def collect_track_position_evidence(
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            result["source_frames"] += 1
+            sampling = record.get("sampling") or {}
+            # Shuttle-only rows preserve higher-rate ball evidence. They must
+            # not dilute player-measurement coverage or movement statistics.
+            if sampling.get("pose_sampled") is not False:
+                result["source_frames"] += 1
             spatial = record.get("spatial") or {}
             tracks = spatial.get("tracks")
             if not isinstance(tracks, list):

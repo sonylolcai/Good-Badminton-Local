@@ -44,6 +44,19 @@ class PerformanceSloTests(unittest.TestCase):
         self.assertEqual(analysis_frames, [1, 3, 5, 7, 9, 11])
         self.assertEqual(health_frames, [1, 16, 31])
 
+    def test_shuttle_cadence_can_exceed_player_cadence(self):
+        system = object.__new__(BadmintonAnalysisSystem)
+        system.analysis_sample_hz = 10.0
+        system.pose_sample_hz = 10.0
+        system.shuttle_sample_hz = 30.0
+        system.fps = 30.0
+
+        player_frames = [index for index in range(1, 10) if system._should_sample_analysis(index)]
+        shuttle_frames = [index for index in range(1, 10) if system._should_sample_shuttle(index)]
+
+        self.assertEqual(player_frames, [1, 4, 7])
+        self.assertEqual(shuttle_frames, list(range(1, 10)))
+
     def test_pose_keypoints_remain_tied_to_their_measurement_frame(self):
         tracker = CourtMultiObjectTracker(CourtSpace(self.CORNERS), fps=10)
         observation = {

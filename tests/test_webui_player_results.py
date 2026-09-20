@@ -15,11 +15,15 @@ class PlayerResultDisplayTests(unittest.TestCase):
                     {"track_id": "track_low", "status": "detected", "confidence": 0.91, "association": {"identity_confidence": 0.79}, "location_evidence": {"confidence": 0.91, "bbox_xyxy": [1, 1, 90, 180]}},
                     {"track_id": "track_high", "status": "detected", "confidence": 0.91, "association": {"identity_confidence": 0.92}, "location_evidence": {"confidence": 0.89, "bbox_xyxy": [1, 1, 90, 180]}},
                 ]}}),
+                json.dumps({"frame": 2, "time_sec": 0.2, "spatial": {"tracks": [
+                    {"track_id": "track_high", "status": "detected", "confidence": 0.96, "association": {"identity_confidence": 0.95}, "location_evidence": {"confidence": 0.94, "bbox_xyxy": [1, 1, 90, 180]}},
+                ]}}),
                 "",
             ]), encoding="utf-8")
             observations = _best_detected_observations(detections)
 
         self.assertEqual(list(observations), ["track_high"])
+        self.assertEqual(observations["track_high"]["frame"], 2)
 
     def test_merges_stream_photo_status_with_real_movement_evidence(self):
         gallery, rows, detail = build_player_result_display(

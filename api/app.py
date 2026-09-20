@@ -324,11 +324,14 @@ def _parse_options(value):
         # caller can still explicitly request 0 for an offline full-frame
         # evidence run, but it is not suitable as the streaming default.
         "pose_imgsz": 960,
-        # One shared cadence for all measurement-producing components.  The
-        # legacy pose_sample_hz key remains accepted for older business
-        # clients, but is normalized to this value below.
+        # Player pose/tracking cadence. The legacy pose_sample_hz key remains
+        # accepted for older business clients and is normalized below.
         "analysis_sample_hz": 10.0,
         "pose_sample_hz": 10.0,
+        # Omitted means "match the player cadence" for compatibility. A
+        # caller may increase shuttle-only observations without increasing
+        # person inference or player tracking work.
+        "shuttle_sample_hz": None,
         "pose_conf": 0.15,
         "far_player_enhancement": False,
         "far_pose_roi": [0.12, 0.30, 0.86, 0.82],
@@ -373,6 +376,14 @@ def _parse_options(value):
             status_code=422,
             detail="analysis_sample_hz must be 0 (every source frame) or at least 1",
         )
+    if options["shuttle_sample_hz"] is None:
+        options["shuttle_sample_hz"] = sample_hz
+    shuttle_sample_hz = float(options["shuttle_sample_hz"])
+    if shuttle_sample_hz < 0.0 or (0.0 < shuttle_sample_hz < 1.0):
+        raise HTTPException(
+            status_code=422,
+            detail="shuttle_sample_hz must be 0 (every source frame) or at least 1",
+        )
     if not 0 < float(options["pose_conf"]) <= 1:
         raise HTTPException(status_code=422, detail="pose_conf must be in (0, 1]")
     if options["output_video_style"] not in {"annotated", "skeleton"}:
@@ -415,6 +426,7 @@ def _parse_options(value):
     options["roster_stable_frames"] = int(options["roster_stable_frames"])
     options["analysis_sample_hz"] = float(options["analysis_sample_hz"])
     options["pose_sample_hz"] = options["analysis_sample_hz"]
+    options["shuttle_sample_hz"] = float(options["shuttle_sample_hz"])
     options["movement_rally_settle_seconds"] = float(options["movement_rally_settle_seconds"])
     options["enable_huji_play_state"] = bool(options["enable_huji_play_state"])
     options["match_session_ref"] = (
