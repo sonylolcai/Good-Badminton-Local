@@ -74,6 +74,9 @@ class GpuPackageTests(unittest.TestCase):
 
     def test_complete_release_contains_only_required_models_with_hash_manifest(self):
         script = REPOSITORY_ROOT / "deploy" / "package_gpu_api.ps1"
+        missing = [name for name in RELEASE_WEIGHT_FILES if not (REPOSITORY_ROOT / "weights" / name).is_file()]
+        if missing:
+            self.skipTest(f"complete-release model inputs are not present: {', '.join(missing)}")
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "good-badminton-gpu-api-full-release.zip"
             completed = subprocess.run(

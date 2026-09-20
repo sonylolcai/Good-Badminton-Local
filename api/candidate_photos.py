@@ -8,11 +8,12 @@ recognition or biometric identity storage.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import cv2
 import numpy as np
@@ -23,6 +24,9 @@ from badminton_analysis.streaming.models import FrameContext, ProcessorEvent
 _TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _POSE_KEYPOINT_CONFIDENCE = 0.25
 _NOSE, _LEFT_EYE, _RIGHT_EYE, _LEFT_EAR, _RIGHT_EAR = range(5)
+_MIN_PHOTO_DETECTION_CONFIDENCE = 0.80
+_MIN_PHOTO_LOCATION_CONFIDENCE = 0.80
+_MIN_PHOTO_IDENTITY_CONFIDENCE = 0.80
 
 
 class CandidatePhotoCollector:
@@ -220,3 +224,115 @@ class CandidatePhotoCollector:
         if score >= 0.42:
             return score, "three_quarter"
         return score, "side_or_back"
+
+
+def extract_full_video_candidate_photos(
+    video_path: str | Path,
+    detections_path: str | Path,
+    output_dir: str | Path,
+) -> list[dict[str, Any]]:
+    """Save one anonymous high-confidence evidence crop for each visual track."""
+
+    source, detections = Path(video_path), Path(detections_path)
+    if not source.is_file() or not detections.is_file():
+        return []
+    best = _best_detected_observations(detections)
+    if not best:
+        return []
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        return []
+    target = Path(output_dir) / "candidate_photos"
+    output: list[dict[str, Any]] = []
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for track_id, observation in sorted(best.items()):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(observation["frame"]))
+            ok, frame = capture.read()
+            crop = _crop(frame, observation["bbox"]) if ok else None
+            if crop is None:
+                continue
+            path = target / f"{track_id}.jpg"
+            if not cv2.imwrite(str(path), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 88]):
+                continue
+            output.append({
+                "track_id": track_id,
+                "path": str(path),
+                "status": "generated_from_full_video_detection",
+                "source_time_sec": observation["source_time_sec"],
+                "capture_quality": observation["score"],
+                "view_label": "未评估",
+                "selection_policy": "highest_detected_bbox_confidence_v1",
+            })
+    finally:
+        capture.release()
+    return output
+
+
+def _best_detected_observations(path: Path) -> dict[str, dict[str, Any]]:
+    best: dict[str, dict[str, Any]] = {}
+    try:
+        source = path.open("r", encoding="utf-8")
+    except OSError:
+        return best
+    with source:
+        for raw in source:
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            frame = record.get("frame")
+            source_time = _number(record.get("time_sec"))
+            if not isinstance(frame, int) or source_time is None:
+                continue
+            for track in ((record.get("spatial") or {}).get("tracks") or []):
+                if not isinstance(track, Mapping) or str(track.get("status")) != "detected":
+                    continue
+                track_id = str(track.get("track_id") or "")
+                evidence = dict(track.get("location_evidence") or {})
+                bbox = evidence.get("bbox_xyxy")
+                if not track_id or not _valid_bbox(bbox):
+                    continue
+                confidence = _number(track.get("confidence")) or 0.0
+                location_confidence = _number(evidence.get("confidence")) or 0.0
+                identity_confidence = _number(dict(track.get("association") or {}).get("identity_confidence")) or 0.0
+                if min(confidence, location_confidence, identity_confidence) < _MIN_PHOTO_DETECTION_CONFIDENCE:
+                    continue
+                score = 0.45 * confidence + 0.35 * location_confidence + 0.20 * identity_confidence
+                if score <= float(best.get(track_id, {}).get("score", -1.0)):
+                    continue
+                best[track_id] = {
+                    "frame": frame,
+                    "source_time_sec": source_time,
+                    "bbox": [float(value) for value in bbox],
+                    "score": round(score, 4),
+                }
+    return best
+
+
+def _crop(frame: Any, bbox: list[float]) -> Any | None:
+    if frame is None or getattr(frame, "ndim", 0) < 2:
+        return None
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+    pad_x, pad_y = max(4, int(round((x2 - x1) * 0.12))), max(4, int(round((y2 - y1) * 0.08)))
+    left, top = max(0, int(x1) - pad_x), max(0, int(y1) - pad_y)
+    right, bottom = min(width, int(x2) + pad_x), min(height, int(y2) + pad_y)
+    return frame[top:bottom, left:right] if right - left >= 24 and bottom - top >= 48 else None
+
+
+def _valid_bbox(value: Any) -> bool:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return False
+    try:
+        x1, y1, x2, y2 = (float(item) for item in value)
+    except (TypeError, ValueError):
+        return False
+    return x2 > x1 and y2 > y1
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None

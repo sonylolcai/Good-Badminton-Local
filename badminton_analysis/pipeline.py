@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from badminton_analysis.cancellation import AnalysisCancelled, raise_if_cancelled
+from api.candidate_photos import extract_full_video_candidate_photos
 from badminton_analysis.court.mapper import (
     CourtMapper,
     auto_detect_preview,
@@ -857,7 +858,6 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
             )
         record_pipeline_component("position_visualizations", visualizations_t0)
         try:
-            from webui.player_results import extract_full_video_candidate_photos
             candidate_photos = extract_full_video_candidate_photos(
                 video_path,
                 system.detections_path,

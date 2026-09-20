@@ -29,8 +29,6 @@ $requiredFiles = @(
     'deploy/install_gpu_api.sh',
     'deploy/install_lap.sh',
     'deploy/refresh_gpu_api_from_zip.sh',
-    'deploy/run_tracknet_v3_ab.sh',
-    'deploy/setup_tracknet_v3_ab.sh',
     'deploy/start_gpu_api_container.sh',
     'deploy/stop_gpu_api_container.sh'
 )
