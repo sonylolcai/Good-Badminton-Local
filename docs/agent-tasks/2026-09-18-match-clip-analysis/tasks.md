@@ -1,7 +1,8 @@
 # 任务分解
 
-| Task ID | Status | Depends on | Owned files | Expected change | Verification | Commit |
-|---|---|---|---|---|---|---|
-| T1 | pending | — | `edge_api.py`、`test_edge_ingest.py`、`test_match_delivery.py` | 当前单局 session 到 PTS 交付的完整性合同 | 连续/缺段/重传测试 | — |
-| T2 | pending | T1 | `match_delivery.py`、`post_match.py`、流测试 | 结构化证据融合、局部补算选择、VLM 证据包 | 不重跑整局与不捏造数据测试 | — |
-| T3 | pending | T1,T2 | `main.py`、`operator_backoffice.py`、前端/API 测试 | 既有采集控制旁展示本局交付状态 | API/UI 合同与人工验收清单 | — |
+| Task ID | Status | Depends on | Owned files | 验证 |
+|---|---|---|---|---|
+| T1 | pending | — | `agent.py`、`edge_api.py`、存储配置、边缘测试 | 同编码双轨输出、母版断点重传与分片回归。 |
+| T2 | pending | T1 | `match_delivery.py`、网关/API 测试 | 母版/分片 PTS 覆盖、fallback 与完整性状态。 |
+| T3 | pending | T2 | 后处理/GPU 适配、流测试 | 严格 repair 门控、窗口限定、无正常全片重跑。 |
+| T4 | pending | T2,T3 | API、前端、前端测试 | 既有采集控制和交付状态可见。 |
