@@ -1,0 +1,41 @@
+{
+  "schema_version": "stream-session.v1",
+  "analysis_session_id": "ssn_01J5STREAMSESSION001",
+  "status": "running",
+  "current_stage": "waiting_for_predecessor",
+  "updated_at": "2026-08-23T10:00:07Z",
+  "sealed": false,
+  "progress": {
+    "received_segments": 2,
+    "processed_segments": 1,
+    "failed_segments": 0,
+    "received_duration_sec": 4.0,
+    "processed_source_time_sec": 2.0,
+    "failed_source_time_sec": 0.0,
+    "backlog_duration_sec": 2.0,
+    "next_expected_segment_index": 1,
+    "missing_segment_indexes": [1],
+    "failed_segment_indexes": []
+  },
+  "track_candidates": [
+    {
+      "track_id": "track_001",
+      "state": "active",
+      "first_source_time_sec": 0.2,
+      "last_source_time_sec": 1.9,
+      "detected_coverage": 0.94,
+      "confidence": 0.91
+    },
+    {
+      "track_id": "track_002",
+      "state": "reassociation_uncertain",
+      "first_source_time_sec": 0.3,
+      "last_source_time_sec": 1.8,
+      "detected_coverage": 0.72,
+      "confidence": 0.63
+    }
+  ],
+  "error": null,
+  "processing_errors": [],
+  "artifacts": []
+}

@@ -128,12 +128,20 @@ class CourtTrajectoryVisualizer:
         
         return court
 
-    def draw_overlay(self, frame, court_history):
+    def draw_overlay(self, frame, court_history=None, *, spatial_tracks=None):
         """
-        在视频帧上绘制球场和球员轨迹
+        在视频帧上绘制球场和球员轨迹。
+
+        New callers must pass ``spatial_tracks``.  Those tracks are keyed by
+        persistent ``track_id`` and retain their latest measured court path,
+        so the mini-court remains visible on output frames skipped by the
+        configured detector cadence. ``court_history`` remains only as a
+        compatibility input for legacy upper/lower callers.
+
         Args:
             frame: 视频帧
-            court_history: 包含'upper'和'lower'键的字典，值为球员在球场坐标系中的历史位置列表
+            court_history: 兼容旧调用的 ``upper`` / ``lower`` 位置历史。
+            spatial_tracks: 当前固定机位空间轨迹快照。
         """
         try:
             # 获取视频帧尺寸计算缩放因子
@@ -168,28 +176,30 @@ class CourtTrajectoryVisualizer:
             doubles_width = 6.10  # 双打场地宽度
             court_length = 13.40  # 场地长度
             
-            # 绘制球员轨迹（合并上下方球员的逻辑）
-            for position, color in [('upper', (0, 255, 255)), ('lower', (255, 0, 255))]:
-                if position in court_history:
-                    history = court_history[position]
-                    # 将deque转换为列表以便处理
-                    history_list = list(history)
-                    
-                    for i, pos in enumerate(history_list):
-                        if pos is not None and len(pos) >= 2:
-                            # 将球场坐标归一化，然后转换为小球场坐标
-                            x_norm = pos[0] / doubles_width
-                            y_norm = pos[1] / court_length
-                            
-                            x = int(x_norm * court_width + offset_x)
-                            y = int(y_norm * court_height + offset_y)
-                            
-                            if 0 <= x < width and 0 <= y < height:
-                                # 计算半径，越新的点半径越大，根据视频尺寸缩放
-                                radius_min = max(2, int(2 * scale_factor))
-                                radius_max = max(3, int(5 * scale_factor))
-                                radius = int(radius_min + (i / len(history_list)) * (radius_max - radius_min)) if len(history_list) > 1 else radius_min
-                                cv2.circle(overlay, (x, y), radius, color, -1)  # upper:黄青色, lower:品红色
+            if spatial_tracks is not None:
+                self._draw_spatial_tracks(
+                    overlay,
+                    spatial_tracks,
+                    court_width=court_width,
+                    court_height=court_height,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                    scale_factor=scale_factor,
+                )
+            else:
+                # Legacy fallback for callers that have not migrated from
+                # upper/lower.  It is intentionally not used by the main
+                # fixed-camera pipeline, because those slots are not durable
+                # identities in doubles or after a re-association.
+                self._draw_legacy_history(
+                    overlay,
+                    court_history or {},
+                    court_width=court_width,
+                    court_height=court_height,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                    scale_factor=scale_factor,
+                )
                 
             # 将球场叠加到视频帧的右上角
             h, w = overlay.shape[:2]
@@ -207,6 +217,106 @@ class CourtTrajectoryVisualizer:
             print(f"绘制球场轨迹出错: {e}")
             
         return frame
+
+    @staticmethod
+    def _court_to_overlay_point(court_xy, *, court_width, court_height, offset_x, offset_y):
+        if court_xy is None or len(court_xy) < 2:
+            return None
+        try:
+            x_m, y_m = float(court_xy[0]), float(court_xy[1])
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(x_m) or not np.isfinite(y_m):
+            return None
+        x = int(round(x_m / 6.10 * court_width + offset_x))
+        y = int(round(y_m / 13.40 * court_height + offset_y))
+        return x, y
+
+    def _draw_spatial_tracks(
+        self,
+        overlay,
+        tracks,
+        *,
+        court_width,
+        court_height,
+        offset_x,
+        offset_y,
+        scale_factor,
+    ):
+        """Draw a deterministic, track-ID based mini-court.
+
+        The source snapshot may be rendered several times between detector
+        samples.  Drawing from its retained measured history makes those
+        frames identical instead of making the entire mini-court blink at the
+        analysis cadence.
+        """
+        palette = [(0, 255, 255), (255, 0, 255), (0, 165, 255), (255, 255, 0)]
+        height, width = overlay.shape[:2]
+        for index, track in enumerate(sorted(tracks or [], key=lambda item: str(item.get("track_id", "")))):
+            status = str(track.get("status") or "missing")
+            if status == "missing":
+                # Missing means the last observed person is no longer a
+                # current on-court fact. Do not keep a stale dot on the map.
+                continue
+            color = palette[index % len(palette)]
+            measured_history = track.get("trajectory_court_m") or []
+            points = [
+                self._court_to_overlay_point(
+                    point,
+                    court_width=court_width,
+                    court_height=court_height,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                )
+                for point in measured_history
+            ]
+            points = [point for point in points if point and 0 <= point[0] < width and 0 <= point[1] < height]
+            current = self._court_to_overlay_point(
+                track.get("court_xy_m"),
+                court_width=court_width,
+                court_height=court_height,
+                offset_x=offset_x,
+                offset_y=offset_y,
+            )
+            if current and 0 <= current[0] < width and 0 <= current[1] < height:
+                if not points or points[-1] != current:
+                    points.append(current)
+            if len(points) >= 2:
+                cv2.polylines(overlay, [np.asarray(points, dtype=np.int32)], False, color, 1, cv2.LINE_AA)
+            if points:
+                radius = max(3, int(4 * scale_factor))
+                if status == "predicted":
+                    cv2.circle(overlay, points[-1], radius, color, 1, cv2.LINE_AA)
+                else:
+                    cv2.circle(overlay, points[-1], radius, color, -1, cv2.LINE_AA)
+
+    def _draw_legacy_history(
+        self,
+        overlay,
+        court_history,
+        *,
+        court_width,
+        court_height,
+        offset_x,
+        offset_y,
+        scale_factor,
+    ):
+        for position, color in [('upper', (0, 255, 255)), ('lower', (255, 0, 255))]:
+            history_list = list(court_history.get(position) or [])
+            for i, pos in enumerate(history_list):
+                point = self._court_to_overlay_point(
+                    pos,
+                    court_width=court_width,
+                    court_height=court_height,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                )
+                if point is None:
+                    continue
+                radius_min = max(2, int(2 * scale_factor))
+                radius_max = max(3, int(5 * scale_factor))
+                radius = int(radius_min + (i / len(history_list)) * (radius_max - radius_min)) if len(history_list) > 1 else radius_min
+                cv2.circle(overlay, point, radius, color, -1, cv2.LINE_AA)
 
 if __name__ == '__main__':
     # 创建可视化器实例

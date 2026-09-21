@@ -52,7 +52,13 @@ class StatsVisualizer:
                 'max_speed': '最大速度',
                 'total_distance': '总距离',
                 'unit_speed': '米/秒',
-                'unit_distance': '米'
+                'unit_distance': '米',
+                'track_status': '球员追踪（仅当前真实检测）',
+                'detected': '已检测',
+                'predicted': '短暂预测',
+                'missing': '未检测',
+                'speed_unavailable': '当前速度: —',
+                'speed_calculating': '当前速度: 计算中',
             },
             'en': {
                 'rally': 'Rally',
@@ -67,7 +73,13 @@ class StatsVisualizer:
                 'max_speed': 'Max Speed',
                 'total_distance': 'Total Distance',
                 'unit_speed': 'm/s',
-                'unit_distance': 'm'
+                'unit_distance': 'm',
+                'track_status': 'Player Tracks (fresh measurements only)',
+                'detected': 'Detected',
+                'predicted': 'Predicted',
+                'missing': 'Missing',
+                'speed_unavailable': 'Current Speed: —',
+                'speed_calculating': 'Current Speed: calculating',
             }
         }
 
@@ -156,10 +168,12 @@ class StatsVisualizer:
         # 计算回合数显示位置，基于视频尺寸
         rally_pos_y = int(self.panel_height + self.frame_height * 0.1) # 第一个面板下方
               
-        # 使用语言配置显示回合数
+        # 回合数只在有羽毛球证据时显示。None means an explicit
+        # shuttle-detector opt-out, not a zero-round match.
         text_items = []
-        rally_text = f"{self.texts[self.language]['rally']}: {rally_count}"
-        text_items.append((rally_text, (self.margin, rally_pos_y), self.font_scale*1.5, (0, 165, 255), self.thickness+2))
+        if rally_count is not None:
+            rally_text = f"{self.texts[self.language]['rally']}: {rally_count}"
+            text_items.append((rally_text, (self.margin, rally_pos_y), self.font_scale*1.5, (0, 165, 255), self.thickness+2))
         
         # 绘制上半场球员统计
         self._draw_player_panel(frame, self.texts[self.language]['upper_player'], movement_stats.get('upper', {}), 
@@ -172,6 +186,88 @@ class StatsVisualizer:
                                self.margin, int(self.frame_height * 0.55), 
                                self.panel_width, self.panel_height, (255, 0, 255), self.font_scale, self.thickness, 
                                self.line_height, self.background_color, self.background_alpha, text_items)
+        self._draw_text_batch(frame, text_items)
+
+    def draw_spatial_track_stats(self, frame, tracks, rally_count):
+        """Draw status/speed strictly from the displayed spatial ``track_id``s.
+
+        The old upper/lower panel remains for legacy callers, but it is not a
+        valid individual statistic in doubles.  This panel intentionally
+        suppresses a speed whenever the matching track is predicted or
+        missing, preventing old history from being rendered as a live player
+        measurement.
+        """
+        tracks = list(tracks or [])
+        text_items = []
+        x_pos = self.margin
+        y_pos = int(self.frame_height * 0.05)
+        line_height = self.line_height
+        panel_height = max(
+            line_height * 3,
+            line_height * (2 + 2 * max(1, len(tracks))),
+        )
+        panel_width = max(self.panel_width, int(self.frame_width * 0.24))
+        margin = max(5, int(panel_width * 0.05))
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (x_pos - margin, y_pos - margin),
+            (x_pos + panel_width + margin, y_pos + panel_height + margin),
+            self.background_color,
+            -1,
+        )
+        cv2.addWeighted(overlay, self.background_alpha, frame, 1 - self.background_alpha, 0, frame)
+
+        self._queue_or_draw_text(
+            frame, text_items, self.texts[self.language]['track_status'], (x_pos, y_pos),
+            self.font_scale * 1.05, (0, 255, 255), self.thickness + 1,
+        )
+        y = y_pos + line_height
+        if rally_count is not None:
+            self._queue_or_draw_text(
+                frame, text_items, f"{self.texts[self.language]['rally']}: {rally_count}",
+                (x_pos, y), self.font_scale, (0, 165, 255), self.thickness,
+            )
+            y += line_height
+
+        if not tracks:
+            waiting = "等待完整球员名册" if self.language == 'zh' else "Waiting for complete player roster"
+            self._queue_or_draw_text(
+                frame, text_items, waiting, (x_pos, y), self.font_scale,
+                (255, 255, 255), self.thickness,
+            )
+        for track in sorted(tracks, key=lambda item: str(item.get('track_id') or '')):
+            track_id = str(track.get('track_id') or 'unknown')
+            status_key = str(track.get('status') or 'missing')
+            status = self.texts[self.language].get(status_key, status_key)
+            color = {
+                'detected': (0, 255, 0),
+                'predicted': (0, 165, 255),
+                'missing': (80, 80, 255),
+            }.get(status_key, (255, 255, 255))
+            self._queue_or_draw_text(
+                frame, text_items, f"{track_id}: {status}", (x_pos, y),
+                self.font_scale, color, self.thickness,
+            )
+            y += line_height
+            motion = track.get('motion') or {}
+            speed = motion.get('current_speed_mps') if status_key == 'detected' else None
+            if speed is None:
+                speed_text = (
+                    self.texts[self.language]['speed_calculating']
+                    if status_key == 'detected'
+                    else self.texts[self.language]['speed_unavailable']
+                )
+            else:
+                speed_text = (
+                    f"{self.texts[self.language]['current_speed']}: {float(speed):.2f} "
+                    f"{self.texts[self.language]['unit_speed']}"
+                )
+            self._queue_or_draw_text(
+                frame, text_items, f"  {speed_text}", (x_pos, y),
+                self.font_scale * 0.92, (255, 255, 255), self.thickness,
+            )
+            y += line_height
         self._draw_text_batch(frame, text_items)
     
     def _draw_player_panel(self, frame, player_name, stats, x_pos, y_pos, panel_width, panel_height, 

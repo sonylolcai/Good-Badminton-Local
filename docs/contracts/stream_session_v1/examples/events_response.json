@@ -1,0 +1,74 @@
+{
+  "schema_version": "stream-session.v1",
+  "analysis_session_id": "ssn_01J5STREAMSESSION001",
+  "events": [
+    {
+      "schema_version": "stream-session.v1",
+      "event_id": "evt-person-000001",
+      "event_type": "person_observation",
+      "analysis_session_id": "ssn_01J5STREAMSESSION001",
+      "source_time_sec": 1.2,
+      "segment_index": 0,
+      "emitted_at": "2026-08-23T10:00:03Z",
+      "confidence": 0.92,
+      "evidence_state": "detected",
+      "data": {
+        "track_id": "track_001",
+        "track_state": "active",
+        "bbox_xyxy_px": [421.0, 214.0, 563.0, 618.0],
+        "court_xy_m": [2.3, 9.1],
+        "measurement_frame": 36
+      }
+    },
+    {
+      "schema_version": "stream-session.v1",
+      "event_id": "evt-shuttle-000001",
+      "event_type": "shuttle_observation",
+      "analysis_session_id": "ssn_01J5STREAMSESSION001",
+      "source_time_sec": 1.23,
+      "segment_index": 0,
+      "emitted_at": "2026-08-23T10:00:03Z",
+      "confidence": 0.67,
+      "evidence_state": "detected",
+      "data": {
+        "shuttle_track_id": "shuttle_001",
+        "image_xy_px": [803.0, 292.0],
+        "court_xy_m": null,
+        "detector": "yolo"
+      }
+    },
+    {
+      "schema_version": "stream-session.v1",
+      "event_id": "evt-interaction-000001",
+      "event_type": "interaction_candidate",
+      "analysis_session_id": "ssn_01J5STREAMSESSION001",
+      "source_time_sec": 1.24,
+      "segment_index": 0,
+      "emitted_at": "2026-08-23T10:00:03Z",
+      "confidence": 0.58,
+      "evidence_state": "candidate",
+      "data": {
+        "candidate_id": "contact_candidate_000001",
+        "interaction_type": "contact_candidate",
+        "track_id": "track_001",
+        "review_required": true
+      }
+    },
+    {
+      "schema_version": "stream-session.v1",
+      "event_id": "evt-status-000001",
+      "event_type": "session_status",
+      "analysis_session_id": "ssn_01J5STREAMSESSION001",
+      "source_time_sec": 2.0,
+      "segment_index": 0,
+      "emitted_at": "2026-08-23T10:00:04Z",
+      "confidence": 1.0,
+      "evidence_state": "derived",
+      "data": {
+        "status": "running",
+        "processed_segments": 1
+      }
+    }
+  ],
+  "next_cursor": "cursor_000004"
+}

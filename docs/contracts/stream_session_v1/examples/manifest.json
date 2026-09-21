@@ -1,0 +1,18 @@
+{
+  "schema_file": "../stream_session_contract_v1.schema.json",
+  "examples": [
+    { "file": "create_session_request.json", "definition": "createSessionRequest" },
+    { "file": "create_session_response.json", "definition": "createSessionResponse" },
+    { "file": "segment_metadata.json", "definition": "segmentMetadata" },
+    { "file": "segment_accepted_response.json", "definition": "segmentReceiptResponse" },
+    { "file": "segment_duplicate_response.json", "definition": "segmentReceiptResponse" },
+    { "file": "segment_out_of_order_response.json", "definition": "segmentReceiptResponse" },
+    { "file": "session_status_response.json", "definition": "sessionStatusResponse" },
+    { "file": "cancelled_status_response.json", "definition": "sessionStatusResponse" },
+    { "file": "events_response.json", "definition": "eventsResponse" },
+    { "file": "complete_request.json", "definition": "completeSessionRequest" },
+    { "file": "complete_response.json", "definition": "completeSessionResponse" },
+    { "file": "error_hash_conflict.json", "definition": "errorResponse" },
+    { "file": "error_missing_segments.json", "definition": "errorResponse" }
+  ]
+}

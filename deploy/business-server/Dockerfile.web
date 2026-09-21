@@ -1,0 +1,21 @@
+FROM node:20-bookworm-slim AS build
+WORKDIR /app/webui-next
+COPY webui-next/package.json webui-next/package-lock.json ./
+# The current lock file was generated on Windows and omits two optional native
+# Sharp dependencies required by npm 10 on Linux.  Install resolves those
+# optional platform packages in the Linux build container; the application
+# dependencies remain constrained by package.json.
+RUN npm install
+COPY webui-next ./
+ARG NEXT_PUBLIC_OPERATOR_API_BASE_URL
+ARG NEXT_PUBLIC_OPERATOR_BASE_PATH
+ENV NEXT_PUBLIC_OPERATOR_API_BASE_URL=$NEXT_PUBLIC_OPERATOR_API_BASE_URL
+ENV NEXT_PUBLIC_OPERATOR_BASE_PATH=$NEXT_PUBLIC_OPERATOR_BASE_PATH
+RUN npm run build
+
+FROM node:20-bookworm-slim
+WORKDIR /app/webui-next
+ENV NODE_ENV=production
+COPY --from=build /app/webui-next ./
+EXPOSE 3000
+CMD ["npm", "run", "start", "--", "--hostname", "0.0.0.0", "--port", "3000"]

@@ -1,0 +1,17 @@
+.git
+.venv
+.venv-business
+node_modules
+webui-next/node_modules
+webui-next/.next
+outputs
+api_data
+datasets
+videos
+weights
+Ultralytics
+_tmptest
+.tmp_test
+*.log
+.env.*
+.gpu-api.env

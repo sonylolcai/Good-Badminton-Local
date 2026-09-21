@@ -1,0 +1,9 @@
+{
+  "schema_version": "stream-session.v1",
+  "analysis_session_id": "ssn_01J5STREAMSESSION001",
+  "status": "draining",
+  "sealed_at": "2026-08-23T10:15:02Z",
+  "missing_segment_indexes": [],
+  "failed_segment_indexes": [],
+  "status_url": "/api/v1/stream-sessions/ssn_01J5STREAMSESSION001"
+}

@@ -1,0 +1,569 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://good-badminton.local/schemas/stream-session/v1",
+  "title": "Good-Badminton Stream Session Contract v1",
+  "description": "Machine-readable request, response, status, event and error payloads for anonymous streaming video analysis.",
+  "oneOf": [
+    { "$ref": "#/$defs/createSessionRequest" },
+    { "$ref": "#/$defs/createSessionResponse" },
+    { "$ref": "#/$defs/segmentMetadata" },
+    { "$ref": "#/$defs/segmentReceiptResponse" },
+    { "$ref": "#/$defs/sessionStatusResponse" },
+    { "$ref": "#/$defs/eventsResponse" },
+    { "$ref": "#/$defs/completeSessionRequest" },
+    { "$ref": "#/$defs/completeSessionResponse" },
+    { "$ref": "#/$defs/errorResponse" }
+  ],
+  "$defs": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "stream-session.v1"
+    },
+    "sessionId": {
+      "type": "string",
+      "pattern": "^ssn_[a-zA-Z0-9_-]{12,80}$"
+    },
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "courtCorners": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": { "type": "number" }
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "dateTime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "sessionState": {
+      "type": "string",
+      "enum": [
+        "accepted",
+        "queued",
+        "running",
+        "draining",
+        "finalized",
+        "partial",
+        "failed",
+        "cancelled",
+        "interrupted_needs_rebuild"
+      ]
+    },
+    "evidenceState": {
+      "type": "string",
+      "enum": ["detected", "predicted", "missing", "derived", "candidate", "finalized"]
+    },
+    "analysisConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analysis_sample_hz",
+        "pose_imgsz",
+        "shuttle_detector",
+        "generate_annotated_video"
+      ],
+      "properties": {
+        "analysis_sample_hz": {
+          "type": "integer",
+          "enum": [10, 15, 30]
+        },
+        "pose_imgsz": {
+          "type": "integer",
+          "enum": [640, 960, 1280]
+        },
+        "shuttle_detector": {
+          "type": "string",
+          "enum": ["none", "yolo", "tracknet_v3"]
+        },
+        "generate_annotated_video": {
+          "type": "boolean"
+        },
+        "tracker_backend": {
+          "type": "string",
+          "enum": ["court_association", "bytetrack"],
+          "description": "Anonymous cross-frame association backend selected by the business service."
+        },
+        "lock_match_roster": {
+          "type": "boolean",
+          "description": "Lock a stable anonymous on-court roster; no user, team or match-mode identity crosses this boundary."
+        },
+        "roster_stable_frames": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Consecutive sampled frames with the same on-court count required before automatic anonymous roster lock."
+        },
+        "preserve_audio": {
+          "type": "boolean"
+        },
+        "court_health_check_hz": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 2
+        },
+        "tracknet_overlap_frames": {
+          "type": "integer",
+          "const": 7
+        },
+        "max_roster_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "expected_player_count": {
+          "type": ["integer", "null"],
+          "enum": [1, 2, 4, null]
+        },
+        "roster_discovery_seconds": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 15
+        },
+        "far_player_enhancement": {
+          "type": "boolean"
+        },
+        "far_pose_roi": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "sport_id": {
+          "type": "string",
+          "enum": ["badminton", "tennis"],
+          "description": "Optional fixed-process identity check. The GPU process rejects a different sport."
+        },
+        "session_mode": {
+          "type": "string",
+          "enum": ["match", "singles_match", "single_player_training"],
+          "description": "Anonymous visual mode selected within the process-fixed sport."
+        },
+        "calibration_scope": {
+          "type": "string",
+          "enum": ["full_court", "near_half_court"],
+          "description": "The semantic world region represented by the four supplied image points."
+        }
+      }
+    },
+    "createSessionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "camera_id",
+        "calibration_id",
+        "court_corners",
+        "analysis_mode",
+        "configuration"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "camera_id": { "$ref": "#/$defs/opaqueId" },
+        "calibration_id": { "$ref": "#/$defs/opaqueId" },
+        "court_corners": { "$ref": "#/$defs/courtCorners" },
+        "analysis_mode": {
+          "type": "string",
+          "const": "person_only"
+        },
+        "client_reference": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "configuration": { "$ref": "#/$defs/analysisConfiguration" }
+      }
+    },
+    "createSessionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "analysis_session_id",
+        "status",
+        "accepted_at",
+        "status_url",
+        "segments_url",
+        "complete_url"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "analysis_session_id": { "$ref": "#/$defs/sessionId" },
+        "status": {
+          "type": "string",
+          "const": "accepted"
+        },
+        "accepted_at": { "$ref": "#/$defs/dateTime" },
+        "status_url": { "type": "string", "minLength": 1 },
+        "segments_url": { "type": "string", "minLength": 1 },
+        "complete_url": { "type": "string", "minLength": 1 }
+      }
+    },
+    "segmentMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "segment_index",
+        "source_start_time_sec",
+        "duration_sec",
+        "sha256",
+        "idempotency_key",
+        "content_type",
+        "content_length_bytes"
+        ,"court_corners"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "segment_index": { "type": "integer", "minimum": 0 },
+        "source_start_time_sec": { "type": "number", "minimum": 0 },
+        "duration_sec": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "idempotency_key": { "$ref": "#/$defs/opaqueId" },
+        "content_type": {
+          "type": "string",
+          "enum": ["video/mp4", "video/iso.segment"]
+        },
+        "content_length_bytes": { "type": "integer", "minimum": 1 }
+        ,"court_corners": { "$ref": "#/$defs/courtCorners" }
+      }
+    },
+    "segmentReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted",
+        "reused",
+        "received_at",
+        "sha256",
+        "content_length_bytes",
+        "processing_disposition"
+      ],
+      "properties": {
+        "accepted": { "type": "boolean", "const": true },
+        "reused": { "type": "boolean" },
+        "received_at": { "$ref": "#/$defs/dateTime" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "content_length_bytes": { "type": "integer", "minimum": 1 },
+        "processing_disposition": {
+          "type": "string",
+          "enum": ["queued", "waiting_for_predecessor", "already_accepted"]
+        }
+      }
+    },
+    "segmentReceiptResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "analysis_session_id",
+        "segment_index",
+        "session_status",
+        "receipt",
+        "status_url"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "analysis_session_id": { "$ref": "#/$defs/sessionId" },
+        "segment_index": { "type": "integer", "minimum": 0 },
+        "session_status": { "$ref": "#/$defs/sessionState" },
+        "receipt": { "$ref": "#/$defs/segmentReceipt" },
+        "status_url": { "type": "string", "minLength": 1 }
+      }
+    },
+    "trackCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "track_id",
+        "state",
+        "first_source_time_sec",
+        "last_source_time_sec",
+        "detected_coverage",
+        "confidence"
+      ],
+      "properties": {
+        "track_id": { "type": "string", "pattern": "^track_[a-zA-Z0-9_-]+$" },
+        "state": {
+          "type": "string",
+          "enum": ["candidate", "active", "predicted", "missing", "closed", "reassociation_uncertain"]
+        },
+        "first_source_time_sec": { "type": "number", "minimum": 0 },
+        "last_source_time_sec": { "type": "number", "minimum": 0 },
+        "detected_coverage": { "$ref": "#/$defs/confidence" },
+        "confidence": { "$ref": "#/$defs/confidence" }
+      }
+    },
+    "sessionProgress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "received_segments",
+        "processed_segments",
+        "failed_segments",
+        "received_duration_sec",
+        "processed_source_time_sec",
+        "failed_source_time_sec",
+        "backlog_duration_sec",
+        "next_expected_segment_index",
+        "missing_segment_indexes",
+        "failed_segment_indexes"
+      ],
+      "properties": {
+        "received_segments": { "type": "integer", "minimum": 0 },
+        "processed_segments": { "type": "integer", "minimum": 0 },
+        "failed_segments": { "type": "integer", "minimum": 0 },
+        "received_duration_sec": { "type": "number", "minimum": 0 },
+        "processed_source_time_sec": { "type": "number", "minimum": 0 },
+        "failed_source_time_sec": { "type": "number", "minimum": 0 },
+        "backlog_duration_sec": { "type": "number", "minimum": 0 },
+        "next_expected_segment_index": { "type": "integer", "minimum": 0 },
+        "missing_segment_indexes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "failed_segment_indexes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "media_type", "url", "sha256", "size_bytes"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "media_type": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "errorDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable", "details"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "validation_error",
+            "authentication_required",
+            "session_not_found",
+            "segment_hash_conflict",
+            "segment_after_seal",
+            "missing_segments",
+            "invalid_state",
+            "storage_unavailable",
+            "engine_failed",
+            "interrupted_needs_rebuild"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "details": { "type": "object" }
+      }
+    },
+    "sessionStatusResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "analysis_session_id",
+        "status",
+        "current_stage",
+        "updated_at",
+        "sealed",
+        "progress",
+        "track_candidates",
+        "error",
+        "processing_errors",
+        "artifacts"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "analysis_session_id": { "$ref": "#/$defs/sessionId" },
+        "status": { "$ref": "#/$defs/sessionState" },
+        "current_stage": {
+          "type": "string",
+          "enum": [
+            "awaiting_segments",
+            "waiting_for_predecessor",
+            "analyzing",
+            "analyzing_with_errors",
+            "draining_backlog",
+            "draining_with_errors",
+            "finalizing",
+            "complete",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "updated_at": { "$ref": "#/$defs/dateTime" },
+        "sealed": { "type": "boolean" },
+        "progress": { "$ref": "#/$defs/sessionProgress" },
+        "track_candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/trackCandidate" }
+        },
+        "error": {
+          "type": ["object", "null"],
+          "required": ["code", "message", "retryable", "details"],
+          "properties": {
+            "code": { "type": "string", "minLength": 1 },
+            "message": { "type": "string", "minLength": 1 },
+            "retryable": { "type": "boolean" },
+            "details": { "type": "object" }
+          },
+          "additionalProperties": false
+        },
+        "processing_errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["segment_index", "phase", "type", "message", "at", "source_start_time_sec", "duration_sec"],
+            "properties": {
+              "segment_index": { "type": "integer", "minimum": 0 },
+              "phase": { "type": "string", "minLength": 1 },
+              "type": { "type": "string", "minLength": 1 },
+              "message": { "type": "string", "minLength": 1 },
+              "at": { "$ref": "#/$defs/dateTime" },
+              "source_start_time_sec": { "type": "number", "minimum": 0 },
+              "duration_sec": { "type": "number", "exclusiveMinimum": 0 }
+            }
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/artifact" }
+        }
+      }
+    },
+    "eventBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "event_id",
+        "event_type",
+        "analysis_session_id",
+        "source_time_sec",
+        "segment_index",
+        "emitted_at",
+        "confidence",
+        "evidence_state",
+        "data"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "event_id": { "$ref": "#/$defs/opaqueId" },
+        "event_type": {
+          "type": "string",
+          "enum": [
+            "person_observation",
+            "roster_candidate_observation",
+            "shuttle_observation",
+            "ball_observation",
+            "interaction_candidate",
+            "session_status",
+            "session_finalized"
+          ]
+        },
+        "analysis_session_id": { "$ref": "#/$defs/sessionId" },
+        "source_time_sec": { "type": "number", "minimum": 0 },
+        "segment_index": { "type": "integer", "minimum": 0 },
+        "emitted_at": { "$ref": "#/$defs/dateTime" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "evidence_state": { "$ref": "#/$defs/evidenceState" },
+        "data": { "type": "object" }
+      }
+    },
+    "eventsResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "analysis_session_id", "events", "next_cursor"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "analysis_session_id": { "$ref": "#/$defs/sessionId" },
+        "events": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/eventBase" }
+        },
+        "next_cursor": { "type": ["string", "null"] }
+      }
+    },
+    "completeSessionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "expected_last_segment_index", "allow_partial"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "expected_last_segment_index": { "type": "integer", "minimum": 0 },
+        "allow_partial": { "type": "boolean" }
+      }
+    },
+    "completeSessionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "analysis_session_id",
+        "status",
+        "sealed_at",
+        "missing_segment_indexes",
+        "failed_segment_indexes",
+        "status_url"
+      ],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "analysis_session_id": { "$ref": "#/$defs/sessionId" },
+        "status": {
+          "type": "string",
+          "enum": ["draining", "finalized", "partial"]
+        },
+        "sealed_at": { "$ref": "#/$defs/dateTime" },
+        "missing_segment_indexes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "failed_segment_indexes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "status_url": { "type": "string", "minLength": 1 }
+      }
+    },
+    "errorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "request_id", "error"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "request_id": { "$ref": "#/$defs/opaqueId" },
+        "analysis_session_id": {
+          "type": ["string", "null"],
+          "pattern": "^ssn_[a-zA-Z0-9_-]{12,80}$"
+        },
+        "error": { "$ref": "#/$defs/errorDetail" }
+      }
+    }
+  }
+}

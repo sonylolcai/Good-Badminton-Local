@@ -1,0 +1,16 @@
+-- Fill four real image-pixel coordinates in clockwise order before running.
+-- This explicitly enables video-session creation for 好雨时节球馆 / 一号场.
+-- Never run this template with the example coordinates.
+
+insert into business.camera_calibrations (
+  id, camera_id, version, court_corners, quality_status
+) values (
+  'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+  'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+  1,
+  '[[LEFT_TOP_X,LEFT_TOP_Y],[RIGHT_TOP_X,RIGHT_TOP_Y],[RIGHT_BOTTOM_X,RIGHT_BOTTOM_Y],[LEFT_BOTTOM_X,LEFT_BOTTOM_Y]]'::jsonb,
+  'validated'
+)
+on conflict (camera_id, version) do update
+set court_corners = excluded.court_corners,
+    quality_status = 'validated';
