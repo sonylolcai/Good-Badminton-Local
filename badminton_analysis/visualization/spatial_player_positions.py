@@ -30,6 +30,14 @@ DEFAULT_MIN_DETECTION_CONFIDENCE = 0.50
 DEFAULT_MIN_LOCATION_CONFIDENCE = 0.50
 DEFAULT_MIN_IDENTITY_CONFIDENCE = 0.70
 PORTRAIT_MIN_CONFIDENCE = 0.80
+# Tracking is allowed to use a conservative same-side roster rebind so a
+# doubles player is not lost after an occlusion.  That rebind is useful for
+# coverage but can join two locations that were not observed as one continuous
+# physical motion.  Do not let it manufacture a player-speed spike.
+SPEED_METRIC_ASSOCIATION_SOURCES = frozenset({
+    "bytetrack", "court_association", "roster_bootstrap", "legacy_direct_measurement",
+})
+MAX_REPORTED_PLAYER_SPEED_MPS = 6.5
 
 
 def _configure_chinese_font():
@@ -189,7 +197,14 @@ def _track_summary(entry, *, source_frames, fps):
         entry["usable_points"],
         key=lambda item: (item["frame"] is None, item["frame"] if item["frame"] is not None else 0),
     )
-    distance_m, accepted_segments, excluded_segments = _distance_from_measurements(points, fps)
+    (
+        distance_m,
+        accepted_segments,
+        excluded_segments,
+        excluded_by_reason,
+        moving_time_sec,
+        peak_speed_mps,
+    ) = _distance_from_measurements(points, fps)
     confidence_values = [point["detection_confidence"] for point in points]
     location_values = [point["location_confidence"] for point in points]
     identity_values = [point["identity_confidence"] for point in points]
@@ -206,35 +221,72 @@ def _track_summary(entry, *, source_frames, fps):
         "movement_distance_m": round(distance_m, 3),
         "movement_segment_count": accepted_segments,
         "movement_segments_excluded": excluded_segments,
+        "movement_segments_excluded_by_reason": excluded_by_reason,
+        "movement_mean_speed_mps": (
+            round(distance_m / moving_time_sec, 3) if moving_time_sec else None
+        ),
+        "movement_peak_speed_mps": (
+            round(peak_speed_mps, 3) if accepted_segments else None
+        ),
+        "movement_time_sec": round(moving_time_sec, 3),
         "movement_policy": (
-            "Distance joins only contiguous high-confidence detected measurements; "
-            "long gaps and implausibly fast jumps are excluded."
+            "Speed joins only contiguous high-confidence detected measurements with a "
+            "direct tracker association; roster rebind transitions, long gaps, and "
+            "speeds above 6.5 m/s are excluded from reported movement."
         ),
     }
 
 
-def _distance_from_measurements(points, fps, max_gap_seconds=0.5, max_speed_mps=10.0):
+def _distance_from_measurements(
+    points,
+    fps,
+    max_gap_seconds=0.5,
+    max_speed_mps=MAX_REPORTED_PLAYER_SPEED_MPS,
+):
     distance_m = 0.0
     accepted = 0
-    excluded = 0
+    excluded_by_reason = {}
+    moving_time_sec = 0.0
+    peak_speed_mps = 0.0
+
+    def exclude(reason):
+        excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + 1
+
     rate = max(float(fps or 0), 1.0)
     for previous, current in zip(points, points[1:]):
         if previous["frame"] is None or current["frame"] is None:
-            excluded += 1
+            exclude("invalid_frame")
             continue
         delta_frames = current["frame"] - previous["frame"]
         if delta_frames <= 0 or delta_frames / rate > max_gap_seconds:
-            excluded += 1
+            exclude("non_contiguous_measurement")
+            continue
+        if (
+            previous.get("association_source") not in SPEED_METRIC_ASSOCIATION_SOURCES
+            or current.get("association_source") not in SPEED_METRIC_ASSOCIATION_SOURCES
+        ):
+            exclude("non_direct_tracker_association")
             continue
         left = previous["court_xy_m"]
         right = current["court_xy_m"]
         segment = math.hypot(right[0] - left[0], right[1] - left[1])
-        if segment / (delta_frames / rate) > max_speed_mps:
-            excluded += 1
+        seconds = delta_frames / rate
+        speed_mps = segment / seconds
+        if speed_mps > max_speed_mps:
+            exclude("reported_speed_guardrail")
             continue
         distance_m += segment
         accepted += 1
-    return distance_m, accepted, excluded
+        moving_time_sec += seconds
+        peak_speed_mps = max(peak_speed_mps, speed_mps)
+    return (
+        distance_m,
+        accepted,
+        sum(excluded_by_reason.values()),
+        dict(sorted(excluded_by_reason.items())),
+        moving_time_sec,
+        peak_speed_mps,
+    )
 
 
 def _render_track_heatmap(points, path, track_id, summary, language):

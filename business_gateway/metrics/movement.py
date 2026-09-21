@@ -20,7 +20,13 @@ from business_gateway.metrics.detections_reader import (
 
 SCHEMA_VERSION = "1.0"
 MAX_JOIN_GAP_SECONDS = 0.5
-MAX_PLAUSIBLE_SPEED_MPS = 10.0
+# This is a reporting guardrail, not a tracker gate.  ByteTrack and roster
+# recovery keep their broader motion tolerance so identities survive an
+# occlusion; movement metrics only accept direct observations below this bound.
+MAX_REPORTED_SPEED_MPS = 6.5
+SPEED_METRIC_ASSOCIATION_SOURCES = frozenset({
+    "bytetrack", "court_association", "roster_bootstrap", "legacy_direct_measurement",
+})
 MOVING_SPEED_MPS = 0.25
 HIGH_INTENSITY_SPEED_MPS = 2.0
 ACCELERATION_EVENT_MPS2 = 1.5
@@ -93,7 +99,8 @@ def generate_movement_metrics(
         "data_source": "detections.jsonl spatial.tracks (fresh high-confidence detections only)",
         "measurement_policy": {
             "max_join_gap_seconds": MAX_JOIN_GAP_SECONDS,
-            "max_plausible_speed_mps": MAX_PLAUSIBLE_SPEED_MPS,
+            "max_reported_speed_mps": MAX_REPORTED_SPEED_MPS,
+            "speed_metric_association_sources": sorted(SPEED_METRIC_ASSOCIATION_SOURCES),
             "moving_speed_mps": MOVING_SPEED_MPS,
             "high_intensity_speed_mps": HIGH_INTENSITY_SPEED_MPS,
             "acceleration_event_mps2": ACCELERATION_EVENT_MPS2,
@@ -450,17 +457,26 @@ def _score(value):
 def _valid_segments(points, fps):
     rate = max(float(fps or 0.0), 1.0)
     segments = []
-    excluded = 0
+    excluded_by_reason = {}
+
+    def exclude(reason):
+        excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + 1
     for left, right in zip(points, points[1:]):
         frame_left = left.get("frame")
         frame_right = right.get("frame")
         if frame_left is None or frame_right is None:
-            excluded += 1
+            exclude("invalid_frame")
             continue
         delta_frames = int(frame_right) - int(frame_left)
         seconds = delta_frames / rate
         if delta_frames <= 0 or seconds > MAX_JOIN_GAP_SECONDS:
-            excluded += 1
+            exclude("non_contiguous_measurement")
+            continue
+        if (
+            left.get("association_source") not in SPEED_METRIC_ASSOCIATION_SOURCES
+            or right.get("association_source") not in SPEED_METRIC_ASSOCIATION_SOURCES
+        ):
+            exclude("non_direct_tracker_association")
             continue
         point_left = left["court_xy_m"]
         point_right = right["court_xy_m"]
@@ -468,8 +484,8 @@ def _valid_segments(points, fps):
         dy = float(point_right[1]) - float(point_left[1])
         distance = math.hypot(dx, dy)
         speed = distance / seconds
-        if speed > MAX_PLAUSIBLE_SPEED_MPS:
-            excluded += 1
+        if speed > MAX_REPORTED_SPEED_MPS:
+            exclude("reported_speed_guardrail")
             continue
         segments.append(
             {
@@ -481,7 +497,7 @@ def _valid_segments(points, fps):
                 "end_time_sec": int(frame_right) / rate,
             }
         )
-    return segments, excluded
+    return segments, dict(sorted(excluded_by_reason.items()))
 
 
 def _speed_statistic_segments(segments, *, interval_seconds=SPEED_ACCELERATION_STATISTICS_INTERVAL_SECONDS):

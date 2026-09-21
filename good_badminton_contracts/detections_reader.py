@@ -88,6 +88,9 @@ def collect_track_position_evidence(
                 identity_confidence = _association_identity_confidence(
                     track.get("association") or {}
                 )
+                association_source = str(
+                    (track.get("association") or {}).get("source") or "legacy_direct_measurement"
+                )
                 if detection_confidence is None or detection_confidence < min_detection_confidence:
                     entry["excluded"]["low_detection_confidence"] += 1
                     continue
@@ -105,6 +108,11 @@ def collect_track_position_evidence(
                         "detection_confidence": detection_confidence,
                         "location_confidence": location_confidence,
                         "identity_confidence": identity_confidence,
+                        # Keep the identity mechanism with each measured
+                        # point.  Downstream speed metrics must be able to
+                        # distinguish a continuous ByteTrack observation from
+                        # a deliberately more permissive roster rebind.
+                        "association_source": association_source,
                     }
                 )
     return result

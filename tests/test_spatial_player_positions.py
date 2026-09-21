@@ -10,6 +10,7 @@ from business_gateway.metrics.detections_reader import (
     collect_track_position_evidence,
 )
 from badminton_analysis.visualization.spatial_player_positions import (
+    _distance_from_measurements,
     extract_high_confidence_player_portraits,
 )
 
@@ -70,6 +71,27 @@ class SpatialPlayerPositionsTests(unittest.TestCase):
             self.assertIsNotNone(crop)
             self.assertGreater(crop.shape[0], 24)
             self.assertGreater(crop.shape[1], 16)
+
+    def test_speed_evidence_excludes_roster_rebind_without_dropping_visual_track(self):
+        # A same-half doubles rebind remains useful to keep a visual identity
+        # alive, but it is not evidence that a player crossed four metres in
+        # half a second.  The following direct observations should still form
+        # the only reported speed segment.
+        points = [
+            {"frame": 0, "court_xy_m": (1.0, 1.0), "association_source": "bytetrack"},
+            {"frame": 5, "court_xy_m": (5.0, 1.0), "association_source": "doubles_team_side_reacquisition"},
+            {"frame": 10, "court_xy_m": (5.2, 1.0), "association_source": "bytetrack"},
+            {"frame": 15, "court_xy_m": (5.5, 1.0), "association_source": "bytetrack"},
+        ]
+
+        distance, accepted, excluded, reasons, seconds, peak = _distance_from_measurements(points, fps=10)
+
+        self.assertEqual(0.3, round(distance, 3))
+        self.assertEqual(1, accepted)
+        self.assertEqual(2, excluded)
+        self.assertEqual(2, reasons["non_direct_tracker_association"])
+        self.assertEqual(0.5, seconds)
+        self.assertEqual(0.6, round(peak, 3))
 
 
     @staticmethod
