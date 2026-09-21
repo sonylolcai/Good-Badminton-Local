@@ -13,6 +13,7 @@ import json
 import math
 from pathlib import Path
 
+import cv2
 import matplotlib
 
 matplotlib.use("Agg")
@@ -28,6 +29,7 @@ COURT_LENGTH_M = 13.40
 DEFAULT_MIN_DETECTION_CONFIDENCE = 0.50
 DEFAULT_MIN_LOCATION_CONFIDENCE = 0.50
 DEFAULT_MIN_IDENTITY_CONFIDENCE = 0.70
+PORTRAIT_MIN_CONFIDENCE = 0.80
 
 
 def _configure_chinese_font():
@@ -96,6 +98,90 @@ def analyze_spatial_track_positions(detections_path, output_dir=None, *, fps=30,
         "summary_path": str(summary_path),
         "summary": payload,
     }
+
+
+def extract_high_confidence_player_portraits(video_path, detections_path, output_dir, *, minimum_confidence=PORTRAIT_MIN_CONFIDENCE):
+    """Export one anonymous full-body crop per stable visual track.
+
+    A portrait is produced only from a real detected pose whose person,
+    location and association confidences all satisfy the UI's 0.80 threshold.
+    This deliberately avoids using predicted tracks, identities, or faces.
+    """
+    candidates = _portrait_candidates(detections_path, minimum_confidence)
+    if not candidates:
+        return {}
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return {}
+    target = Path(output_dir) / "player_portraits"
+    target.mkdir(parents=True, exist_ok=True)
+    results = {}
+    try:
+        for track_id, candidate in sorted(candidates.items()):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, candidate["frame"] - 1))
+            readable, frame = capture.read()
+            if not readable or frame is None:
+                continue
+            crop = _portrait_crop(frame, candidate["bbox_xyxy"])
+            if crop is None:
+                continue
+            safe_track_id = "".join(char if char.isalnum() or char in "_-" else "_" for char in track_id)
+            portrait_path = target / f"{safe_track_id}.jpg"
+            if cv2.imwrite(str(portrait_path), crop):
+                results[track_id] = str(portrait_path)
+    finally:
+        capture.release()
+    return results
+
+
+def _portrait_candidates(detections_path, minimum_confidence):
+    selected = {}
+    try:
+        source = Path(detections_path).open(encoding="utf-8")
+    except OSError:
+        return selected
+    with source:
+        for raw in source:
+            try:
+                row = json.loads(raw)
+                frame = int(row["frame"])
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            for track in ((row.get("spatial") or {}).get("tracks") or []):
+                if not isinstance(track, dict) or track.get("status") != "detected":
+                    continue
+                location = track.get("location_evidence") or {}
+                association = track.get("association") or {}
+                bbox = location.get("bbox_xyxy") or []
+                try:
+                    track_id = str(track["track_id"])
+                    confidence = min(
+                        float(track["confidence"]),
+                        float(location["confidence"]),
+                        float(association["identity_confidence"]),
+                    )
+                    x1, y1, x2, y2 = (float(value) for value in bbox[:4])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if confidence < float(minimum_confidence) or x2 <= x1 or y2 <= y1:
+                    continue
+                area = (x2 - x1) * (y2 - y1)
+                rank = (confidence, area)
+                if rank > selected.get(track_id, {}).get("rank", (-1.0, -1.0)):
+                    selected[track_id] = {"frame": frame, "bbox_xyxy": [x1, y1, x2, y2], "rank": rank}
+    return selected
+
+
+def _portrait_crop(frame, bbox_xyxy):
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = bbox_xyxy
+    pad_x = max(4, int((x2 - x1) * 0.12))
+    pad_y = max(4, int((y2 - y1) * 0.08))
+    left, top = max(0, int(x1) - pad_x), max(0, int(y1) - pad_y)
+    right, bottom = min(width, int(x2) + pad_x), min(height, int(y2) + pad_y)
+    if right - left < 16 or bottom - top < 24:
+        return None
+    return frame[top:bottom, left:right].copy()
 
 
 def _track_summary(entry, *, source_frames, fps):

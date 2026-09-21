@@ -1,9 +1,11 @@
 """HTTP boundary for the GPU-only Good-Badminton analysis service."""
 
+import base64
 import json
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -49,6 +51,15 @@ def create_app(
     app.state.stream_manager = stream_manager
     app.state.vision_profile = vision_profile
 
+    def default_court_detector(path):
+        # Import lazily: full CV dependencies are needed only when a user asks
+        # to extract a court template, not for health checks or queue handling.
+        from webui.pipeline import prepare_court_from_video
+
+        return prepare_court_from_video(path)
+
+    app.state.court_detector = default_court_detector
+
     def require_api_key(x_api_key: Optional[str] = Header(default=None)):
         expected = os.environ.get("GOOD_BADMINTON_API_KEY")
         if not expected:
@@ -76,6 +87,37 @@ def create_app(
         require_api_key=require_api_key,
         health_payload=stream_health_payload,
     )
+
+    @app.post("/api/v1/court/detect", dependencies=[Depends(require_api_key)])
+    async def detect_court(video: UploadFile = File(...)):
+        """Return an editable court preview and the exact selected video frame."""
+        if Path(video.filename or "").suffix.lower() not in VIDEO_EXTENSIONS:
+            raise HTTPException(status_code=422, detail="video has an unsupported file extension")
+        with tempfile.TemporaryDirectory(prefix="gpu-court-") as temporary:
+            source = await _save_upload(video, Path(temporary), VIDEO_EXTENSIONS, "video")
+            result = app.state.court_detector(str(source))
+
+        preview_data_url = None
+        if result.get("preview_bgr") is not None:
+            import cv2
+
+            encoded, data = cv2.imencode(".jpg", result["preview_bgr"])
+            if encoded:
+                preview_data_url = "data:image/jpeg;base64," + base64.b64encode(data.tobytes()).decode("ascii")
+
+        template_data_url = None
+        template_path = Path(result.get("template_path") or "")
+        if template_path.is_file() and template_path.suffix.lower() in IMAGE_EXTENSIONS:
+            media_type = {
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".bmp": "image/bmp",
+            }[template_path.suffix.lower()]
+            template_data_url = f"data:{media_type};base64," + base64.b64encode(template_path.read_bytes()).decode("ascii")
+
+        return {
+            "corners": result.get("corners") or [],
+            "preview_data_url": preview_data_url,
+            "template_data_url": template_data_url,
+        }
 
     @app.post("/api/v1/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_api_key)])
     async def create_job(
@@ -279,30 +321,41 @@ def _parse_options(value, *, sport_id="badminton"):
         "show_skeletons": True,
         "show_player_trajectories": True,
         "show_court_trajectory": True,
+        "show_shuttlecock_detection": True,
         "show_shuttlecock_trajectory": True,
         "show_player_stats": True,
         "show_pose_roi": False,
         "visualize_positions": True,
-        "output_video_style": "skeleton",
-        # Data is the production contract. Rendering and media export are
-        # explicit diagnostics/review options rather than default compute.
-        "generate_annotated_video": False,
-        "browser_video_reencode": False,
+        # The user-facing default keeps the source footage and layers analysis on top.
+        # ``skeleton`` remains available as a deliberate data-visualisation style.
+        "output_video_style": "annotated",
+        # A complete analysis run includes a reviewable, browser-playable
+        # annotated video by default. Clients can opt out only explicitly.
+        "generate_annotated_video": True,
+        "browser_video_reencode": True,
         # Fixed-camera production keeps a timestamped 10 Hz pose budget.  A
         # caller can still explicitly request 0 for an offline full-frame
         # evidence run, but it is not suitable as the streaming default.
         "pose_imgsz": 960,
-        # One shared cadence for all measurement-producing components.  The
-        # legacy pose_sample_hz key remains accepted for older business
-        # clients, but is normalized to this value below.
+        # Pose, identity tracking and player JSONL cadence.  The legacy
+        # pose_sample_hz key remains accepted for older business clients.
         "analysis_sample_hz": 10.0,
         "pose_sample_hz": 10.0,
+        # Shuttle detection may run more often than pose inference.  When it
+        # is omitted, normalize it to the pose cadence for old clients.
+        "shuttle_sample_hz": 10.0,
         "pose_conf": 0.15,
-        "far_player_enhancement": False,
+        # Doubles/Auto benefit from a second far-court pose pass; clients may
+        # explicitly disable it for a speed-first local experiment.
+        "far_player_enhancement": True,
         "far_pose_roi": [0.12, 0.30, 0.86, 0.82],
-        "match_mode": "singles",
+        "match_mode": "auto",
         "lock_match_roster": True,
         "roster_stable_frames": 2,
+        # Auto mode gets a short, bounded observation window to distinguish
+        # two from four people, then freezes the roster and Track IDs. This is
+        # a timing policy only; it does not add any pose/GPU inference.
+        "roster_discovery_seconds": 3.0,
         # ByteTrack is the production association source. It is invoked only
         # on the same timestamp buckets as pose/shuttle/JSONL measurement;
         # it never turns a 10/15/30 Hz task back into full-frame tracking.
@@ -333,6 +386,8 @@ def _parse_options(value, *, sport_id="badminton"):
         options["pose_sample_hz"] = options["analysis_sample_hz"]
     else:
         options["analysis_sample_hz"] = options["pose_sample_hz"]
+    if "shuttle_sample_hz" not in received:
+        options["shuttle_sample_hz"] = options["analysis_sample_hz"]
     if options["pose_imgsz"] not in {640, 960, 1280}:
         raise HTTPException(status_code=422, detail="pose_imgsz must be 640, 960, or 1280")
     sample_hz = float(options["analysis_sample_hz"])
@@ -341,19 +396,30 @@ def _parse_options(value, *, sport_id="badminton"):
             status_code=422,
             detail="analysis_sample_hz must be 0 (every source frame) or at least 1",
         )
+    shuttle_sample_hz = float(options["shuttle_sample_hz"])
+    if shuttle_sample_hz < 0.0 or (0.0 < shuttle_sample_hz < 1.0):
+        raise HTTPException(
+            status_code=422,
+            detail="shuttle_sample_hz must be 0 (every source frame) or at least 1",
+        )
     if not 0 < float(options["pose_conf"]) <= 1:
         raise HTTPException(status_code=422, detail="pose_conf must be in (0, 1]")
     if options["output_video_style"] not in {"annotated", "skeleton"}:
         raise HTTPException(status_code=422, detail="output_video_style must be annotated or skeleton")
-    for key in ("generate_annotated_video", "browser_video_reencode", "enable_huji_play_state"):
+    for key in (
+        "generate_annotated_video", "browser_video_reencode", "enable_huji_play_state",
+        "show_skeletons", "show_player_trajectories", "show_court_trajectory",
+        "show_shuttlecock_detection", "show_shuttlecock_trajectory", "show_player_stats",
+        "show_pose_roi",
+    ):
         if not isinstance(options[key], bool):
             raise HTTPException(status_code=422, detail=f"{key} must be a JSON boolean")
     if not options["generate_annotated_video"]:
         # There is no media source to transcode. Keep the persisted option
         # truthful so the terminal performance trace explains the omission.
         options["browser_video_reencode"] = False
-    if options["match_mode"] not in {"singles", "doubles"}:
-        raise HTTPException(status_code=422, detail="match_mode must be singles or doubles")
+    if options["match_mode"] not in {"auto", "singles", "doubles"}:
+        raise HTTPException(status_code=422, detail="match_mode must be auto, singles, or doubles")
     if options["tracker_backend"] not in {"court_association", "bytetrack"}:
         raise HTTPException(status_code=422, detail="tracker_backend must be court_association or bytetrack")
     if not isinstance(options["enable_bytetrack"], bool):
@@ -365,6 +431,14 @@ def _parse_options(value, *, sport_id="badminton"):
         )
     if options["shuttle_detector"] not in {"none", "yolo", "tracknet_v3"}:
         raise HTTPException(status_code=422, detail="shuttle_detector must be none, yolo, or tracknet_v3")
+    # Ball layers cannot exist when the ball detector was deliberately disabled.
+    # Keep this invariant at the public API boundary, so every caller gets the
+    # same truthful annotated-video output.
+    if options["shuttle_detector"] == "none":
+        options["show_shuttlecock_detection"] = False
+        options["show_shuttlecock_trajectory"] = False
+    elif not options["show_shuttlecock_detection"]:
+        options["show_shuttlecock_trajectory"] = False
     if float(options["movement_rally_settle_seconds"]) not in {0.5, 0.7, 1.0}:
         raise HTTPException(
             status_code=422,
@@ -381,6 +455,7 @@ def _parse_options(value, *, sport_id="badminton"):
     options["roster_stable_frames"] = int(options["roster_stable_frames"])
     options["analysis_sample_hz"] = float(options["analysis_sample_hz"])
     options["pose_sample_hz"] = options["analysis_sample_hz"]
+    options["shuttle_sample_hz"] = float(options["shuttle_sample_hz"])
     options["movement_rally_settle_seconds"] = float(options["movement_rally_settle_seconds"])
     options["enable_huji_play_state"] = bool(options["enable_huji_play_state"])
     options["match_session_ref"] = (

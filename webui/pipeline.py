@@ -52,7 +52,7 @@ def resolve_full_video_models(sport_id, options):
             f"shuttle_detector={detector} is not allowed for sport_id={sport_id}"
         )
     match_policy = {
-        "match_mode": "singles" if sport_id == "tennis" else options.get("match_mode", "singles"),
+        "match_mode": "singles" if sport_id == "tennis" else options.get("match_mode", "auto"),
         "lock_match_roster": True if mode.expected_player_count is not None else bool(options.get("lock_match_roster", True)),
         "session_mode": mode.session_mode,
         "expected_player_count": mode.expected_player_count,
@@ -326,7 +326,11 @@ def _is_webui_output_directory(name):
 
 def _default_analysis_output_dir(video_path, timestamp):
     """Create a readable result folder whose first sortable field is time."""
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    # Jobs may be created by a Windows client while this worker runs on macOS
+    # or Linux.  ``os.path.basename`` only recognises the local separator, so
+    # normalise the foreign separator before deriving the portable folder name.
+    portable_path = str(video_path).replace("\\", "/")
+    video_name = os.path.splitext(os.path.basename(portable_path))[0]
     safe_name = _SAFE_OUTPUT_STEM_PATTERN.sub("_", video_name).strip(" ._") or "video"
     # Leave room for the output root and generated artifacts on Windows.
     return os.path.join("outputs", f"{timestamp}_webui_{safe_name[:80]}")
@@ -745,27 +749,35 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     show_skeletons = options.get("show_skeletons", True)
     show_player_trajectories = options.get("show_player_trajectories", True)
     show_court_trajectory = options.get("show_court_trajectory", True)
+    show_shuttlecock_detection = options.get("show_shuttlecock_detection", True)
     show_shuttlecock_trajectory = options.get("show_shuttlecock_trajectory", True)
     show_player_stats = options.get("show_player_stats", True)
     show_pose_roi = options.get("show_pose_roi", True)
     visualize_positions = options.get("visualize_positions", True)
     output_video_style = options.get("output_video_style", "annotated")
     pose_imgsz = int(options.get("pose_imgsz", 960))
-    # All evidence-producing components share this cadence.  The legacy pose
-    # option is retained as a fallback for saved tasks submitted before this
-    # option was introduced.
+    # Pose/tracking cadence; legacy pose_sample_hz remains a fallback for
+    # saved tasks submitted before analysis_sample_hz was introduced.
     analysis_sample_hz = float(options.get("analysis_sample_hz", options.get("pose_sample_hz", 10.0)))
+    # A more frequent shuttle cadence preserves hit/flight evidence without
+    # forcing equally expensive pose inference on every ball sample.
+    shuttle_sample_hz = float(options.get("shuttle_sample_hz", analysis_sample_hz))
     pose_conf = float(options.get("pose_conf", 0.15))
-    far_player_enhancement = bool(options.get("far_player_enhancement", False))
+    far_player_enhancement = bool(options.get("far_player_enhancement", True))
     far_pose_roi = options.get("far_pose_roi", (0.12, 0.30, 0.86, 0.82))
     # ByteTrack only receives already-sampled pose detections. The shared
     # timestamp cadence remains the sole detector/tracker update budget.
     tracker_backend = options.get("tracker_backend", "bytetrack")
     enable_bytetrack = bool(options.get("enable_bytetrack", True))
     roster_stable_frames = int(options.get("roster_stable_frames", 2))
+    roster_discovery_seconds = float(options.get("roster_discovery_seconds", 3.0))
     shuttle_detector = options.get("shuttle_detector", "yolo")
     if shuttle_detector not in {"none", "yolo", "tracknet_v3"}:
         raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
+    # Rendering follows the selected detector and the explicit layer switches.
+    # Analysis can still retain its evidence while a user hides a visual layer.
+    show_shuttlecock_detection = bool(show_shuttlecock_detection) and shuttle_detector != "none"
+    show_shuttlecock_trajectory = bool(show_shuttlecock_trajectory) and show_shuttlecock_detection
     match_mode = model_config["match_mode"]
     lock_match_roster = model_config["lock_match_roster"]
     yolo_pose_model = model_config["pose_model_path"]
@@ -790,6 +802,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         show_skeletons=show_skeletons,
         show_player_trajectories=show_player_trajectories,
         show_court_trajectory=show_court_trajectory,
+        show_shuttlecock_detection=show_shuttlecock_detection,
         show_shuttlecock_trajectory=show_shuttlecock_trajectory,
         show_player_stats=show_player_stats,
         show_performance_stats=False,
@@ -806,6 +819,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         pose_imgsz=pose_imgsz,
         pose_sample_hz=analysis_sample_hz,
         analysis_sample_hz=analysis_sample_hz,
+        shuttle_sample_hz=shuttle_sample_hz,
         pose_conf=pose_conf,
         far_player_enhancement=far_player_enhancement,
         far_pose_roi=far_pose_roi,
@@ -814,6 +828,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         enable_bytetrack=enable_bytetrack,
         lock_match_roster=lock_match_roster,
         roster_stable_frames=roster_stable_frames,
+        roster_discovery_seconds=roster_discovery_seconds,
         shuttle_detector=shuttle_detector,
         tracknet_measurements_path=tracknet_measurements_path,
         movement_rally_settle_seconds=movement_rally_settle_seconds,
@@ -864,6 +879,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         )
 
     position_evidence_summary = None
+    player_portraits = {}
     if visualize_positions and has_detections:
         visualizations_t0 = time.perf_counter()
         _emit_analysis_stage(state_cb, "post_processing", "position_visualizations")
@@ -872,7 +888,10 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         # v2 files keep a durable spatial track for every person.  Use that
         # contract first so doubles never collapse into legacy upper/lower
         # display slots.  Old result files still use their original renderer.
-        from badminton_analysis.visualization.spatial_player_positions import analyze_spatial_track_positions
+        from badminton_analysis.visualization.spatial_player_positions import (
+            analyze_spatial_track_positions,
+            extract_high_confidence_player_portraits,
+        )
         position_result = analyze_spatial_track_positions(
             system.detections_path,
             vis_dir,
@@ -888,8 +907,13 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         else:
             visualization_ok = bool(position_result.get("success"))
             position_evidence_summary = position_result.get("summary_path")
+            player_portraits = extract_high_confidence_player_portraits(
+                video_path,
+                system.detections_path,
+                vis_dir,
+            )
             track_summaries = (position_result.get("summary") or {}).get("tracks") or {}
-            if match_mode == "doubles" and len(track_summaries) < 4:
+            if system.match_mode == "doubles" and len(track_summaries) < 4:
                 warnings.append(
                     "双打名册未形成四条轨迹：本次只输出已实际追踪到的人员热力图，不能据此做四人能力对比。"
                 )
@@ -955,6 +979,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
         "movement_rallies": (getattr(system, "offline_artifacts", None) or {}).get("rallies_path"),
         "movement_rally_window_sweep": (getattr(system, "offline_artifacts", None) or {}).get("rally_window_sweep_path"),
         "position_evidence_summary": position_evidence_summary,
+        "player_portraits": player_portraits,
         "derived": getattr(system, "offline_artifacts", None),
         "execution_metrics": execution_metrics,
         "visualizations": [],

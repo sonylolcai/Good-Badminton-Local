@@ -53,6 +53,7 @@ class PersonOnlyTracker:
         max_missed_frames: int = 12,
         max_retained_missing_frames: Optional[int] = None,
         max_speed_mps: float = 10.0,
+        match_mode: str = "person_only",
         lock_match_roster: bool = False,
         expected_roster_count: Optional[int] = None,
         roster_stable_frames: int = 3,
@@ -129,6 +130,9 @@ class PersonOnlyTracker:
         ]
         self.fps = float(fps)
         self.tracker_backend = tracker_backend
+        self.match_mode = str(match_mode)
+        if self.match_mode not in {"auto", "singles", "doubles", "person_only"}:
+            raise ValueError("match_mode must be auto, singles, doubles, or person_only")
         self.lock_match_roster = bool(lock_match_roster)
         self.expected_roster_count = (
             None if expected_roster_count is None else int(expected_roster_count)
@@ -150,7 +154,7 @@ class PersonOnlyTracker:
             max_missed_frames=max_missed_frames,
             max_retained_missing_frames=max_retained_missing_frames,
             max_speed_mps=max_speed_mps,
-            match_mode="person_only",
+            match_mode=self.match_mode,
             lock_match_roster=self.lock_match_roster,
             expected_roster_count=self.expected_roster_count,
             roster_stable_frames=self.roster_stable_frames,
@@ -441,6 +445,7 @@ class PersonOnlyTracker:
             "athlete_observation_lateral_margin_m": self.athlete_observation_lateral_margin_m,
             "athlete_observation_baseline_margin_m": self.athlete_observation_baseline_margin_m,
             "lock_match_roster": self.lock_match_roster,
+            "match_mode": self.match_mode,
             "expected_roster_count": self._tracker.expected_roster_count,
             "roster_stable_frames": self.roster_stable_frames,
             "max_roster_count": self.max_roster_count,
@@ -516,6 +521,8 @@ class PersonOnlyTracker:
             raise ValueError("person_only checkpoint vision profile does not match")
         if bool(state.get("lock_match_roster", False)) != self.lock_match_roster:
             raise ValueError("person_only roster lock setting does not match")
+        if state.get("match_mode", "person_only") != self.match_mode:
+            raise ValueError("person_only checkpoint match mode does not match")
         if (
             self.expected_roster_count is not None
             and state.get("expected_roster_count") != self.expected_roster_count

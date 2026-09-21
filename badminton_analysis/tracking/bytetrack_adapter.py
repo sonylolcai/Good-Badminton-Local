@@ -66,7 +66,11 @@ class ByteTrackAdapter:
         track_high_thresh: float = 0.25,
         track_low_thresh: float = 0.10,
         new_track_thresh: float = 0.30,
-        match_thresh: float = 0.80,
+        # Far-court badminton poses change scale and overlap quickly between
+        # 10 Hz samples. The generic 0.80 IoU gate fragments a player even
+        # when the pose detector keeps seeing them; 0.50 retains that temporal
+        # continuity while the fixed-court roster remains the second guard.
+        match_thresh: float = 0.50,
         tracker_factory: Optional[Callable[[Any], Any]] = None,
     ):
         self.fps = float(fps)

@@ -4,6 +4,8 @@ import time
 import cv2
 import numpy as np
 
+from .yolo_pose import resolve_ultralytics_device
+
 try:
     import torch
 except Exception:
@@ -28,6 +30,9 @@ class ShuttlecockTracker:
         max_prediction_frames=3,
         prediction_confidence_decay=0.6,
         required_class_names=None,
+        measurement_fps=30.0,
+        speed_window_seconds=1.0,
+        device="auto",
     ):
         self.yolo_ball_model = yolo_ball_model
         self.trajectory_length = trajectory_length
@@ -45,11 +50,20 @@ class ShuttlecockTracker:
             str(name) for name in (required_class_names or ())
         )
         self.required_class_ids = self._resolve_required_class_ids()
+        self.measurement_fps = float(measurement_fps)
+        self.speed_window_seconds = float(speed_window_seconds)
         if not 0.0 <= self.prediction_confidence_decay <= 1.0:
             raise ValueError("prediction_confidence_decay must be between 0 and 1")
+        if self.measurement_fps <= 0.0:
+            raise ValueError("measurement_fps must be greater than 0")
+        if self.speed_window_seconds <= 0.0:
+            raise ValueError("speed_window_seconds must be greater than 0")
 
         self.shuttlecock_trajectory = deque(maxlen=trajectory_length)
         self.actual_history = deque(maxlen=trajectory_length)
+        # Predicted locations may improve the display, but never become speed
+        # evidence. This list contains observed ball measurements only.
+        self.speed_history = deque(maxlen=max(2, trajectory_length))
         self.last_valid_position = None
         self.last_valid_confidence = None
         self.last_candidate = None
@@ -57,10 +71,7 @@ class ShuttlecockTracker:
         self.missing_frames = 0
         self.frame_index = 0
 
-        if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
-            self.ultra_device = 0
-        else:
-            self.ultra_device = "cpu"
+        self.ultra_device = resolve_ultralytics_device(device)
 
     def detect_ball(self, frame, conf=0.18, roi_corners=None):
         t0 = time.time()
@@ -205,6 +216,8 @@ class ShuttlecockTracker:
                     "source": "constant_velocity",
                     "gap_frames": self.missing_frames,
                     "rejection_reason": reason,
+                    "speed_px_s": None,
+                    "speed_status": "no_fresh_ball_measurement",
                 }
             )
             return [float(predicted[0]), float(predicted[1])]
@@ -391,9 +404,63 @@ class ShuttlecockTracker:
     def _append_valid_point(self, point):
         self.shuttlecock_trajectory.append(point)
         self.actual_history.append((self.frame_index, point))
+        self.speed_history.append((self.frame_index, point))
         self.last_valid_position = point
         self.last_valid_confidence = self.last_detection.get("confidence")
         self.missing_frames = 0
+        self._update_speed_estimate()
+
+    def set_measurement_fps(self, value):
+        """Set the actual ball-measurement cadence after video metadata loads."""
+        value = float(value)
+        if value <= 0.0:
+            raise ValueError("measurement_fps must be greater than 0")
+        self.measurement_fps = value
+
+    def _update_speed_estimate(self):
+        """Expose a one-second, observed-only image-plane speed estimate."""
+        history = list(self.speed_history)
+        base = {
+            "speed_px_s": None,
+            "speed_window_seconds": self.speed_window_seconds,
+            "speed_measurement_count": len(history),
+            "speed_status": "not_enough_fresh_ball_measurements",
+            "speed_basis": "one_second_observed_image_trajectory",
+        }
+        if len(history) < 2:
+            self.last_detection.update(base)
+            return
+        latest_frame = history[-1][0]
+        window_frames = max(1, int(round(self.measurement_fps * self.speed_window_seconds)))
+        window = [item for item in history if item[0] >= latest_frame - window_frames]
+        if len(window) < 2:
+            self.last_detection.update(base)
+            return
+        start_frame, _ = window[0]
+        end_frame, _ = window[-1]
+        elapsed_seconds = (end_frame - start_frame) / self.measurement_fps
+        if elapsed_seconds <= 0.0:
+            self.last_detection.update(base)
+            return
+        # A long detection gap would turn an unknown flight into a fabricated
+        # low speed. Do not label speed until fresh observations resume.
+        max_gap_frames = max(1, int(round(self.measurement_fps * 0.35)))
+        if any(right[0] - left[0] > max_gap_frames for left, right in zip(window, window[1:])):
+            base["speed_status"] = "measurement_gap_too_long"
+            self.last_detection.update(base)
+            return
+        distance_px = sum(
+            self._distance(left[1], right[1]) for left, right in zip(window, window[1:])
+        )
+        base.update(
+            {
+                "speed_px_s": round(distance_px / elapsed_seconds, 1),
+                "speed_measurement_count": len(window),
+                "speed_status": "measured",
+                "speed_elapsed_seconds": round(elapsed_seconds, 3),
+            }
+        )
+        self.last_detection.update(base)
 
     def _record_missing_detection(self):
         self.missing_frames += 1
@@ -408,6 +475,8 @@ class ShuttlecockTracker:
         self.last_detection["source"] = None
         self.last_detection["gap_frames"] = self.missing_frames
         self.last_detection["rejection_reason"] = reason
+        self.last_detection["speed_px_s"] = None
+        self.last_detection["speed_status"] = "no_fresh_ball_measurement"
 
     def _empty_detection_state(self):
         return {
@@ -422,6 +491,11 @@ class ShuttlecockTracker:
             "source": None,
             "gap_frames": 0,
             "rejection_reason": None,
+            "speed_px_s": None,
+            "speed_window_seconds": self.speed_window_seconds,
+            "speed_measurement_count": 0,
+            "speed_status": "not_enough_fresh_ball_measurements",
+            "speed_basis": "one_second_observed_image_trajectory",
         }
 
     def _distance(self, point_a, point_b):
@@ -444,6 +518,18 @@ class ShuttlecockTracker:
         latest_point = self._as_drawable_pixel(points[-1])
         if latest_point is not None:
             cv2.circle(frame, latest_point, 6, (0, 165, 255), thickness=-1, lineType=cv2.LINE_AA)
+            speed_px_s = self.last_detection.get("speed_px_s")
+            if self.last_detection.get("status") == "detected" and speed_px_s is not None:
+                cv2.putText(
+                    frame,
+                    f"Shuttle speed: {float(speed_px_s):.0f} px/s",
+                    (latest_point[0] + 10, max(22, latest_point[1] - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (0, 215, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
         if self.show_performance_stats:
             print(f"Drawing shuttlecock trajectory took {time.time() - t0:.2f} sec")
@@ -460,6 +546,7 @@ class ShuttlecockTracker:
     def clear_trajectory(self):
         self.shuttlecock_trajectory.clear()
         self.actual_history.clear()
+        self.speed_history.clear()
         self.last_valid_position = None
         self.last_valid_confidence = None
         self.last_candidate = None

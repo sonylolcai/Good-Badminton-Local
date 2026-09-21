@@ -41,6 +41,11 @@ class _DelayedTwoPersonByteTracker:
 class MultiTrackModeTests(unittest.TestCase):
     CORNERS = [(0, 0), (610, 0), (610, 1340), (0, 1340)]
 
+    def test_bytetrack_uses_far_court_continuity_match_threshold(self):
+        """Fixed-camera far players need a less brittle IoU association gate."""
+        adapter = ByteTrackAdapter(fps=10, tracker_factory=_FakeByteTracker)
+        self.assertEqual(0.50, adapter.config["match_thresh"])
+
     def test_doubles_keeps_four_independent_tracks_and_team_is_not_court_side(self):
         pipeline = FixedCameraMatchPipeline(self.CORNERS, fps=10, match_mode="doubles")
         first = pipeline.update(
@@ -160,6 +165,48 @@ class MultiTrackModeTests(unittest.TestCase):
             "unassigned_after_locked_roster_association",
         )
 
+    def test_auto_mode_resolves_to_doubles_when_four_stable_tracks_appear(self):
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="auto",
+            lock_match_roster=True,
+            roster_stable_frames=1,
+        )
+        resolved = pipeline.update(
+            1,
+            [
+                self._observation((1.0, 1.0), None),
+                self._observation((5.0, 1.0), None),
+                self._observation((1.0, 12.0), None),
+                self._observation((5.0, 12.0), None),
+            ],
+            None,
+        )
+
+        self.assertEqual(resolved["match"]["requested_mode"], "auto")
+        self.assertEqual(resolved["match"]["mode"], "doubles")
+        self.assertEqual(resolved["match_roster"]["expected_player_count"], 4)
+        self.assertEqual(resolved["match_roster"]["status"], "locked")
+
+    def test_auto_mode_resolves_to_singles_only_after_the_discovery_window(self):
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=1,
+            match_mode="auto",
+            lock_match_roster=True,
+            roster_stable_frames=1,
+        )
+        observations = [self._observation((1.0, 1.0), None), self._observation((5.0, 12.0), None)]
+        pending = pipeline.update(1, observations, None)
+        self.assertEqual(pending["match"]["mode"], "auto")
+        for frame_index in range(2, 10):
+            resolved = pipeline.update(frame_index, observations, None)
+
+        self.assertEqual(resolved["match"]["requested_mode"], "auto")
+        self.assertEqual(resolved["match"]["mode"], "singles")
+        self.assertEqual(resolved["match_roster"]["expected_player_count"], 2)
+
     def test_bytetrack_roster_waits_for_confirmed_association_keys(self):
         """Do not bind durable roster IDs before ByteTrack has confirmed them."""
         pipeline = FixedCameraMatchPipeline(
@@ -229,6 +276,162 @@ class MultiTrackModeTests(unittest.TestCase):
         self.assertEqual(locked_roster["status"], "locked")
         self.assertEqual({item["status"] for item in replaced}, {"predicted"})
         self.assertEqual(tracker.roster_summary()["unassigned_observation_count"], 2)
+
+    def test_locked_singles_recovers_one_new_bytetrack_key_when_the_other_player_matches(self):
+        """A two-person roster has no third-player ambiguity for this frame."""
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS),
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            expected_roster_count=2,
+            max_roster_count=2,
+            roster_stable_frames=1,
+            roster_discovery_seconds=0.0,
+            require_association_keys=True,
+        )
+        initial = [
+            self._observation((2.0, 2.0), "bytetrack_a"),
+            self._observation((4.0, 11.0), "bytetrack_b"),
+        ]
+        tracker.update(1, initial)
+        tracker.update(2, initial)
+
+        recovered = tracker.update(
+            3,
+            [
+                self._observation((2.1, 2.0), "bytetrack_a"),
+                self._observation((4.1, 10.9), "bytetrack_restarted"),
+            ],
+        )
+
+        self.assertEqual({item["status"] for item in recovered}, {"detected"})
+        self.assertIn(
+            "singles_roster_complement",
+            {item["association"]["source"] for item in recovered},
+        )
+        self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
+
+    def test_locked_singles_recovers_both_new_bytetrack_keys_by_unique_court_end(self):
+        """A two-player roster survives a simultaneous ByteTrack restart."""
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS),
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            expected_roster_count=2,
+            max_roster_count=2,
+            roster_stable_frames=1,
+            roster_discovery_seconds=0.0,
+            require_association_keys=True,
+        )
+        initial = [
+            self._observation((2.0, 2.0), "bytetrack_a"),
+            self._observation((4.0, 11.0), "bytetrack_b"),
+        ]
+        tracker.update(1, initial)
+        tracker.update(2, initial)
+
+        recovered = tracker.update(
+            3,
+            [
+                self._observation((2.2, 2.1), "bytetrack_restarted_upper"),
+                self._observation((3.8, 10.8), "bytetrack_restarted_lower"),
+            ],
+        )
+
+        self.assertEqual({item["status"] for item in recovered}, {"detected"})
+        self.assertEqual(
+            {item["association"]["source"] for item in recovered},
+            {"singles_roster_full_reacquisition"},
+        )
+        self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
+
+    def test_locked_doubles_recovers_both_new_bytetrack_pairs_by_court_end(self):
+        """Two simultaneous teammate ID fragments retain the four slots."""
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS),
+            fps=10,
+            match_mode="doubles",
+            lock_match_roster=True,
+            expected_roster_count=4,
+            max_roster_count=4,
+            roster_stable_frames=1,
+            roster_discovery_seconds=0.0,
+            require_association_keys=True,
+        )
+        initial = [
+            self._observation((1.0, 2.0), "bytetrack_a"),
+            self._observation((5.0, 2.4), "bytetrack_b"),
+            self._observation((1.2, 11.0), "bytetrack_c"),
+            self._observation((4.8, 10.6), "bytetrack_d"),
+        ]
+        tracker.update(1, initial)
+        tracker.update(2, initial)
+        recovered = tracker.update(
+            3,
+            [
+                self._observation((1.2, 2.1), "bytetrack_upper_a"),
+                self._observation((4.8, 2.3), "bytetrack_upper_b"),
+                self._observation((1.4, 10.9), "bytetrack_lower_a"),
+                self._observation((4.6, 10.7), "bytetrack_lower_b"),
+            ],
+        )
+
+        self.assertEqual({item["status"] for item in recovered}, {"detected"})
+        self.assertEqual(
+            {item["association"]["source"] for item in recovered},
+            {"doubles_team_pair_reacquisition"},
+        )
+        self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
+
+    def test_locked_doubles_recovers_visible_teammate_then_its_new_keyed_partner(self):
+        """One temporarily occluded teammate must not deadlock the whole roster."""
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS),
+            fps=10,
+            match_mode="doubles",
+            lock_match_roster=True,
+            expected_roster_count=4,
+            max_roster_count=4,
+            roster_stable_frames=1,
+            roster_discovery_seconds=0.0,
+            require_association_keys=True,
+        )
+        initial = [
+            self._observation((1.0, 2.0), "bytetrack_a"),
+            self._observation((5.0, 2.4), "bytetrack_b"),
+            self._observation((1.2, 11.0), "bytetrack_c"),
+            self._observation((4.8, 10.6), "bytetrack_d"),
+        ]
+        tracker.update(1, initial)
+        tracker.update(2, initial)
+
+        partial = tracker.update(
+            3,
+            [
+                self._observation((1.2, 2.1), "bytetrack_upper_a"),
+                self._observation((1.4, 10.9), "bytetrack_lower_a"),
+                self._observation((4.6, 10.7), "bytetrack_lower_b"),
+            ],
+        )
+        self.assertEqual(3, sum(item["status"] == "detected" for item in partial))
+        self.assertIn(
+            "doubles_team_side_reacquisition",
+            {item["association"]["source"] for item in partial},
+        )
+
+        complete = tracker.update(
+            4,
+            [
+                self._observation((1.3, 2.2), "bytetrack_upper_a"),
+                self._observation((4.7, 2.2), "bytetrack_upper_b"),
+                self._observation((1.5, 10.8), "bytetrack_lower_a"),
+                self._observation((4.5, 10.8), "bytetrack_lower_b"),
+            ],
+        )
+        self.assertEqual({item["status"] for item in complete}, {"detected"})
+        self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
 
     def test_expected_bytetrack_roster_restarts_discovery_when_key_set_changes(self):
         """Four transient tracker fragments cannot consume the full lock window."""
@@ -432,6 +635,42 @@ class MultiTrackModeTests(unittest.TestCase):
             {item["association"]["source"] for item in recovered["tracks"]},
         )
 
+    def test_locked_singles_assigns_the_only_remaining_pose_to_the_only_missing_track(self):
+        """A two-person match may use roster complement after a large pose jump."""
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="singles",
+            lock_match_roster=True,
+            roster_stable_frames=1,
+        )
+        initial = pipeline.update(
+            1,
+            [self._observation((5.5, 0.2), None), self._observation((4.0, 11.0), None)],
+            None,
+        )
+        missing_id = next(
+            item["track_id"] for item in initial["tracks"] if item["court_xy_m"] == [5.5, 0.2]
+        )
+
+        # Keep the lower player continuously associated while the upper
+        # player's Pose is absent long enough to exceed the metric recovery
+        # gate. The sole newly observed pose is still the only remaining
+        # singles participant, not a third roster member.
+        for frame_index in range(2, 32):
+            pipeline.update(frame_index, [self._observation((4.0, 11.0), None)], None)
+        recovered = pipeline.update(
+            32,
+            [self._observation((0.1, 0.2), None), self._observation((4.0, 11.0), None)],
+            None,
+        )
+
+        restored = next(item for item in recovered["tracks"] if item["track_id"] == missing_id)
+        self.assertEqual(restored["status"], "detected")
+        self.assertEqual(restored["association"]["source"], "singles_roster_complement")
+        self.assertGreaterEqual(restored["association"]["identity_confidence"], 0.7)
+        self.assertEqual(recovered["match_roster"]["unassigned_observation_count"], 0)
+
     def test_locked_doubles_roster_recovers_one_unambiguous_long_occlusion(self):
         """A real returning detection must reclaim its locked ID after overlap.
 
@@ -488,12 +727,12 @@ class MultiTrackModeTests(unittest.TestCase):
         )
         restored = next(item for item in recovered["tracks"] if item["track_id"] == first_end_a_id)
         self.assertEqual(restored["status"], "detected")
-        self.assertEqual(restored["association"]["source"], "roster_end_recovery")
-        self.assertLess(restored["association"]["identity_confidence"], 0.7)
+        self.assertEqual(restored["association"]["source"], "doubles_team_side_complement")
+        self.assertGreaterEqual(restored["association"]["identity_confidence"], 0.7)
         self.assertEqual(recovered["match_roster"]["unassigned_observation_count"], 0)
 
-    def test_locked_doubles_long_recovery_does_not_guess_between_two_same_end_people(self):
-        """Ambiguous same-end returns remain unassigned rather than switching IDs."""
+    def test_locked_doubles_long_pair_recovery_reclaims_the_fixed_court_end(self):
+        """Two long-missing teammates remain the known pair for that court end."""
         pipeline = FixedCameraMatchPipeline(
             self.CORNERS,
             fps=10,
@@ -530,13 +769,16 @@ class MultiTrackModeTests(unittest.TestCase):
             ],
             None,
         )
-        self.assertEqual(recovered["match_roster"]["unassigned_observation_count"], 2)
-        self.assertEqual(len(recovered["match_roster"]["unassigned_observations"]), 2)
-        missing_end_a = [
+        self.assertEqual(recovered["match_roster"]["unassigned_observation_count"], 0)
+        recovered_end_a = [
             item for item in recovered["tracks"]
-            if item["court_end"] == "end_a" and item["status"] == "missing"
+            if item["court_end"] == "end_a" and item["status"] == "detected"
         ]
-        self.assertEqual(len(missing_end_a), 2)
+        self.assertEqual(len(recovered_end_a), 2)
+        self.assertEqual(
+            {item["association"]["source"] for item in recovered_end_a},
+            {"doubles_team_pair_reacquisition"},
+        )
 
     def test_bytetrack_is_not_enabled_without_recorded_gate(self):
         with self.assertRaisesRegex(ValueError, "evaluation-gated"):

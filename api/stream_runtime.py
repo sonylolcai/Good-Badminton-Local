@@ -262,8 +262,11 @@ class YoloShuttleFrameProcessor:
         self.model_identity = deepcopy(model_identity) if model_identity else None
 
     def process_frame(self, frame, context: FrameContext):
-        detected = self.tracker.detect_ball(frame, roi_corners=self.court_corners)
-        self.tracker.update_trajectory(detected, roi_corners=self.court_corners)
+        # Court corners are calibration evidence, not a crop for a flying
+        # shuttle. A high clear can legitimately travel beyond the court's
+        # projection before returning to a player.
+        detected = self.tracker.detect_ball(frame, roi_corners=None)
+        self.tracker.update_trajectory(detected, roi_corners=None)
         state = self.tracker.get_last_detection()
         status = str(state.get("status") or "missing")
         evidence = "detected" if status == "detected" else "predicted" if status == "predicted" else "missing"
@@ -581,11 +584,12 @@ class StreamProcessorFactory:
             # accepted stream-session.v1 requests are normalised with the
             # explicit default (currently true) by ``stream_models``.
             lock_match_roster=bool(configuration.get("lock_match_roster", False)),
+            match_mode=str(configuration.get("match_mode", "person_only")),
             expected_roster_count=configuration.get("expected_player_count"),
             roster_stable_frames=int(configuration.get("roster_stable_frames", 3)),
             max_roster_count=int(configuration.get("max_roster_count", 4)),
             roster_discovery_seconds=float(
-                configuration.get("roster_discovery_seconds", 8.0)
+                configuration.get("roster_discovery_seconds", 3.0)
             ),
             court_dimensions_m=calibration["court_dimensions_m"],
             calibration_world_points_m=calibration["world_points_m"],

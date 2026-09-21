@@ -222,7 +222,13 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
     return downloaded
 
 
-def stream_roster_configuration(expected_player_count, *, sport_id="badminton", session_mode=None):
+def stream_roster_configuration(
+    expected_player_count=None,
+    *,
+    match_mode="auto",
+    sport_id="badminton",
+    session_mode=None,
+):
     """Return the fixed anonymous roster policy for one continuous match.
 
     Track IDs are runtime implementation details, not the number of people in
@@ -236,14 +242,25 @@ def stream_roster_configuration(expected_player_count, *, sport_id="badminton", 
     if sport_id == "tennis":
         if session_mode != "singles_match" or expected_player_count != 2:
             raise RemoteAnalysisError("网球当前只支持单打对打：固定 2 名运动员")
-    elif expected_player_count not in {2, 4}:
-        raise RemoteAnalysisError("羽毛球场上人数只能选择 2 人或 4 人")
+        resolved_mode = "singles"
+    else:
+        resolved_mode = str(match_mode or "auto").strip().lower()
+        if resolved_mode not in {"auto", "singles", "doubles"}:
+            raise RemoteAnalysisError("比赛模式必须为 Auto、单打或双打")
+        if resolved_mode == "auto" and expected_player_count is not None:
+            if expected_player_count not in {2, 4}:
+                raise RemoteAnalysisError("羽毛球场上人数只能是 2 人或 4 人")
+            # Compatibility for older callers.  The current UI supplies
+            # None for Auto, which preserves automatic opening discovery.
+            resolved_mode = "singles" if expected_player_count == 2 else "doubles"
+        expected_player_count = {"singles": 2, "doubles": 4}.get(resolved_mode)
     return {
         "lock_match_roster": True,
         "expected_player_count": expected_player_count,
         "roster_stable_frames": 3,
-        "max_roster_count": expected_player_count,
+        "max_roster_count": 4 if resolved_mode == "auto" else expected_player_count,
         "roster_discovery_seconds": 8.0,
+        "match_mode": resolved_mode,
     }
 
 
@@ -314,7 +331,8 @@ def iter_remote_two_second_stream(
         )
     stream_configuration.update(
         stream_roster_configuration(
-            int(options["expected_player_count"]),
+            options.get("expected_player_count"),
+            match_mode=options.get("match_mode", "auto"),
             sport_id=sport_id,
             session_mode=session_mode,
         )

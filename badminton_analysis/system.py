@@ -69,7 +69,8 @@ def load_runtime_dependencies():
 class BadmintonAnalysisSystem:
     def __init__(self, video_path, show_display=False,
                  show_skeletons=True, show_player_trajectories=True, 
-                 show_court_trajectory=True, show_shuttlecock_trajectory=True,
+                 show_court_trajectory=True, show_shuttlecock_detection=True,
+                 show_shuttlecock_trajectory=True,
                  show_player_stats=True, show_performance_stats=False, 
                  save_images=False, language='zh', output_dir=None,
                  ball_model_path='weights/yolo11s-ball.pt', template_path=None,
@@ -77,12 +78,14 @@ class BadmintonAnalysisSystem:
                  yolo_pose_model='yolo11n-pose.pt', show_pose_roi=True,
                  output_video_style='annotated', pose_imgsz=960,
                  pose_sample_hz=0.0, analysis_sample_hz=None,
+                 shuttle_sample_hz=None,
                  court_health_check_hz=2.0,
                  pose_conf=0.15, far_player_enhancement=False,
                  far_pose_roi=(0.12, 0.30, 0.86, 0.82), net_image_line=None,
                  match_mode='singles', tracker_backend='bytetrack',
                  enable_bytetrack=True, lock_match_roster=True,
-                 roster_stable_frames=2, shuttle_detector='yolo',
+                 roster_stable_frames=2, roster_discovery_seconds=3.0,
+                 shuttle_detector='yolo',
                  tracknet_measurements_path=None, huji_action_model=None,
                  huji_sample_hz=6.0, enable_huji_play_state=True,
                  movement_rally_settle_seconds=0.7, generate_annotated_video=False,
@@ -94,7 +97,8 @@ class BadmintonAnalysisSystem:
                  ball_tracker_class=None, ball_observation_identity=None,
                  athlete_observation_margin_m=0.35,
                  athlete_observation_lateral_margin_m=None,
-                 athlete_observation_baseline_margin_m=None):
+                 athlete_observation_baseline_margin_m=None,
+                 inference_device=None):
         self.video_path = video_path
         self.sport_id = str(sport_id)
         self.court_dimensions = tuple(float(value) for value in court_dimensions)
@@ -104,7 +108,7 @@ class BadmintonAnalysisSystem:
         self.expected_player_count = (
             int(expected_player_count)
             if expected_player_count is not None
-            else (2 if match_mode == 'singles' else 4)
+            else ({'singles': 2, 'doubles': 4}.get(match_mode))
         )
         self.calibration_scope = str(calibration_scope)
         self.athlete_observation_region = str(athlete_observation_region)
@@ -117,6 +121,10 @@ class BadmintonAnalysisSystem:
         self.language = language
         self.template_path = template_path
         self.ball_model_path = ball_model_path
+        self.inference_device = (
+            str(inference_device or os.environ.get("GOOD_BADMINTON_STREAM_DEVICE") or "auto")
+            .strip()
+        )
         if shuttle_detector not in {'none', 'yolo', 'tracknet_v3'}:
             raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
         self.shuttle_detector = shuttle_detector
@@ -142,15 +150,20 @@ class BadmintonAnalysisSystem:
         self.show_pose_roi = show_pose_roi
         self.pose_imgsz = int(pose_imgsz)
         # ``pose_sample_hz`` remains a compatible alias for older callers.
-        # New analysis work has one shared measurement cadence: pose, YOLO
-        # shuttle, temporal tracking, rally/hit derivation, and JSONL records
-        # are all produced only on these timestamps.
+        # Pose/identity/JSONL and shuttle inference may have independent
+        # cadences; an omitted shuttle rate retains the historical shared
+        # cadence for old callers.
         if analysis_sample_hz is None:
             analysis_sample_hz = pose_sample_hz
         self.analysis_sample_hz = float(analysis_sample_hz)
         if self.analysis_sample_hz < 0.0 or (0.0 < self.analysis_sample_hz < 1.0):
             raise ValueError("analysis_sample_hz must be 0 (every source frame) or at least 1")
         self.pose_sample_hz = self.analysis_sample_hz
+        self.shuttle_sample_hz = float(
+            self.analysis_sample_hz if shuttle_sample_hz is None else shuttle_sample_hz
+        )
+        if self.shuttle_sample_hz < 0.0 or (0.0 < self.shuttle_sample_hz < 1.0):
+            raise ValueError("shuttle_sample_hz must be 0 (every source frame) or at least 1")
         self.court_health_check_hz = float(court_health_check_hz)
         if self.court_health_check_hz <= 0.0:
             raise ValueError("court_health_check_hz must be greater than 0")
@@ -160,8 +173,8 @@ class BadmintonAnalysisSystem:
         self.far_player_enhancement = bool(far_player_enhancement)
         self.far_pose_roi = tuple(float(value) for value in far_pose_roi)
         self.net_image_line = net_image_line
-        if match_mode not in {'singles', 'doubles'}:
-            raise ValueError("match_mode must be 'singles' or 'doubles'.")
+        if match_mode not in {'auto', 'singles', 'doubles'}:
+            raise ValueError("match_mode must be 'auto', 'singles', or 'doubles'.")
         if tracker_backend not in {'court_association', 'bytetrack'}:
             raise ValueError("tracker_backend must be 'court_association' or 'bytetrack'.")
         self.match_mode = match_mode
@@ -169,6 +182,9 @@ class BadmintonAnalysisSystem:
         self.enable_bytetrack = bool(enable_bytetrack)
         self.lock_match_roster = bool(lock_match_roster)
         self.roster_stable_frames = max(1, int(roster_stable_frames))
+        self.roster_discovery_seconds = float(roster_discovery_seconds)
+        if self.roster_discovery_seconds < 0.0:
+            raise ValueError("roster_discovery_seconds must be non-negative")
         if output_video_style not in {'annotated', 'skeleton'}:
             raise ValueError(
                 "output_video_style must be 'annotated' or 'skeleton'."
@@ -185,7 +201,10 @@ class BadmintonAnalysisSystem:
         self.show_skeletons = show_skeletons
         self.show_player_trajectories = show_player_trajectories
         self.show_court_trajectory = show_court_trajectory
-        self.show_shuttlecock_trajectory = show_shuttlecock_trajectory
+        self.show_shuttlecock_detection = bool(show_shuttlecock_detection)
+        self.show_shuttlecock_trajectory = bool(
+            show_shuttlecock_trajectory and self.show_shuttlecock_detection
+        )
         self.show_player_stats = show_player_stats
         self.show_performance_stats = show_performance_stats
         self.save_images = save_images  
@@ -209,6 +228,7 @@ class BadmintonAnalysisSystem:
                 conf=self.pose_conf,
                 asymmetric=self.far_player_enhancement,
                 far_roi=self.far_pose_roi,
+                device=self.inference_device,
             )
         else:
             self.rtmpose_processor = RTMPoseProcessor(mode=self.pose_mode, pose_family=self.pose_family)
@@ -258,6 +278,7 @@ class BadmintonAnalysisSystem:
         }
         if tracker_class is ShuttlecockTracker:
             tracker_options["trajectory_length"] = 30
+            tracker_options["device"] = self.inference_device
             if self.shuttle_detector == 'yolo':
                 tracker_options["required_class_names"] = ("badminton",)
         self.shuttlecock_tracker = tracker_class(
@@ -284,6 +305,8 @@ class BadmintonAnalysisSystem:
         # cache is display-only: it is never written as a new detection or
         # passed back into tracking/analytics.
         self._last_spatial_state = None
+        self._last_ball_position = None
+        self._last_ball_detection_state = {}
 
         self.is_court_view_count = 0
         self.consecutive_non_court_frames = 0
@@ -321,6 +344,8 @@ class BadmintonAnalysisSystem:
                 "source_frames": 0,
                 "analysis_measurement_frames": 0,
                 "analysis_skipped_source_frames": 0,
+                "pose_measurement_frames": 0,
+                "shuttle_measurement_frames": 0,
                 "court_health_checks": 0,
                 "court_health_skipped_source_frames": 0,
             },
@@ -349,6 +374,11 @@ class BadmintonAnalysisSystem:
             "effective_analysis_sample_hz": (
                 float(self.fps) if self.analysis_sample_hz == 0
                 else min(float(self.fps), self.analysis_sample_hz)
+            ),
+            "requested_shuttle_sample_hz": self.shuttle_sample_hz,
+            "effective_shuttle_sample_hz": (
+                float(self.fps) if self.shuttle_sample_hz == 0
+                else min(float(self.fps), self.shuttle_sample_hz)
             ),
             "court_health_check_hz": min(float(self.fps), self.court_health_check_hz),
         })
@@ -395,6 +425,8 @@ class BadmintonAnalysisSystem:
         
 
         self.fps = fps
+        effective_shuttle_hz = fps if self.shuttle_sample_hz == 0.0 else min(fps, self.shuttle_sample_hz)
+        self.shuttlecock_tracker.set_measurement_fps(effective_shuttle_hz)
         self.performance_log_interval_frames = max(1, int(fps * 5))
         
 
@@ -435,6 +467,7 @@ class BadmintonAnalysisSystem:
             enable_bytetrack=self.enable_bytetrack,
             lock_match_roster=self.lock_match_roster,
             roster_stable_frames=self.roster_stable_frames,
+            roster_discovery_seconds=self.roster_discovery_seconds,
             shuttle_enabled=self.shuttle_detector != 'none',
             movement_rally_settle_seconds=self.movement_rally_settle_seconds,
             court_dimensions=self.court_dimensions,
@@ -528,6 +561,16 @@ class BadmintonAnalysisSystem:
                         if self.shuttle_detector == 'tracknet_v3'
                         else "yolo_model_confidence"
                     ),
+                    "requested_sample_hz": self.shuttle_sample_hz,
+                    "effective_sample_hz": (
+                        float(fps) if self.shuttle_sample_hz == 0
+                        else min(float(fps), self.shuttle_sample_hz)
+                    ),
+                    "sampling_policy": (
+                        "full_temporal_source" if self.shuttle_detector == 'tracknet_v3' else
+                        "every_source_frame" if self.shuttle_sample_hz == 0 else
+                        "independent timestamp buckets; shuttle inference may run more often than pose inference"
+                    ),
                     **self.ball_observation_identity,
                 },
                 "play_state": {
@@ -567,8 +610,7 @@ class BadmintonAnalysisSystem:
                     "raw_keypoint_contract": self.fixed_camera_match.tracker.pose_keypoint_contract(),
                     "sampling_policy": (
                         "every_source_frame" if self.analysis_sample_hz == 0 else
-                        "shared timestamp buckets: pose, shuttle, tracking and JSONL are measured together; "
-                        "skipped source frames create no detector or tracking evidence"
+                        "independent pose timestamp buckets; skipped source frames create no new pose or player JSONL evidence"
                     ),
                     "court_filter_margins_m": {
                         "lateral": self.player_pose_visualizer.court_filter_margin,
@@ -618,7 +660,7 @@ class BadmintonAnalysisSystem:
                     "zone_policy": "zone_id is transient court space; never identity, team, or side",
                     "legacy_compatibility": "players.upper/lower retained for existing consumers only",
                     "match_mode": self.match_mode,
-                    "max_players_per_team": 1 if self.match_mode == 'singles' else 2,
+                    "max_players_per_team": {'singles': 1, 'doubles': 2}.get(self.match_mode),
                     "backend": self.tracker_backend,
                     "bytetrack_enabled": self.tracker_backend == 'bytetrack',
                     "match_roster": (
@@ -688,8 +730,16 @@ class BadmintonAnalysisSystem:
             self._write_output_frame(output_frame, frame_count, out)
             return output_frame, detect_frame_count
 
-        analysis_was_sampled = self._should_sample_analysis(frame_count)
-        if not analysis_was_sampled:
+        pose_was_sampled = self._should_sample_pose(frame_count)
+        # TrackNetV3 produces a full-temporal measurement series before this
+        # loop, so consume it at every source frame. YOLO shuttle inference is
+        # scheduled independently from the comparatively expensive pose pass.
+        shuttle_detector = getattr(self, "shuttle_detector", "yolo")
+        shuttle_was_sampled = shuttle_detector != 'none' and (
+            shuttle_detector == 'tracknet_v3'
+            or self._should_sample_shuttle(frame_count)
+        )
+        if not pose_was_sampled and not shuttle_was_sampled:
             self.execution_metrics["sampling"]["analysis_skipped_source_frames"] += 1
             output_frame = self._create_output_frame(frame) if self._needs_visual_output() else frame
             if self._needs_visual_output() and self._last_spatial_state is not None:
@@ -703,29 +753,43 @@ class BadmintonAnalysisSystem:
             self._write_output_frame(output_frame, frame_count, out)
             return output_frame, detect_frame_count
 
-        self.execution_metrics["sampling"]["analysis_measurement_frames"] += 1
-        detect_frame_count += 1
-
         x1, y1 = roi_corners[0]
         x2, y2 = roi_corners[1]
-        roi = frame[y1:y2, x1:x2]
-        pose_t0 = time.perf_counter()
-        centroids, point_left_hands, point_right_hands = self.player_pose_visualizer.detect_players(roi, x1, y1)
-        self.pose_processed_frames += 1
-        pose_elapsed = time.perf_counter() - pose_t0
-        self._record_execution_metric("pose_inference", pose_elapsed)
+        pose_elapsed = 0.0
+        pose_data = {}
+        centroids = []
+        point_left_hands = {}
+        point_right_hands = {}
+        if pose_was_sampled:
+            self.execution_metrics["sampling"]["analysis_measurement_frames"] += 1
+            self.execution_metrics["sampling"]["pose_measurement_frames"] += 1
+            detect_frame_count += 1
+            roi = frame[y1:y2, x1:x2]
+            pose_t0 = time.perf_counter()
+            centroids, point_left_hands, point_right_hands = self.player_pose_visualizer.detect_players(roi, x1, y1)
+            self.pose_processed_frames += 1
+            pose_elapsed = time.perf_counter() - pose_t0
+            self._record_execution_metric("pose_inference", pose_elapsed)
+            pose_data = self.player_pose_visualizer.get_current_pose_data() or {}
 
-        if self.shuttle_detector == 'tracknet_v3':
+        ball_elapsed = 0.0
+        if shuttle_was_sampled and self.shuttle_detector == 'tracknet_v3':
+            self.execution_metrics["sampling"]["shuttle_measurement_frames"] += 1
             detected_ball_position = None
             ball_t0 = time.perf_counter()
             ball_position = self.shuttlecock_tracker.update_external_measurement(
                 self.tracknet_measurements.measurement_for_frame(frame_count - 1),
-                roi_corners=roi_corners,
+                roi_corners=None,
             )
-            self._record_execution_metric("shuttle_trajectory", time.perf_counter() - ball_t0)
-        elif self.shuttle_detector == 'yolo':
+            ball_elapsed = time.perf_counter() - ball_t0
+            self._record_execution_metric("shuttle_trajectory", ball_elapsed)
+        elif shuttle_was_sampled and self.shuttle_detector == 'yolo':
+            self.execution_metrics["sampling"]["shuttle_measurement_frames"] += 1
             ball_t0 = time.perf_counter()
-            ball_roi_corners = None if self.sport_id == 'tennis' else roi_corners
+            # A shuttle can be above, outside, or perspectively beyond the
+            # court while remaining the same in-flight object.  Court geometry
+            # is retained for terminal evidence, never as a detector crop.
+            ball_roi_corners = None
             detected_ball_position = self.shuttlecock_tracker.detect_ball(
                 frame, roi_corners=ball_roi_corners
             )
@@ -735,50 +799,64 @@ class BadmintonAnalysisSystem:
                 detected_ball_position, ball_roi_corners
             )
             self._record_execution_metric("shuttle_trajectory", time.perf_counter() - trajectory_t0)
+            ball_elapsed = time.perf_counter() - ball_t0
         else:
-            # An operator opt-out is not a missing/predicted ball track.
+            # Do not turn a skipped shuttle timestamp into a false missing
+            # measurement. Person-only analysis is the sole explicit opt-out.
+            if self.shuttle_detector == 'none' and pose_was_sampled:
+                trajectory_t0 = time.perf_counter()
+                ball_position = self.shuttlecock_tracker.mark_not_requested()
+                self._record_execution_metric("shuttle_trajectory", time.perf_counter() - trajectory_t0)
+            else:
+                ball_position = self._last_ball_position
             detected_ball_position = None
-            trajectory_t0 = time.perf_counter()
-            ball_position = self.shuttlecock_tracker.mark_not_requested()
-            self._record_execution_metric("shuttle_trajectory", time.perf_counter() - trajectory_t0)
-        ball_elapsed = 0.0
-        
 
-        pose_data = self.player_pose_visualizer.get_current_pose_data() or {}
-        spatial_t0 = time.perf_counter()
-        ball_detection_state = {
-            **self.shuttlecock_tracker.get_last_detection(),
-            **self.ball_observation_identity,
-        }
-        spatial_state = self.fixed_camera_match.update(
-            frame_index=frame_count,
-            observations=self._spatial_observations(pose_data.get("detections", [])),
-            shuttlecock=self._spatial_shuttle_input(
-                ball_position, ball_detection_state
-            ),
-            has_fresh_observations=True,
-        )
-        self._last_spatial_state = spatial_state
-        self._record_execution_metric("spatial_tracking", time.perf_counter() - spatial_t0)
-        self._emit_tracking_state(state_callback, frame_count, spatial_state)
-        player_t0 = time.perf_counter()
-        players = self.player_tracker.update(
-            frame_count,
-            centroids,
-            ball_position,
-            point_left_hands,
-            point_right_hands,
-            detect_frame_count,
-            pose_detections=pose_data.get("detections"),
-            ball_detection=ball_detection_state,
-            spatial_state=spatial_state,
-        )
-        player_elapsed = time.perf_counter() - player_t0
-        player_timing = getattr(self.player_tracker, "last_update_timing", {})
-        jsonl_elapsed = float(player_timing.get("jsonl_write_seconds", 0.0))
-        self._record_execution_metric("player_tracking", max(0.0, player_elapsed - jsonl_elapsed))
-        if jsonl_elapsed > 0.0:
-            self._record_execution_metric("jsonl_write", jsonl_elapsed)
+        if shuttle_was_sampled or (self.shuttle_detector == 'none' and pose_was_sampled):
+            ball_detection_state = {
+                **self.shuttlecock_tracker.get_last_detection(),
+                **self.ball_observation_identity,
+            }
+            self._last_ball_position = ball_position
+            self._last_ball_detection_state = ball_detection_state
+            spatial_t0 = time.perf_counter()
+            spatial_state = self.fixed_camera_match.update(
+                frame_index=frame_count,
+                observations=self._spatial_observations(pose_data.get("detections", [])),
+                shuttlecock=self._spatial_shuttle_input(ball_position, ball_detection_state),
+                has_fresh_observations=pose_was_sampled,
+            )
+            if (
+                self.match_mode == "auto"
+                and self.fixed_camera_match.match_mode in {"singles", "doubles"}
+            ):
+                self.match_mode = self.fixed_camera_match.match_mode
+                self.expected_player_count = self.fixed_camera_match.expected_player_count
+            self._last_spatial_state = spatial_state
+            self._record_execution_metric("spatial_tracking", time.perf_counter() - spatial_t0)
+            self._emit_tracking_state(state_callback, frame_count, spatial_state)
+        else:
+            ball_detection_state = self._last_ball_detection_state
+            spatial_state = self._last_spatial_state or self.fixed_camera_match.tracker.snapshot(frame_count)
+
+        if pose_was_sampled:
+            player_t0 = time.perf_counter()
+            self.player_tracker.update(
+                frame_count,
+                centroids,
+                ball_position,
+                point_left_hands,
+                point_right_hands,
+                detect_frame_count,
+                pose_detections=pose_data.get("detections"),
+                ball_detection=ball_detection_state,
+                spatial_state=spatial_state,
+            )
+            player_elapsed = time.perf_counter() - player_t0
+            player_timing = getattr(self.player_tracker, "last_update_timing", {})
+            jsonl_elapsed = float(player_timing.get("jsonl_write_seconds", 0.0))
+            self._record_execution_metric("player_tracking", max(0.0, player_elapsed - jsonl_elapsed))
+            if jsonl_elapsed > 0.0:
+                self._record_execution_metric("jsonl_write", jsonl_elapsed)
         
 
         if frame_count == 1 or not self.cached_movement_stats:
@@ -819,7 +897,7 @@ class BadmintonAnalysisSystem:
                 cv2.putText(output_frame, "Pose ROI", (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2, cv2.LINE_AA)
 
             shuttle_draw_t0 = time.time()
-            if self.shuttle_detector != 'none':
+            if self.shuttle_detector != 'none' and self.show_shuttlecock_detection:
                 self.shuttlecock_tracker.handle_visualization(output_frame)
             shuttle_draw_elapsed = time.time() - shuttle_draw_t0
 
@@ -929,13 +1007,21 @@ class BadmintonAnalysisSystem:
         return current_bucket != previous_bucket
 
     def _should_sample_analysis(self, frame_count):
-        """Return whether all model/data components run at this timestamp."""
+        """Return whether pose/player evidence runs at this timestamp."""
         sample_hz = float(getattr(self, "analysis_sample_hz", self.pose_sample_hz))
         return self._should_sample_at_rate(frame_count, sample_hz)
 
     def _should_sample_pose(self, frame_count):
-        """Backward-compatible alias for the shared analysis cadence."""
+        """Backward-compatible alias for the pose/player cadence."""
         return self._should_sample_analysis(frame_count)
+
+    def _should_sample_shuttle(self, frame_count):
+        """Return whether YOLO shuttle inference runs at this timestamp."""
+        if not hasattr(self, "shuttle_sample_hz"):
+            # Kept for direct callers/tests that construct a legacy system
+            # object without the new option.
+            return self._should_sample_analysis(frame_count)
+        return self._should_sample_at_rate(frame_count, self.shuttle_sample_hz)
 
     def _should_sample_court_health(self, frame_count):
         """Low-frequency fixed-camera template health check cadence."""
@@ -1034,6 +1120,8 @@ class BadmintonAnalysisSystem:
             "image_xy": ball_position,
             "confidence": ball_detection.get("confidence", 0.0),
             "detected": detected,
+            "speed_px_s": ball_detection.get("speed_px_s"),
+            "speed_status": ball_detection.get("speed_status"),
         }
 
     def _create_output_frame(self, source_frame):
@@ -1159,9 +1247,13 @@ class BadmintonAnalysisSystem:
             if os.path.isfile(self.metadata_path):
                 with open(self.metadata_path, "r", encoding="utf-8") as source:
                     metadata = json.load(source)
-                metadata.setdefault("temporal_tracking", {}).setdefault("players", {})[
-                    "match_roster"
-                ] = spatial_summary.get("match_roster")
+                player_metadata = metadata.setdefault("temporal_tracking", {}).setdefault("players", {})
+                player_metadata["match_roster"] = spatial_summary.get("match_roster")
+                player_metadata["match_mode"] = self.match_mode
+                player_metadata["max_players_per_team"] = {
+                    "singles": 1,
+                    "doubles": 2,
+                }.get(self.match_mode)
                 metadata.setdefault("models", {}).setdefault("pose", {})[
                     "processed_frame_count"
                 ] = int(self.pose_processed_frames)

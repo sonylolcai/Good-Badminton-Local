@@ -1,6 +1,7 @@
 import unittest
 
 from badminton_analysis.detection.shuttlecock import ShuttlecockTracker
+from badminton_analysis.analysis.fixed_camera_match import FixedCameraMatchPipeline
 
 
 class _NoopBallModel:
@@ -42,6 +43,43 @@ class ShuttlecockPredictionTests(unittest.TestCase):
         tracker.update_trajectory([0, 0])
         self.assertEqual(tracker.update_trajectory([0, 0]), [0, 0])
         self.assertEqual(tracker.get_last_detection()["status"], "missing")
+
+    def test_speed_uses_a_one_second_window_of_observed_points_only(self):
+        tracker = ShuttlecockTracker(_NoopBallModel(), measurement_fps=10)
+        for x in range(0, 101, 10):
+            tracker.update_trajectory([x, 100])
+        measured = tracker.get_last_detection()
+        self.assertEqual(measured["speed_status"], "measured")
+        self.assertAlmostEqual(measured["speed_px_s"], 100.0)
+
+        tracker.update_trajectory([0, 0])
+        self.assertIsNone(tracker.get_last_detection()["speed_px_s"])
+
+    def test_contact_candidate_uses_visible_hand_distance_not_court_metres(self):
+        pipeline = FixedCameraMatchPipeline(
+            [[0, 0], [600, 0], [600, 1200], [0, 1200]], fps=10,
+        )
+        tracks = [{
+            "track_id": "track_001",
+            "status": "detected",
+            "confidence": 0.9,
+            "court_xy_m": [2.0, 2.0],
+            "location_evidence": {
+                "is_current_measurement": True,
+                "bbox_xyxy": [80, 30, 200, 330],
+                "hands_image": {"left": None, "right": [150, 160]},
+            },
+        }]
+        shuttle = {
+            "status": "approximate",
+            "confidence": 0.9,
+            "image_xy": [165, 160],
+        }
+
+        events = pipeline._detect_hit_events(tracks, shuttle, 10)
+        self.assertEqual(events[0]["hitter_track_id"], "track_001")
+        self.assertEqual(events[0]["half_court_zone_id"], "rear_left")
+        self.assertEqual(pipeline._detect_hit_events(tracks, shuttle, 11), [])
 
 
 if __name__ == "__main__":

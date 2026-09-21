@@ -193,6 +193,7 @@ def validate_configuration(configuration):
         "max_roster_count",
         "expected_player_count",
         "roster_discovery_seconds",
+        "match_mode",
         "far_player_enhancement",
         "far_pose_roi",
         # These fields describe an anonymous visual mode.  They never carry
@@ -234,7 +235,8 @@ def validate_configuration(configuration):
         # The shared tracker can represent a one-person training roster.  The
         # per-sport profile rejects counts its mode does not support.
         "expected_player_count": configuration.get("expected_player_count"),
-        "roster_discovery_seconds": configuration.get("roster_discovery_seconds", 8.0),
+        "roster_discovery_seconds": configuration.get("roster_discovery_seconds", 3.0),
+        "match_mode": configuration.get("match_mode", "person_only"),
         # Fixed-camera far-half inference is an optional detection aid, not a
         # business identity rule.  It is opt-in because it changes the actual
         # inference plan; a camera profile may provide a tighter ROI.
@@ -245,6 +247,8 @@ def validate_configuration(configuration):
     normalized["lock_match_roster"] = _bool(
         normalized["lock_match_roster"], "lock_match_roster"
     )
+    if normalized["match_mode"] not in {"auto", "singles", "doubles", "person_only"}:
+        raise ValueError("match_mode must be auto, singles, doubles, or person_only")
     stable_frames = normalized["roster_stable_frames"]
     if isinstance(stable_frames, bool) or not 1 <= stable_frames <= 10:
         raise ValueError("roster_stable_frames must be an integer from 1 to 10")

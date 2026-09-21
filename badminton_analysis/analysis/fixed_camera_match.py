@@ -9,7 +9,7 @@ keeps future doubles rules outside the visual tracking layer.
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from math import hypot
+from math import hypot, isfinite
 from typing import Optional, Tuple
 
 from ..court.mapper import CourtMapper
@@ -190,8 +190,8 @@ class CourtMultiObjectTracker:
         athlete_observation_lateral_margin_m=None,
         athlete_observation_baseline_margin_m=None,
     ):
-        if match_mode not in {"singles", "doubles", "person_only"}:
-            raise ValueError("match_mode must be 'singles', 'doubles', or 'person_only'")
+        if match_mode not in {"auto", "singles", "doubles", "person_only"}:
+            raise ValueError("match_mode must be 'auto', 'singles', 'doubles', or 'person_only'")
         self.court_space = court_space
         self.fps = float(fps)
         self.max_missed_frames = int(max_missed_frames)
@@ -204,7 +204,7 @@ class CourtMultiObjectTracker:
             1 if match_mode == "singles" else 2 if match_mode == "doubles" else None
         )
         self.lock_match_roster = bool(lock_match_roster)
-        default_roster_count = 2 if match_mode == "singles" else 4
+        default_roster_count = 2 if match_mode == "singles" else 4 if match_mode == "doubles" else None
         # Anonymous streaming cannot ask the user whether a game is singles,
         # doubles, or an informal uneven game.  When roster locking is enabled
         # in ``person_only`` mode, a stable on-court count becomes the roster
@@ -212,7 +212,7 @@ class CourtMultiObjectTracker:
         # constraint, never a player/team/side identity claim.
         self.expected_roster_count = (
             None
-            if match_mode == "person_only" and expected_roster_count is None
+            if match_mode in {"person_only", "auto"} and expected_roster_count is None
             else int(expected_roster_count or default_roster_count)
         )
         if self.expected_roster_count is not None and self.expected_roster_count <= 0:
@@ -490,7 +490,19 @@ class CourtMultiObjectTracker:
 
     def _lock_discovered_roster(self, frame_index, reason):
         """Seal only the real IDs accumulated during the discovery window."""
-        self.expected_roster_count = len(self.roster_track_ids)
+        discovered_count = len(self.roster_track_ids)
+        # Auto mode has one explicit domain constraint: a badminton match is
+        # either 2 or 4 players. Three visible tracks mean the model has
+        # evidence of doubles but has not yet seen a fourth durable ID; keep
+        # discovery open rather than incorrectly freezing a three-person run.
+        if self.match_mode == "auto" and discovered_count not in {2, 4}:
+            self.roster_status = "discovering"
+            self._last_roster_reason = "auto_waiting_for_two_or_four_stable_tracks"
+            return self.snapshot(frame_index)
+        self.expected_roster_count = discovered_count
+        if self.match_mode == "auto":
+            self.match_mode = "singles" if discovered_count == 2 else "doubles"
+            self.max_players_per_team = 1 if self.match_mode == "singles" else 2
         self.roster_status = "locked"
         self.roster_locked_frame = int(frame_index)
         self._last_roster_reason = reason
@@ -551,16 +563,81 @@ class CourtMultiObjectTracker:
             unmatched_track_ids.remove(track_id)
             unmatched_observations.remove(index)
 
+        # A complete locked roster gives a useful, explicit fallback when a
+        # detector observation has no durable key. In singles the remaining
+        # pose belongs to the sole missing participant. In doubles, the same
+        # conclusion is permitted only inside one court half and only when a
+        # high-confidence teammate is already associated there.
+        for track_id, index in self._unambiguous_singles_complement_recoveries(
+            unmatched_track_ids,
+            unmatched_observations,
+            observations,
+        ):
+            assignments.append((track_id, index))
+            assignment_sources[(track_id, index)] = "singles_roster_complement"
+            unmatched_track_ids.remove(track_id)
+            unmatched_observations.remove(index)
+
+        # A brief detector loss or a hard camera cut can make ByteTrack issue
+        # new keys for both players at once. In a locked singles match, two
+        # live poses split one-per-court-end are the complete known roster,
+        # not two new people.
+        for track_id, index in self._complete_singles_roster_reacquisitions(
+            unmatched_track_ids,
+            unmatched_observations,
+            observations,
+        ):
+            assignments.append((track_id, index))
+            assignment_sources[(track_id, index)] = "singles_roster_full_reacquisition"
+            unmatched_track_ids.remove(track_id)
+            unmatched_observations.remove(index)
+
+        for track_id, index in self._unambiguous_doubles_teammate_recoveries(
+            unmatched_track_ids,
+            unmatched_observations,
+            observations,
+            assignments,
+        ):
+            assignments.append((track_id, index))
+            assignment_sources[(track_id, index)] = "doubles_team_side_complement"
+            unmatched_track_ids.remove(track_id)
+            unmatched_observations.remove(index)
+
+        # A fixed-court doubles view may lose both teammates' ByteTrack keys
+        # at once when far-player detections switch from the full frame to the
+        # far-court pass. The known roster still constrains each pair to one
+        # court end. Rebind only complete, high-confidence pairs, choosing the
+        # lower-motion one-to-one pairing inside that end.
+        for track_id, index in self._unambiguous_doubles_pair_reacquisitions(
+            unmatched_track_ids,
+            unmatched_observations,
+            observations,
+            frame_index,
+        ):
+            assignments.append((track_id, index))
+            assignment_sources[(track_id, index)] = "doubles_team_pair_reacquisition"
+            unmatched_track_ids.remove(track_id)
+            unmatched_observations.remove(index)
+
+        # If one teammate remains occluded, a short-gap high-confidence pose
+        # still belongs to one of the two known people on that current court
+        # end. Recover only the nearest recent slot; a following unique pose
+        # can then use the normal teammate-complement rule. This avoids an
+        # all-four deadlock after a simultaneous ByteTrack fragment.
+        for track_id, index in self._short_gap_doubles_end_reacquisitions(
+            unmatched_track_ids,
+            unmatched_observations,
+            observations,
+            frame_index,
+        ):
+            assignments.append((track_id, index))
+            assignment_sources[(track_id, index)] = "doubles_team_side_reacquisition"
+            unmatched_track_ids.remove(track_id)
+            unmatched_observations.remove(index)
+
         # After a long physical overlap, the normal motion gate deliberately
-        # expires.  In a locked doubles roster we may still recover a *real*
-        # returning pose when there is exactly one missing ID and exactly one
-        # unassigned detector observation on the same current court end.
-        #
-        # This is not a team/upper/lower identity rule: court end is only a
-        # short-lived spatial constraint at the recovery timestamp.  Two
-        # teammates returning on the same end remain unassigned rather than
-        # being guessed, and the recovered association is explicitly low
-        # confidence for downstream analytics.
+        # expires. Court-only doubles tracking may still recover a real
+        # returning pose from the unique current court-end candidate.
         if not self.require_association_keys:
             for track_id, index in self._unambiguous_long_gap_recoveries(
                 unmatched_track_ids,
@@ -709,7 +786,7 @@ class CourtMultiObjectTracker:
             "enabled": self.lock_match_roster,
             "status": self.roster_status,
             "expected_player_count": self.expected_roster_count if self.lock_match_roster else None,
-            "minimum_player_count": 2 if self.match_mode == "person_only" and self.lock_match_roster else None,
+            "minimum_player_count": 2 if self.match_mode in {"person_only", "auto"} and self.lock_match_roster else None,
             "maximum_player_count": self.max_roster_count if self.lock_match_roster else None,
             "discovery_seconds": self.roster_discovery_seconds if self.lock_match_roster else None,
             "discovery_started_frame": self._roster_discovery_started_frame,
@@ -994,9 +1071,16 @@ class CourtMultiObjectTracker:
             self._association_keys[association_key] = track.track_id
         metrics = self.track_metrics[track.track_id]
         metrics["detected_frames"] += 1
-        if association_source == "roster_end_recovery":
-            # This measurement is kept for review, but the long missing gap
-            # must not become a fabricated movement segment in player stats.
+        if association_source in {
+            "roster_end_recovery",
+            "singles_roster_complement",
+            "singles_roster_full_reacquisition",
+            "doubles_team_side_complement",
+            "doubles_team_pair_reacquisition",
+            "doubles_team_side_reacquisition",
+        }:
+            # This real measurement restores coverage, but a preceding
+            # association gap must not become a fabricated movement segment.
             metrics["recovered_detected_frames"] += 1
         else:
             metrics["distance_m"] += distance
@@ -1104,6 +1188,254 @@ class CourtMultiObjectTracker:
                 recoveries.append((candidates[0], detected[0]))
         return recoveries
 
+    def _unambiguous_singles_complement_recoveries(self, unmatched_track_ids, unmatched_observations, observations):
+        """Return the unique remaining raw pose for a locked two-person match.
+
+        This rule uses the match roster cardinality, not image position or a
+        fabricated prediction. It is therefore unavailable once a match has
+        more than two participants, and never overrides a ByteTrack key.
+        """
+        if not (
+            self.lock_match_roster
+            and self.match_mode == "singles"
+            and self.expected_roster_count == 2
+            and len(unmatched_track_ids) == 1
+            and len(unmatched_observations) == 1
+        ):
+            return []
+        index = next(iter(unmatched_observations))
+        # A changed ByteTrack key is a tracker fragment, not evidence of a
+        # third player, when the complete match roster is exactly two people
+        # and the other participant has already matched this frame.  In this
+        # unique one-to-one case, continuity is stronger than the new key.
+        return [(next(iter(unmatched_track_ids)), index)]
+
+    def _complete_singles_roster_reacquisitions(
+        self,
+        unmatched_track_ids,
+        unmatched_observations,
+        observations,
+    ):
+        """Reconnect both slots after a simultaneous singles ID restart.
+
+        This is narrower than a distance-only guess: it requires the entire
+        locked two-player roster and a unique observation in each current
+        court half. It does not apply to anonymous sessions or doubles.
+        """
+        if not (
+            self.lock_match_roster
+            and self.match_mode == "singles"
+            and self.expected_roster_count == 2
+            and len(unmatched_track_ids) == 2
+            and len(unmatched_observations) == 2
+        ):
+            return []
+
+        tracks_by_end = {}
+        for track_id in unmatched_track_ids:
+            court_end = self._court_end(self.tracks[track_id].court_xy)
+            if court_end is None or court_end in tracks_by_end:
+                return []
+            tracks_by_end[court_end] = track_id
+        observations_by_end = {}
+        for index in unmatched_observations:
+            court_end = self._court_end(observations[index].get("court_xy"))
+            if court_end is None or court_end in observations_by_end:
+                return []
+            observations_by_end[court_end] = index
+        if set(tracks_by_end) != set(observations_by_end):
+            return []
+        return [
+            (tracks_by_end[court_end], observations_by_end[court_end])
+            for court_end in sorted(tracks_by_end)
+        ]
+
+    def _unambiguous_doubles_teammate_recoveries(
+        self,
+        unmatched_track_ids,
+        unmatched_observations,
+        observations,
+        assignments,
+    ):
+        """Recover the unique missing teammate in one visible court half.
+
+        Both doubles teammates occupy the same court end at a rally timestamp.
+        This is a current spatial fact, not a permanent image-side or team
+        label. We require a high-confidence matched teammate, exactly one
+        missing Track, and exactly one keyless raw Pose on that end.
+        """
+        if not (
+            self.lock_match_roster
+            and self.match_mode == "doubles"
+            and self.expected_roster_count == 4
+        ):
+            return []
+
+        missing_by_end = {}
+        for track_id in unmatched_track_ids:
+            court_end = self._court_end(self.tracks[track_id].court_xy)
+            if court_end is not None:
+                missing_by_end.setdefault(court_end, []).append(track_id)
+
+        candidates_by_end = {}
+        for index in unmatched_observations:
+            court_end = self._court_end(observations[index].get("court_xy"))
+            if court_end is not None:
+                candidates_by_end.setdefault(court_end, []).append(index)
+
+        anchors_by_end = {}
+        for track_id, index in assignments:
+            track = self.tracks[track_id]
+            observation = observations[index]
+            court_end = self._court_end(observation.get("court_xy"))
+            if court_end is None:
+                continue
+            if (
+                track.association_identity_confidence < 0.80
+                or float(observation.get("confidence") or 0.0) < 0.70
+                or float(observation.get("location_confidence") or 0.0) < 0.70
+            ):
+                continue
+            anchors_by_end.setdefault(court_end, []).append(track_id)
+
+        recoveries = []
+        for court_end in sorted(set(missing_by_end) & set(candidates_by_end) & set(anchors_by_end)):
+            missing = missing_by_end[court_end]
+            candidates = candidates_by_end[court_end]
+            anchors = anchors_by_end[court_end]
+            if len(missing) == len(candidates) == len(anchors) == 1:
+                recoveries.append((missing[0], candidates[0]))
+        return recoveries
+
+    def _short_gap_doubles_end_reacquisitions(
+        self,
+        unmatched_track_ids,
+        unmatched_observations,
+        observations,
+        frame_index,
+    ):
+        """Recover one visible teammate into its fixed doubles court end.
+
+        Once a four-person doubles roster is locked, a player cannot turn into
+        a fifth participant merely because the far-court detector or
+        ByteTrack lost both IDs for a while. A real, high-confidence pose in
+        an end with one or two missing roster slots therefore reclaims the
+        nearest slot in that same end. This preserves team-side continuity;
+        it does not fabricate a second player, cross the net, or claim that
+        the two same-end teammates are distinguishable during their gap.
+        """
+        if not (
+            self.lock_match_roster
+            and self.match_mode == "doubles"
+            and self.expected_roster_count == 4
+        ):
+            return []
+        tracks_by_end = {}
+        for track_id in unmatched_track_ids:
+            track = self.tracks[track_id]
+            court_end = self._court_end(track.court_xy)
+            if court_end is not None:
+                tracks_by_end.setdefault(court_end, []).append(track_id)
+        observations_by_end = {}
+        for index in unmatched_observations:
+            observation = observations[index]
+            if (
+                float(observation.get("confidence") or 0.0) < 0.65
+                or float(observation.get("location_confidence") or 0.0) < 0.65
+            ):
+                continue
+            court_end = self._court_end(observation.get("court_xy"))
+            if court_end is not None:
+                observations_by_end.setdefault(court_end, []).append(index)
+
+        recoveries = []
+        for court_end in sorted(set(tracks_by_end).intersection(observations_by_end)):
+            track_ids = tracks_by_end[court_end]
+            indices = observations_by_end[court_end]
+            if len(indices) != 1 or len(track_ids) not in {1, 2}:
+                continue
+            index = indices[0]
+            track_id = min(
+                track_ids,
+                key=lambda item: self._distance(
+                    self._predict_position(self.tracks[item], frame_index),
+                    observations[index]["court_xy"],
+                ),
+            )
+            recoveries.append((track_id, index))
+        return recoveries
+
+    def _unambiguous_doubles_pair_reacquisitions(
+        self,
+        unmatched_track_ids,
+        unmatched_observations,
+        observations,
+        frame_index,
+    ):
+        """Reconnect a complete doubles pair after simultaneous ID fragments.
+
+        Each recovery requires exactly two stale roster slots and exactly two
+        strong live pose observations in the same current court end. Within
+        that constrained pair we use the lower total predicted-court-motion
+        pairing. A long tracker gap does not invalidate the fixed two-person
+        team-side roster; incomplete, low-confidence, or mixed-end sets stay
+        explicit as unassigned evidence instead of being forced into a player
+        slot.
+        """
+        if not (
+            self.lock_match_roster
+            and self.match_mode == "doubles"
+            and self.expected_roster_count == 4
+            and len(unmatched_track_ids) in {2, 4}
+            and len(unmatched_observations) in {2, 3, 4}
+        ):
+            return []
+
+        tracks_by_end = {}
+        for track_id in unmatched_track_ids:
+            court_end = self._court_end(self.tracks[track_id].court_xy)
+            if court_end is None:
+                return []
+            tracks_by_end.setdefault(court_end, []).append(track_id)
+        observations_by_end = {}
+        for index in unmatched_observations:
+            observation = observations[index]
+            court_end = self._court_end(observation.get("court_xy"))
+            if court_end is None:
+                return []
+            if (
+                float(observation.get("confidence") or 0.0) < 0.65
+                or float(observation.get("location_confidence") or 0.0) < 0.65
+            ):
+                return []
+            observations_by_end.setdefault(court_end, []).append(index)
+
+        if set(tracks_by_end) != set(observations_by_end):
+            return []
+        recoveries = []
+        for court_end in sorted(tracks_by_end):
+            track_ids = sorted(tracks_by_end[court_end])
+            indices = sorted(observations_by_end[court_end])
+            if len(track_ids) != 2 or len(indices) != 2:
+                continue
+            first_track, second_track = track_ids
+            first_index, second_index = indices
+            first_predicted = self._predict_position(self.tracks[first_track], frame_index)
+            second_predicted = self._predict_position(self.tracks[second_track], frame_index)
+            direct_cost = (
+                self._distance(first_predicted, observations[first_index]["court_xy"])
+                + self._distance(second_predicted, observations[second_index]["court_xy"])
+            )
+            crossed_cost = (
+                self._distance(first_predicted, observations[second_index]["court_xy"])
+                + self._distance(second_predicted, observations[first_index]["court_xy"])
+            )
+            if crossed_cost < direct_cost:
+                recoveries.extend([(first_track, second_index), (second_track, first_index)])
+            else:
+                recoveries.extend([(first_track, first_index), (second_track, second_index)])
+        return recoveries
+
     @staticmethod
     def _identity_confidence_for_source(association_source):
         """Keep association uncertainty available to consumers and reviewers."""
@@ -1112,6 +1444,11 @@ class CourtMultiObjectTracker:
             "roster_bootstrap": 0.95,
             "court_association": 0.85,
             "roster_reassociation": 0.72,
+            "singles_roster_complement": 0.78,
+            "singles_roster_full_reacquisition": 0.78,
+            "doubles_team_side_complement": 0.78,
+            "doubles_team_pair_reacquisition": 0.74,
+            "doubles_team_side_reacquisition": 0.72,
             "roster_end_recovery": 0.55,
         }.get(str(association_source), 0.60)
 
@@ -1585,6 +1922,7 @@ class FixedCameraMatchPipeline:
         byte_tracker_factory=None,
         lock_match_roster=False,
         roster_stable_frames=2,
+        roster_discovery_seconds=3.0,
         shuttle_enabled=True,
         movement_rally_settle_seconds=0.7,
         court_dimensions=(BADMINTON_COURT_WIDTH, BADMINTON_COURT_LENGTH),
@@ -1598,10 +1936,9 @@ class FixedCameraMatchPipeline:
         athlete_observation_lateral_margin_m=None,
         athlete_observation_baseline_margin_m=None,
     ):
-        if match_mode not in {"singles", "doubles"}:
+        if match_mode not in {"auto", "singles", "doubles"}:
             raise ValueError(
-                "FixedCameraMatchPipeline handles singles/doubles rules; "
-                "use PersonOnlyTracker/PersonOnlyFrameProcessor for analysis_mode=person_only"
+                "FixedCameraMatchPipeline match_mode must be auto, singles, or doubles"
             )
         if tracker_backend not in {"court_association", "bytetrack"}:
             raise ValueError("tracker_backend must be 'court_association' or 'bytetrack'")
@@ -1618,10 +1955,11 @@ class FixedCameraMatchPipeline:
         self.coordinate_system_id = str(coordinate_system_id)
         self.session_mode = str(session_mode)
         self.calibration_scope = str(calibration_scope)
+        self.requested_match_mode = match_mode
         self.expected_player_count = (
             int(expected_player_count)
             if expected_player_count is not None
-            else (2 if match_mode == "singles" else 4)
+            else ({"singles": 2, "doubles": 4}.get(match_mode))
         )
         self.net_image_line = net_image_line or [
             self.court_space.court_to_image((0.0, self.court_space.net_y_m)),
@@ -1641,6 +1979,7 @@ class FixedCameraMatchPipeline:
             lock_match_roster=lock_match_roster,
             expected_roster_count=self.expected_player_count,
             roster_stable_frames=roster_stable_frames,
+            roster_discovery_seconds=roster_discovery_seconds,
             require_association_keys=tracker_backend == "bytetrack",
             athlete_observation_margin_m=athlete_observation_margin_m,
             athlete_observation_lateral_margin_m=athlete_observation_lateral_margin_m,
@@ -1650,7 +1989,9 @@ class FixedCameraMatchPipeline:
         self.rallies = RallyStateMachine(
             fps=fps,
             shuttle_enabled=shuttle_enabled,
-            expected_player_count=self.expected_player_count,
+            # Auto mode resolves before movement-only rally boundaries are
+            # trusted; this placeholder never invents a roster conclusion.
+            expected_player_count=self.expected_player_count or 2,
             settle_window_seconds=movement_rally_settle_seconds,
         )
         self._last_frame = 0
@@ -1662,15 +2003,29 @@ class FixedCameraMatchPipeline:
     def update(self, frame_index, observations, shuttlecock, has_fresh_observations=True):
         self._last_frame = int(frame_index)
         observations = [dict(item) for item in observations]
-        if self.byte_tracker is not None:
+        # A higher-rate shuttle cadence can request this update between pose
+        # measurements.  Those timestamps must advance shuttle/hit evidence
+        # without treating an intentionally absent pose inference as an empty
+        # person detection or ageing ByteTrack state.
+        if self.byte_tracker is not None and has_fresh_observations:
             association_keys = self.byte_tracker.update(observations)
             for index, association_key in association_keys.items():
                 observations[index]["association_key"] = association_key
-        tracks = self.tracker.update(
-            frame_index,
-            observations,
-            has_fresh_observations=has_fresh_observations,
-        )
+        if has_fresh_observations:
+            tracks = self.tracker.update(
+                frame_index,
+                observations,
+                has_fresh_observations=True,
+            )
+        else:
+            tracks = self.tracker.snapshot(frame_index)
+        if (
+            self.requested_match_mode == "auto"
+            and self.tracker.match_mode in {"singles", "doubles"}
+        ):
+            self.match_mode = self.tracker.match_mode
+            self.expected_player_count = self.tracker.expected_roster_count
+            self.rallies.expected_player_count = self.expected_player_count
         shuttle = self._shuttle_record(frame_index, shuttlecock)
         hit_events = self._detect_hit_events(tracks, shuttle, frame_index)
         rally = self.rallies.update(frame_index, tracks, shuttle, hit_events)
@@ -1679,6 +2034,7 @@ class FixedCameraMatchPipeline:
             "coordinate_system": self.coordinate_system_id,
             "match": {
                 "mode": self.match_mode,
+                "requested_mode": self.requested_match_mode,
                 "max_players_per_team": self.tracker.max_players_per_team,
                 "identity_policy": "track_id is persistent; court_end and zone_id are transient; team_id requires confirmation",
             },
@@ -1702,6 +2058,7 @@ class FixedCameraMatchPipeline:
             "team_claims": dict(self.tracker.team_claims),
             "match": {
                 "mode": self.match_mode,
+                "requested_mode": self.requested_match_mode,
                 "max_players_per_team": self.tracker.max_players_per_team,
             },
             "tracking": {
@@ -1739,16 +2096,25 @@ class FixedCameraMatchPipeline:
         court_xy = shuttlecock.get("court_xy")
         if court_xy is None and shuttlecock.get("image_xy") is not None:
             court_xy = self.court_space.image_to_court(shuttlecock["image_xy"])
-        return self.shuttle.update(
+        record = self.shuttle.update(
             frame_index,
             frame_index / self.tracker.fps,
             court_xy,
             shuttlecock.get("confidence", 0.0),
             bool(shuttlecock.get("detected", False)),
         )
+        # Image position remains meaningful while the shuttle is beyond the
+        # court projection. It is therefore retained separately from the
+        # homography-derived ground-plane proxy.
+        record["image_xy"] = self._as_point(shuttlecock.get("image_xy"))
+        record["speed_px_s"] = shuttlecock.get("speed_px_s")
+        record["speed_status"] = shuttlecock.get("speed_status")
+        return record
 
-    HIT_CONTACT_DISTANCE_M = 1.35
-    HIT_RELEASE_DISTANCE_M = 1.75
+    HIT_CONTACT_MIN_PX = 24.0
+    HIT_CONTACT_MAX_PX = 140.0
+    HIT_CONTACT_BODY_HEIGHT_RATIO = 0.38
+    HIT_RELEASE_RATIO = 1.55
     HIT_CONTACT_STALE_FRAMES = 10 * 60
 
     def _detect_hit_events(self, tracks, shuttle, frame_index):
@@ -1765,23 +2131,81 @@ class FixedCameraMatchPipeline:
             for track_id, last_frame in self._hit_contact_frames.items()
             if frame_index - int(last_frame) <= self.HIT_CONTACT_STALE_FRAMES
         }
-        if shuttle.get("status") != "approximate" or not tracks:
+        shuttle_image = self._as_point(shuttle.get("image_xy"))
+        if shuttle.get("status") != "approximate" or shuttle_image is None or not tracks:
             return []
-        shuttle_xy = shuttle["xyz_m"][:2]
-        nearest = min(tracks, key=lambda track: hypot(track["court_xy_m"][0] - shuttle_xy[0], track["court_xy_m"][1] - shuttle_xy[1]))
-        distance = hypot(nearest["court_xy_m"][0] - shuttle_xy[0], nearest["court_xy_m"][1] - shuttle_xy[1])
-        if nearest["status"] != "detected":
+        candidates = []
+        for track in tracks:
+            if track.get("status") != "detected":
+                continue
+            evidence = track.get("location_evidence") or {}
+            if not evidence.get("is_current_measurement"):
+                continue
+            bbox = evidence.get("bbox_xyxy") or []
+            body_height = None
+            if len(bbox) >= 4:
+                try:
+                    body_height = abs(float(bbox[3]) - float(bbox[1]))
+                except (TypeError, ValueError):
+                    body_height = None
+            contact_gate = max(
+                self.HIT_CONTACT_MIN_PX,
+                min(self.HIT_CONTACT_MAX_PX, (body_height or 0.0) * self.HIT_CONTACT_BODY_HEIGHT_RATIO),
+            )
+            for hand_name, hand_point in (evidence.get("hands_image") or {}).items():
+                hand = self._as_point(hand_point)
+                if hand is None:
+                    continue
+                distance = hypot(hand[0] - shuttle_image[0], hand[1] - shuttle_image[1])
+                candidates.append((distance, contact_gate, track, str(hand_name)))
+        if not candidates:
+            # The shuttle is no longer close to any currently measured hand,
+            # so the next genuine approach may become a new contact.
+            self._hit_contact_frames.clear()
             return []
+        for distance, contact_gate, track, _hand_name in candidates:
+            if distance > contact_gate * self.HIT_RELEASE_RATIO:
+                self._hit_contact_frames.pop(track["track_id"], None)
+        distance, contact_gate, nearest, _hand_name = min(candidates, key=lambda item: item[0])
         track_id = nearest["track_id"]
-        if distance > self.HIT_RELEASE_DISTANCE_M:
-            self._hit_contact_frames.pop(track_id, None)
+        if distance > contact_gate:
             return []
-        if track_id in self._hit_contact_frames or distance > self.HIT_CONTACT_DISTANCE_M:
+        if track_id in self._hit_contact_frames:
             return []
         self._hit_contact_frames[track_id] = frame_index
         return [{
             "status": "candidate",
             "hitter_track_id": track_id,
             "confidence": round(min(0.45, shuttle["confidence"] * nearest["confidence"]), 4),
-            "reason": "spatial_proximity_only; not score evidence",
+            "contact_distance_px": round(distance, 2),
+            "contact_gate_px": round(contact_gate, 2),
+            "half_court_zone_id": self._half_court_zone(nearest.get("court_xy_m")),
+            "reason": "visible_hand_image_proximity; not score evidence",
         }]
+
+    def _half_court_zone(self, court_xy):
+        """Return a player-relative 3×3 zone for one court end."""
+        if court_xy is None or len(court_xy) < 2:
+            return None
+        try:
+            x, y = float(court_xy[0]), float(court_xy[1])
+        except (TypeError, ValueError):
+            return None
+        width = self.court_space.width_m
+        net_y = self.court_space.net_y_m
+        if not (0.0 <= x <= width and 0.0 <= y <= self.court_space.length_m):
+            return None
+        column = "left" if x < width / 3.0 else "right" if x >= width * 2.0 / 3.0 else "center"
+        local_depth = y / net_y if y < net_y else (self.court_space.length_m - y) / net_y
+        row = "rear" if local_depth < 1.0 / 3.0 else "front" if local_depth >= 2.0 / 3.0 else "mid"
+        return f"{row}_{column}"
+
+    @staticmethod
+    def _as_point(value):
+        try:
+            if value is None or len(value) < 2:
+                return None
+            x, y = float(value[0]), float(value[1])
+            return (x, y) if isfinite(x) and isfinite(y) else None
+        except (TypeError, ValueError):
+            return None

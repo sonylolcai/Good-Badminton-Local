@@ -6,6 +6,27 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 
+def resolve_ultralytics_device(device="auto"):
+    """Choose CUDA, Apple MPS, or CPU for Ultralytics inference.
+
+    MPS is intentionally checked separately from CUDA: Apple Silicon exposes
+    neither a CUDA device nor an integer GPU index.
+    """
+    requested = "auto" if device is None else str(device).strip().lower()
+    if requested not in {"", "auto"}:
+        return device
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return 0
+        if torch.backends.mps.is_built() and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 class YOLOPoseProcessor:
     """Ultralytics YOLO pose processor with inspectable fixed-camera inference.
 
@@ -39,18 +60,7 @@ class YOLOPoseProcessor:
         self.inference_name = "YOLO-Pose"
         self._last_detections = []
 
-        if device in (None, "auto"):
-            selected = "cpu"
-            try:
-                import torch
-
-                if torch.cuda.is_available():
-                    selected = 0
-            except Exception:
-                selected = "cpu"
-            self.device = selected
-        else:
-            self.device = device
+        self.device = resolve_ultralytics_device(device)
 
         if model is None:
             from ultralytics import YOLO

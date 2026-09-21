@@ -3,8 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 from business_gateway.metrics.detections_reader import (
     collect_track_position_evidence,
+)
+from badminton_analysis.visualization.spatial_player_positions import (
+    extract_high_confidence_player_portraits,
 )
 
 
@@ -42,6 +48,29 @@ class SpatialPlayerPositionsTests(unittest.TestCase):
         self.assertEqual(evidence["tracks"]["track_001"]["excluded"]["predicted"], 1)
         self.assertEqual(evidence["tracks"]["track_002"]["excluded"]["low_location_confidence"], 1)
         self.assertEqual(evidence["tracks"]["track_003"]["excluded"]["low_identity_confidence"], 1)
+
+    def test_high_confidence_detected_track_exports_an_anonymous_person_crop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "source.avi"
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (80, 60))
+            writer.write(np.zeros((60, 80, 3), dtype=np.uint8))
+            frame = np.zeros((60, 80, 3), dtype=np.uint8)
+            frame[10:50, 20:45] = (0, 255, 0)
+            writer.write(frame)
+            writer.release()
+            detections = root / "detections.jsonl"
+            track = self._track("track_001", (2.0, 4.0))
+            track["location_evidence"]["bbox_xyxy"] = [20, 10, 45, 50]
+            detections.write_text(json.dumps(self._row(2, [track])) + "\n", encoding="utf-8")
+
+            portraits = extract_high_confidence_player_portraits(video, detections, root / "outputs")
+            self.assertIn("track_001", portraits)
+            crop = cv2.imread(portraits["track_001"])
+            self.assertIsNotNone(crop)
+            self.assertGreater(crop.shape[0], 24)
+            self.assertGreater(crop.shape[1], 16)
+
 
     @staticmethod
     def _row(frame, tracks):

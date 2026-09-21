@@ -27,6 +27,7 @@ def _segment_metadata(index, raw, source_start):
         "idempotency_key": f"reliability-segment-{index:03d}",
         "content_type": "video/mp4",
         "content_length_bytes": len(raw),
+        "court_corners": [[0, 0], [100, 0], [100, 100], [0, 100]],
     }
 
 
@@ -35,6 +36,7 @@ def _create_request():
         "schema_version": "stream-session.v1",
         "camera_id": "reliability-camera",
         "calibration_id": "reliability-calibration",
+        "court_corners": [[0, 0], [100, 0], [100, 100], [0, 100]],
         "analysis_mode": "person_only",
         "configuration": {
             "analysis_sample_hz": 10,

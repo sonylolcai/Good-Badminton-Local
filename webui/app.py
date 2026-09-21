@@ -1175,7 +1175,12 @@ def run_analysis_with_upload_mode(
             "tracker_backend": "court_association" if use_local_cpu else tracker_backend,
             "far_player_enhancement": bool(far_player_enhancement),
             "far_pose_roi": tuple(float(item.strip()) for item in far_pose_roi.split(',')),
-            "expected_player_count": 2 if sport_id == "tennis" else int(expected_player_count),
+            "match_mode": "singles" if sport_id == "tennis" else str(match_mode),
+            "expected_player_count": (
+                2
+                if sport_id == "tennis"
+                else {"singles": 2, "doubles": 4}.get(str(match_mode))
+            ),
         }
         stream_output_dir = os.path.join(
             "outputs", "remote_stream_sessions", datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -2994,7 +2999,7 @@ def build_ui():
                     pose_mode = gr.State(value="balanced")
                     language = gr.State(value="zh")
                     audio = gr.State(value=False)
-                    match_mode = gr.State(value="doubles")
+                    match_mode = gr.State(value="auto")
                     output_video_style = gr.State(value="annotated")
                     shuttle_detector = gr.Dropdown(
                         choices=[
@@ -3029,8 +3034,8 @@ def build_ui():
                         info="只影响同一人跨帧关联；不会要求选择单打或双打。",
                     )
                     generate_annotated_video = gr.Checkbox(
-                        value=False,
-                        label="生成标注视频（较慢，可用于肉眼复核）",
+                        value=True,
+                        label="生成标注视频（默认开启，可用于肉眼复核）",
                         elem_id="badminton-annotated-video",
                     )
                     generate_promotion_video_toggle = gr.Checkbox(
@@ -3062,12 +3067,10 @@ def build_ui():
                             "可继续生成宣传视频。"
                         ),
                     )
-                    expected_player_count = gr.Radio(
-                        choices=[("2 人（单打）", 2), ("4 人（双打）", 4)],
-                        value=2,
-                        label="分片流式场上人数",
-                        info="仅在勾选 2 秒分片推送时生效。GPU 连续识别稳定人数后锁定名单，避免临时轨迹变成额外球员。",
-                    )
+                    # Retain a hidden callback value for compatibility.  The
+                    # stream policy derives its roster from match_mode below;
+                    # operators never enter a player count.
+                    expected_player_count = gr.State(value=None)
                     # Keep remaining implementation controls in the callback
                     # contract, but make them deployment defaults rather than
                     # routine end-user choices.

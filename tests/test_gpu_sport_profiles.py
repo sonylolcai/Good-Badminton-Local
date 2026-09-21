@@ -258,7 +258,12 @@ class GpuSportProfileTests(unittest.TestCase):
 
     def test_tennis_app_health_and_runtime_are_profile_fixed(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
-            "os.environ", {"GOOD_GPU_BUILD_SHA": "test-build"}, clear=False
+            "os.environ",
+            {
+                "GOOD_GPU_BUILD_SHA": "test-build",
+                "GOOD_GPU_MODEL_MANIFEST": str(Path(directory) / "missing-manifest.json"),
+            },
+            clear=False,
         ):
             app = create_app(
                 data_dir=Path(directory),

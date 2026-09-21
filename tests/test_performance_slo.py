@@ -44,6 +44,19 @@ class PerformanceSloTests(unittest.TestCase):
         self.assertEqual(analysis_frames, [1, 3, 5, 7, 9, 11])
         self.assertEqual(health_frames, [1, 16, 31])
 
+    def test_shuttle_sampling_can_be_higher_than_pose_sampling(self):
+        system = object.__new__(BadmintonAnalysisSystem)
+        system.analysis_sample_hz = 10.0
+        system.pose_sample_hz = 10.0
+        system.shuttle_sample_hz = 25.0
+        system.fps = 30.0
+
+        pose_frames = [index for index in range(1, 13) if system._should_sample_pose(index)]
+        shuttle_frames = [index for index in range(1, 13) if system._should_sample_shuttle(index)]
+
+        self.assertEqual(pose_frames, [1, 4, 7, 10])
+        self.assertEqual(shuttle_frames, [1, 3, 4, 5, 6, 7, 9, 10, 11, 12])
+
     def test_pose_keypoints_remain_tied_to_their_measurement_frame(self):
         tracker = CourtMultiObjectTracker(CourtSpace(self.CORNERS), fps=10)
         observation = {

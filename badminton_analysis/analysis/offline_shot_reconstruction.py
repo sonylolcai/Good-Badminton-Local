@@ -26,6 +26,7 @@ SHUTTLE_TRACK_FILENAME = "shuttle_tracks_v2.jsonl"
 SHOT_EVENT_FILENAME = "shot_events_v2.jsonl"
 RALLY_FILENAME = "rallies_v2.jsonl"
 TERMINAL_CANDIDATE_FILENAME = "terminal_candidates_v1.jsonl"
+PLAYER_CONTACT_SUMMARY_FILENAME = "player_contact_summary_v1.json"
 RALLY_BOUNDARY_REFERENCE_FILENAME = "rally_boundary_reference_user_review.jsonl"
 DERIVATION_VERSION = "2.4"
 
@@ -71,16 +72,19 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
     event_path = output_dir / SHOT_EVENT_FILENAME
     rally_path = output_dir / RALLY_FILENAME
     terminal_candidate_path = output_dir / TERMINAL_CANDIDATE_FILENAME
+    player_contact_summary_path = output_dir / PLAYER_CONTACT_SUMMARY_FILENAME
     write_jsonl(track_path, track_rows)
     write_jsonl(event_path, events)
     write_jsonl(rally_path, rallies)
     write_jsonl(terminal_candidate_path, terminal_candidates)
+    write_json(player_contact_summary_path, build_player_contact_summary(events))
     return {
         "version": DERIVATION_VERSION,
         "tracks_path": str(track_path),
         "events_path": str(event_path),
         "rallies_path": str(rally_path),
         "terminal_candidates_path": str(terminal_candidate_path),
+        "player_contact_summary_path": str(player_contact_summary_path),
         "frame_count": len(track_rows),
         "event_count": len(events),
         "rally_count": len(rallies),
@@ -100,6 +104,48 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
         "policy": (
             "raw detections are immutable; only short, bounded gaps may be reconstructed; "
             "rallies and missing-shuttle hits are review candidates, never score evidence"
+        ),
+    }
+
+
+def build_player_contact_summary(events):
+    """Summarise candidate contacts by durable track and player-relative zone.
+
+    These are contact candidates, grouped only by durable track, rally and
+    player-relative half-court zone. They do not infer stroke technique.
+    """
+    players = {}
+    for event in events or []:
+        hitter = event.get("hitter") or {}
+        track_id = hitter.get("track_id")
+        if not track_id:
+            continue
+        record = players.setdefault(
+            str(track_id),
+            {
+                "candidate_contact_count": 0,
+                "machine_candidate_contact_count": 0,
+                "motion_inferred_contact_count": 0,
+                "by_rally": {},
+                "by_half_court_zone": {},
+            },
+        )
+        record["candidate_contact_count"] += 1
+        if event.get("event_origin") == "motion_constraint_candidate":
+            record["motion_inferred_contact_count"] += 1
+        else:
+            record["machine_candidate_contact_count"] += 1
+        rally_id = event.get("rally_id") or "unassigned_rally"
+        record["by_rally"][rally_id] = record["by_rally"].get(rally_id, 0) + 1
+        zone = hitter.get("half_court_zone_id") or "unknown"
+        record["by_half_court_zone"][zone] = record["by_half_court_zone"].get(zone, 0) + 1
+    return {
+        "schema_version": DERIVATION_VERSION,
+        "kind": "player_contact_candidate_summary",
+        "players": players,
+        "policy": (
+            "Counts are machine contact candidates, not official score statistics. "
+            "Only track, rally and player-relative half-court position are summarised."
         ),
     }
 
@@ -222,6 +268,9 @@ def build_shot_events(raw_rows, track_rows, fps=30.0, px_scale=1.0):
                     "confidence": float(event.get("confidence") or 0.0),
                     "hitter_track_id": event.get("hitter_track_id"),
                     "reason": event.get("reason"),
+                    "contact_distance_px": event.get("contact_distance_px"),
+                    "contact_gate_px": event.get("contact_gate_px"),
+                    "half_court_zone_id": event.get("half_court_zone_id"),
                 }
             )
     seeds.extend(_trajectory_turn_seeds(track_rows, px_scale=px_scale))
@@ -233,6 +282,12 @@ def build_shot_events(raw_rows, track_rows, fps=30.0, px_scale=1.0):
         raw = _row_at_frame(raw_rows, seed["frame"])
         track = by_frame.get(seed["frame"])
         hitter = _hitter_evidence(raw, track, seed.get("hitter_track_id"), px_scale=px_scale)
+        if seed.get("half_court_zone_id"):
+            hitter["half_court_zone_id"] = seed["half_court_zone_id"]
+        if seed.get("contact_distance_px") is not None:
+            hitter["contact_distance_px"] = seed["contact_distance_px"]
+        if seed.get("contact_gate_px") is not None:
+            hitter["contact_gate_px"] = seed["contact_gate_px"]
         event_origin = seed.get("event_origin", "machine_candidate")
         events.append(
             {
@@ -1433,27 +1488,17 @@ def _distance_to_segment(point, start, end):
 
 
 def _propose_from_space(event, following):
-    trajectory = event["trajectory"]
-    hitter_id = event["hitter"].get("track_id")
-    receiver_id = event["receiver"].get("track_id")
-    if not hitter_id or not receiver_id or following is None:
-        return _proposal("unknown", 0.0, "No separately supported hitter and receiver; human review required.")
-    # Receiver is the next hit candidate. Its location evidence is used only as
-    # a spatial cue, never as a forced event attribution.
-    receiver_zone = _track_zone_from_event(following, receiver_id)
-    hitter_zone = _track_zone_from_event(event, hitter_id)
-    duration = trajectory.get("flight_duration_sec")
-    speed = trajectory.get("outbound_speed_px_s")
-    confidence = min(0.45, event["time_confidence"] * max(event["hitter"].get("confidence", 0.0), event["receiver"].get("confidence", 0.0)))
-    if hitter_zone and receiver_zone and hitter_zone.startswith("front_") and receiver_zone.startswith("rear_"):
-        return _proposal("lift", confidence, "Front-court hitter to next rear-court receiver is a lift/clear candidate.")
-    if hitter_zone and receiver_zone and hitter_zone.startswith("rear_") and receiver_zone.startswith("front_"):
-        if speed is not None and duration is not None and speed >= 1000 and duration <= 0.9:
-            return _proposal("smash", confidence, "Rear-to-front, short fast flight is a smash candidate.")
-        return _proposal("drop", confidence, "Rear-court hitter to next front-court receiver is a drop candidate.")
-    if speed is not None and duration is not None and speed >= 700 and duration <= 0.9:
-        return _proposal("drive", confidence * 0.8, "Short, fast 2D flight is a drive candidate.")
-    return _proposal("unknown", confidence * 0.5, "Spatial evidence does not distinguish the shot type reliably.")
+    """Keep raw touch and trajectory facts; automatic shot typing is disabled.
+
+    This deliberately avoids producing weak ball-route labels before there is a
+    trained, validated visual model.  The caller still records the existing
+    hit candidate, player location and 2D shuttle-motion evidence.
+    """
+    return _proposal(
+        "unknown",
+        0.0,
+        "自动球种与球路比例判断当前已关闭；仅保留触球、人员位置和羽毛球轨迹原始证据。",
+    )
 
 
 def _track_zone_from_event(event, track_id):
@@ -1559,3 +1604,10 @@ def write_jsonl(path, records: Iterable[dict]):
         for record in records:
             destination.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
             destination.write("\n")
+
+
+def write_json(path, payload):
+    Path(path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )

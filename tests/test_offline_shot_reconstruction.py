@@ -55,10 +55,25 @@ class OfflineShotReconstructionTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0]["hitter"]["track_id"], "track_001")
         self.assertEqual(events[0]["receiver"]["track_id"], "track_002")
-        self.assertEqual(events[0]["proposal"]["label"], "lift")
+        self.assertEqual(events[0]["proposal"]["label"], "unknown")
+        self.assertNotIn("probabilities", events[0]["proposal"])
         self.assertEqual(events[0]["trajectory"]["outbound_speed"]["basis"], "first_two_post_hit_trajectory_points")
         self.assertEqual(events[0]["trajectory"]["outbound_speed"]["unit"], "px/s")
         self.assertFalse(events[0]["decision"]["eligible_for_statistics"])
+
+    def test_fast_rear_to_front_trajectory_keeps_raw_speed_without_shot_typing(self):
+        rows = [
+            self._row(1, [100, 100], accepted=True, confidence=0.90, hit="track_001", zone="rear_center"),
+            self._row(2, [220, 110], accepted=True, confidence=0.90),
+            self._row(3, [340, 120], accepted=True, confidence=0.90),
+            self._row(6, [420, 125], accepted=True, confidence=0.90, hit="track_002", zone="front_center"),
+        ]
+
+        event = build_shot_events(rows, reconstruct_shuttle_track(rows, fps=10), fps=10)[0]
+        self.assertEqual("unknown", event["proposal"]["label"])
+        self.assertIn("已关闭", event["proposal"]["rationale"])
+        self.assertGreater(event["trajectory"]["outbound_speed_px_s"], 1000)
+        self.assertFalse(event["decision"]["eligible_for_statistics"])
 
     def test_hand_supported_heading_change_catches_a_return_that_is_not_a_full_reversal(self):
         """A fast descending shuttle can leave sideways after a real return.

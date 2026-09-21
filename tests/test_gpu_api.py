@@ -47,6 +47,51 @@ class GpuApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_court_detection_rejects_non_video_uploads(self):
+        response = self.client.post(
+            "/api/v1/court/detect",
+            headers={"X-API-Key": "test-api-key"},
+            files={"video": ("notes.txt", b"not a video", "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_court_detection_returns_detected_corners_for_a_video(self):
+        self.app.state.court_detector = lambda _path: {
+            "corners": [[10, 20], [30, 20], [30, 40], [10, 40]],
+            "preview_bgr": None,
+        }
+
+        response = self.client.post(
+            "/api/v1/court/detect",
+            headers={"X-API-Key": "test-api-key"},
+            files={"video": ("match.mp4", b"video-bytes", "video/mp4")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"corners": [[10, 20], [30, 20], [30, 40], [10, 40]], "preview_data_url": None, "template_data_url": None},
+        )
+
+    def test_court_detection_returns_the_original_selected_frame_for_a_run(self):
+        template = Path(self.temp_dir.name) / "court.png"
+        template.write_bytes(b"raw-template-frame")
+        self.app.state.court_detector = lambda _path: {
+            "corners": [[10, 20], [30, 20], [30, 40], [10, 40]],
+            "preview_bgr": None,
+            "template_path": str(template),
+        }
+
+        response = self.client.post(
+            "/api/v1/court/detect",
+            headers={"X-API-Key": "test-api-key"},
+            files={"video": ("match.mp4", b"video-bytes", "video/mp4")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["template_data_url"], "data:image/png;base64,cmF3LXRlbXBsYXRlLWZyYW1l")
+
     def test_valid_upload_creates_a_queued_job_with_stable_status_url(self):
         response = self.client.post(
             "/api/v1/jobs",
@@ -115,6 +160,8 @@ class GpuApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "queued")
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(3.0, stored["options"]["roster_discovery_seconds"])
 
     def test_job_accepts_tracknet_as_explicit_primary_shuttle_source(self):
         response = self.client.post(
@@ -220,12 +267,35 @@ class GpuApiTests(unittest.TestCase):
         self.assertEqual(stored["options"]["pose_imgsz"], 960)
         self.assertEqual(stored["options"]["analysis_sample_hz"], 10.0)
         self.assertEqual(stored["options"]["pose_sample_hz"], 10.0)
+        self.assertEqual(stored["options"]["shuttle_sample_hz"], 10.0)
         self.assertEqual(stored["options"]["tracker_backend"], "bytetrack")
         self.assertTrue(stored["options"]["enable_bytetrack"])
         self.assertEqual(stored["options"]["shuttle_detector"], "yolo")
-        self.assertFalse(stored["options"]["generate_annotated_video"])
-        self.assertFalse(stored["options"]["browser_video_reencode"])
+        self.assertEqual(stored["options"]["match_mode"], "auto")
+        self.assertTrue(stored["options"]["generate_annotated_video"])
+        self.assertTrue(stored["options"]["browser_video_reencode"])
+        self.assertEqual(stored["options"]["output_video_style"], "annotated")
+        self.assertTrue(stored["options"]["show_shuttlecock_detection"])
+        self.assertTrue(stored["options"]["show_shuttlecock_trajectory"])
         self.assertEqual(stored["tracking"]["phase"], "waiting_for_analysis")
+
+    def test_ball_layers_are_disabled_for_a_pose_only_job(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "pose-only-video-layers"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"shuttle_detector":"none","show_shuttlecock_detection":true,"show_shuttlecock_trajectory":true}',
+            },
+        )
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertFalse(stored["options"]["show_shuttlecock_detection"])
+        self.assertFalse(stored["options"]["show_shuttlecock_trajectory"])
 
     def test_job_can_explicitly_request_video_generation_and_browser_reencode(self):
         response = self.client.post(
@@ -255,7 +325,7 @@ class GpuApiTests(unittest.TestCase):
             },
             data={
                 "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
-                "options_json": '{"browser_video_reencode":true}',
+                "options_json": '{"generate_annotated_video":false,"browser_video_reencode":true}',
             },
         )
         self.assertEqual(response.status_code, 202)
@@ -300,6 +370,26 @@ class GpuApiTests(unittest.TestCase):
         stored = self.app.state.job_manager.get_job(response.json()["job_id"])
         self.assertEqual(stored["options"]["analysis_sample_hz"], 15.0)
         self.assertEqual(stored["options"]["pose_sample_hz"], 15.0)
+        self.assertEqual(stored["options"]["shuttle_sample_hz"], 15.0)
+
+    def test_job_accepts_a_higher_shuttle_sampling_frequency_than_pose(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "business-task-split-cadence"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={
+                "court_corners": "[[1,1],[2,1],[2,2],[1,2]]",
+                "options_json": '{"analysis_sample_hz":10,"shuttle_sample_hz":25}',
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        stored = self.app.state.job_manager.get_job(response.json()["job_id"])
+        self.assertEqual(stored["options"]["analysis_sample_hz"], 10.0)
+        self.assertEqual(stored["options"]["shuttle_sample_hz"], 25.0)
 
     def test_job_keeps_an_opaque_match_reference_without_participant_identity(self):
         response = self.client.post(

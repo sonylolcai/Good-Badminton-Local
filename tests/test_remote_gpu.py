@@ -38,16 +38,22 @@ class RemoteGpuTests(unittest.TestCase):
 
     def test_two_or_four_player_roster_is_locked_for_direct_streams(self):
         self.assertEqual(
-            stream_roster_configuration(2),
+            stream_roster_configuration(2, match_mode="singles"),
             {
                 "lock_match_roster": True,
                 "expected_player_count": 2,
                 "roster_stable_frames": 3,
                 "max_roster_count": 2,
                 "roster_discovery_seconds": 8.0,
+                "match_mode": "singles",
             },
         )
-        self.assertEqual(stream_roster_configuration(4)["max_roster_count"], 4)
+        self.assertEqual(
+            stream_roster_configuration(match_mode="doubles")["max_roster_count"], 4
+        )
+        self.assertIsNone(
+            stream_roster_configuration(match_mode="auto")["expected_player_count"]
+        )
         with self.assertRaisesRegex(RemoteAnalysisError, "2 人或 4 人"):
             stream_roster_configuration(3)
 

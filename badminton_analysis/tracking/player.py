@@ -128,6 +128,11 @@ class PlayerTracker:
                     "ball_kind": ball_detection.get("ball_kind"),
                     "detector_mode": ball_detection.get("detector_mode"),
                     "experimental": bool(ball_detection.get("experimental", False)),
+                    "speed_px_s": ball_detection.get("speed_px_s"),
+                    "speed_window_seconds": ball_detection.get("speed_window_seconds"),
+                    "speed_measurement_count": int(ball_detection.get("speed_measurement_count", 0)),
+                    "speed_status": ball_detection.get("speed_status"),
+                    "speed_basis": ball_detection.get("speed_basis"),
                 }
             )
 
