@@ -6,15 +6,15 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.venv/
-venv/
-env/
+.venv*/
+venv*/
+env*/
 .agents/
 
 # Local inputs and generated outputs
 results/
 outputs/
-api_data/
+api_data*/
 .gpu-api.env
 .webui-remote-gpu.env
 .webui-operator.env
