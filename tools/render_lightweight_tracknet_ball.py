@@ -32,6 +32,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from badminton_analysis.detection.lightweight_tracknet import LightweightTrackNetDetector
+from badminton_analysis.sports.badminton import BadmintonRuleEngine
+from badminton_analysis.sports.physics import PhysicalTrajectoryAnalyzer
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -101,7 +103,7 @@ def draw_hud(
 
     # HUD Box Dimensions
     x1, y1 = int(24 * scale), int(24 * scale)
-    w_box, h_box = int(320 * scale), int(120 * scale)
+    w_box, h_box = int(360 * scale), int(165 * scale)
     x2, y2 = x1 + w_box, y1 + h_box
 
     # Semi-transparent dark background
@@ -112,8 +114,8 @@ def draw_hud(
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_mono = cv2.FONT_HERSHEY_DUPLEX
-    f_scale = 0.55 * scale
-    f_scale_sm = 0.42 * scale
+    f_scale = 0.52 * scale
+    f_scale_sm = 0.40 * scale
 
     # Row 1: Model title + Status pill
     cv2.putText(frame, "TRACKNET V3 FAST", (x1 + int(12 * scale), y1 + int(24 * scale)), font, f_scale_sm, (180, 200, 220), 1, cv2.LINE_AA)
@@ -128,13 +130,22 @@ def draw_hud(
     # Row 2: Frame & Timestamp
     time_str = f"{mins:02d}:{secs:02d}.{millis:02d}"
     cv2.putText(frame, f"F: {frame_idx:04d} / {total_frames}", (x1 + int(12 * scale), y1 + int(56 * scale)), font_mono, f_scale, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"TIME: {time_str}", (x1 + int(175 * scale), y1 + int(56 * scale)), font_mono, f_scale, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"TIME: {time_str}", (x1 + int(185 * scale), y1 + int(56 * scale)), font_mono, f_scale, (220, 220, 220), 1, cv2.LINE_AA)
 
     # Row 3: Ball Speed Display
-    cv2.putText(frame, "BALL SPEED:", (x1 + int(12 * scale), y1 + int(96 * scale)), font, f_scale_sm, (160, 175, 190), 1, cv2.LINE_AA)
+    cv2.putText(frame, "BALL SPEED:", (x1 + int(12 * scale), y1 + int(90 * scale)), font, f_scale_sm, (160, 175, 190), 1, cv2.LINE_AA)
     speed_str = f"{speed:5.1f} km/h" if current_det["visible"] else "--- km/h"
     speed_color = (0, 240, 255) if speed > 100 else (255, 255, 255)
-    cv2.putText(frame, speed_str, (x1 + int(120 * scale), y1 + int(98 * scale)), font_mono, 0.65 * scale, speed_color, 2, cv2.LINE_AA)
+    cv2.putText(frame, speed_str, (x1 + int(120 * scale), y1 + int(92 * scale)), font_mono, 0.65 * scale, speed_color, 2, cv2.LINE_AA)
+
+    # Row 4: Rally & Shot Info
+    rally_str = current_det.get("rally_display", "REST / INTER-RALLY")
+    rally_color = (0, 255, 120) if "RALLY" in rally_str else ((0, 220, 255) if "POINT" in rally_str else (160, 175, 190))
+    cv2.putText(frame, rally_str, (x1 + int(12 * scale), y1 + int(124 * scale)), font_mono, 0.50 * scale, rally_color, 1, cv2.LINE_AA)
+
+    # Row 5: Tactical Details / Direction
+    tactical_str = current_det.get("tactical_info", "STATUS: INTER-RALLY")
+    cv2.putText(frame, tactical_str, (x1 + int(12 * scale), y1 + int(150 * scale)), font, 0.38 * scale, (180, 195, 210), 1, cv2.LINE_AA)
 
 
 def draw_pure_ball(
@@ -193,6 +204,7 @@ def main():
     parser.add_argument("--output-dir", default="outputs/tracknet_fast_eval", type=Path)
     parser.add_argument("--output-scale", type=float, default=0.5, help="0.5 scales 4K down to 1080p")
     parser.add_argument("--batch-chunks", type=int, default=2)
+    parser.add_argument("--court-roi-x", type=float, nargs=2, default=[500.0, 3150.0], help="X min and max for Court 1 ROI")
     parser.add_argument("--trail-length", type=int, default=26)
     args = parser.parse_args()
 
@@ -223,8 +235,83 @@ def main():
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
 
+    # Filter out detections outside main Court 1
+    court_x_min, court_x_max = args.court_roi_x
+    for d in detections:
+        if d["x"] is not None and (d["x"] > court_x_max or d["x"] < court_x_min):
+            d["visible"] = False
+            d["x"] = None
+            d["y"] = None
+
     # Pass 1.5: Compute velocities & metrics
     detections = compute_ballistics_and_speeds(detections, fps=fps)
+
+    # Pass 1.6: Decoupled Physical Trajectory & Badminton Rule Engine Analysis
+    logger.info("Running Pass 1.6: Decoupled Physical Trajectory & Badminton Rule Engine Analysis...")
+    analyzer = PhysicalTrajectoryAnalyzer(fps=fps, court_roi_x=(court_x_min, court_x_max), court_roi_y=(0.0, float(orig_h)))
+    points = analyzer.extract_trajectory_points(detections)
+    arcs = analyzer.segment_flight_arcs(points)
+
+    rule_engine = BadmintonRuleEngine()
+    rallies = rule_engine.segment_rallies(points, arcs)
+    valid_rallies = [r for r in rallies if r.is_valid_rally]
+    logger.info(f"Segmented {len(valid_rallies)} valid rallies from {len(arcs)} flight arcs.")
+
+    # Populate HUD annotations
+    for d in detections:
+        d["rally_display"] = "REST / INTER-RALLY"
+        d["tactical_info"] = "STATUS: WAITING / READY"
+
+    for r in valid_rallies:
+        for s_idx, shot in enumerate(r.shots):
+            for f in range(shot.start_frame, shot.end_frame + 1):
+                if 0 <= f < total_frames:
+                    detections[f]["rally_display"] = f"RALLY #{r.rally_id} (SHOT {s_idx + 1}/{r.shot_count})"
+                    detections[f]["tactical_info"] = f"DIR: {shot.flight_direction.replace('_', ' ').upper()} | {shot.tactical_line.upper()}"
+
+        if r.terminal:
+            term_end_f = min(total_frames, r.end_frame + int(1.5 * fps))
+            for f in range(r.end_frame + 1, term_end_f):
+                detections[f]["rally_display"] = f"POINT: {r.terminal.scoring_side.replace('_', ' ').upper()}"
+                detections[f]["tactical_info"] = f"REASON: {r.terminal.terminal_type.replace('_', ' ').upper()}"
+
+    # Export structured rallies and shots JSON
+    rallies_export = []
+    for r in valid_rallies:
+        rallies_export.append({
+            "rally_id": r.rally_id,
+            "start_time_s": r.start_time_s,
+            "end_time_s": r.end_time_s,
+            "duration_s": r.duration_s,
+            "shot_count": r.shot_count,
+            "terminal": {
+                "terminal_type": r.terminal.terminal_type,
+                "scoring_side": r.terminal.scoring_side,
+                "landing_xy": r.terminal.landing_xy,
+                "reason": r.terminal.reason,
+            } if r.terminal else None,
+            "shots": [
+                {
+                    "shot_index": s_idx + 1,
+                    "start_time_s": round(s.start_time_s, 2),
+                    "end_time_s": round(s.end_time_s, 2),
+                    "flight_direction": s.flight_direction,
+                    "peak_speed_kmh": s.peak_speed_kmh,
+                    "tactical_line": s.tactical_line,
+                }
+                for s_idx, s in enumerate(r.shots)
+            ],
+        })
+
+    rallies_json_path = output_dir / f"{video_path.stem}_rallies_and_shots.json"
+    with open(rallies_json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "video": str(video_path),
+            "sport_id": "badminton",
+            "total_rallies": len(valid_rallies),
+            "rallies": rallies_export,
+        }, f, indent=2, ensure_ascii=False)
+    logger.info(f"Saved rally and shot analytics to {rallies_json_path}")
 
     # Export CSV
     csv_path = output_dir / f"{video_path.stem}_ball_tracknet_fast.csv"
@@ -360,6 +447,8 @@ def main():
         "jitter_metric_px": round(jitter, 2),
         "output_video": str(final_video),
         "output_csv": str(csv_path),
+        "total_rallies": len(valid_rallies),
+        "rallies_and_shots_json": str(rallies_json_path),
     }
 
     metrics_path = output_dir / f"{video_path.stem}_metrics.json"
