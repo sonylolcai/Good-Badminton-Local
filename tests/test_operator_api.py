@@ -75,6 +75,13 @@ class OperatorApiTests(unittest.TestCase):
         self.patch = patch("operator_api.main.get_db", return_value=self.database)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        app.state.auth_override = {
+            "id": "admin-1",
+            "username": "test-admin",
+            "must_change_password": False,
+            "roles": [{"role": "platform_admin", "venue_id": None}],
+        }
+        self.addCleanup(setattr, app.state, "auth_override", None)
         self.client = TestClient(app)
 
     def test_venue_list_is_named_json_not_positional_rows(self):

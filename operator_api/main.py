@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -26,6 +27,11 @@ from operator_api.services.operator_backoffice import (  # noqa: E402
     BackofficeError,
     BusinessDatabase,
     OperatorBackoffice,
+)
+from operator_api.services.auth import (  # noqa: E402
+    AuthService,
+    SESSION_COOKIE,
+    principal_has_permission,
 )
 
 
@@ -109,6 +115,32 @@ class CourtCalibrationRequest(BaseModel):
     cross_lines: list[CrossCourtLine] = Field(default_factory=list, max_length=2)
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=1000)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=1000)
+    new_password: str = Field(min_length=12, max_length=1000)
+
+
+class AdminCreateRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=120)
+    password: str = Field(min_length=12, max_length=1000)
+    role: Literal["platform_admin", "venue_admin"]
+    venue_id: str | None = None
+
+
+class PlayerCreateRequest(BaseModel):
+    nickname: str = Field(min_length=1, max_length=120)
+
+
+class PlayerUpdateRequest(BaseModel):
+    nickname: str = Field(min_length=1, max_length=120)
+    status: Literal["active", "disabled"]
+
+
 def _origins() -> list[str]:
     configured = os.environ.get("GOOD_BADMINTON_OPERATOR_API_ALLOWED_ORIGINS", "")
     return [item.strip() for item in configured.split(",") if item.strip()] or [
@@ -125,10 +157,51 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins(),
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "X-Request-ID"],
 )
+app.state.auth_override = None
+app.state.auth_service_override = None
+
+
+def get_auth_service() -> AuthService:
+    return app.state.auth_service_override or AuthService(get_db())
+
+
+@app.on_event("startup")
+def bootstrap_admin() -> None:
+    get_auth_service().bootstrap_if_needed()
+
+
+@app.middleware("http")
+async def require_admin_session(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or path in {"/api/v1/auth/login", "/api/v1/system/readiness"}:
+        return await call_next(request)
+    if not path.startswith("/api/v1/"):
+        return await call_next(request)
+    principal = app.state.auth_override
+    if principal is None:
+        token = request.cookies.get(SESSION_COOKIE, "")
+        principal = get_auth_service().authenticate(token) if token else None
+    if principal is None:
+        return JSONResponse(status_code=401, content={"error": {"code": "authentication_required", "message": "请先登录。"}})
+    if principal.get("must_change_password") and path not in {
+        "/api/v1/auth/me", "/api/v1/auth/change-password", "/api/v1/auth/logout"
+    }:
+        return JSONResponse(status_code=403, content={"error": {"code": "password_change_required", "message": "首次登录必须先修改密码。"}})
+    platform_only = (
+        "/api/v1/admins", "/api/v1/tenants", "/api/v1/venue-registrations",
+        "/api/v1/dashboard", "/api/v1/gpu", "/api/v1/cases",
+    )
+    if path.startswith(platform_only) and not principal_has_permission(principal, "platform.manage"):
+        return JSONResponse(status_code=403, content={"error": {"code": "permission_denied", "message": "仅平台管理员可执行此操作。"}})
+    match = re.match(r"^/api/v1/venues/([^/]+)", path)
+    if match and not principal_has_permission(principal, "venues.read", match.group(1)):
+        return JSONResponse(status_code=403, content={"error": {"code": "venue_scope_denied", "message": "无权访问该场馆。"}})
+    request.state.admin = principal
+    return await call_next(request)
 
 
 @app.exception_handler(BackofficeError)
@@ -149,6 +222,10 @@ def get_service() -> OperatorBackoffice:
 
 def get_db() -> BusinessDatabase:
     return BusinessDatabase()
+
+
+def _admin(request: Request) -> dict[str, Any]:
+    return request.state.admin
 
 
 def _tenant(row: list[str]) -> dict[str, str]:
@@ -246,6 +323,65 @@ def _edge_gateway_operator_video(path: str) -> tuple[bytes, str]:
         raise HTTPException(status_code=502, detail={"code": "edge_gateway_unavailable", "message": f"无法读取保存的录像：{exc}"}) from exc
 
 
+@app.post("/api/v1/auth/login")
+def login(request: LoginRequest) -> JSONResponse:
+    try:
+        token, principal = get_auth_service().login(request.username, request.password)
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail="用户名或密码错误。") from exc
+    response = JSONResponse({"admin": principal})
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=int(os.environ.get("GOOD_BADMINTON_ADMIN_SESSION_HOURS", "12")) * 3600,
+        httponly=True,
+        secure=os.environ.get("GOOD_BADMINTON_APP_ENV") == "production",
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+@app.get("/api/v1/auth/me")
+def current_admin(request: Request) -> dict[str, Any]:
+    return {"admin": _admin(request)}
+
+
+@app.post("/api/v1/auth/logout")
+def logout(request: Request) -> JSONResponse:
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if token:
+        get_auth_service().logout(token)
+    response = JSONResponse({"logged_out": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+@app.post("/api/v1/auth/change-password")
+def change_password(request: Request, payload: PasswordChangeRequest) -> dict[str, bool]:
+    try:
+        get_auth_service().change_password(_admin(request), payload.current_password, payload.new_password)
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail="当前密码错误。") from exc
+    return {"changed": True}
+
+
+@app.get("/api/v1/admins")
+def list_admins() -> dict[str, list[dict]]:
+    return {"admins": get_auth_service().list_admins()}
+
+
+@app.post("/api/v1/admins", status_code=status.HTTP_201_CREATED)
+def create_admin(request: Request, payload: AdminCreateRequest) -> dict[str, dict]:
+    try:
+        admin = get_auth_service().create_admin(
+            _admin(request), payload.username, payload.password, payload.role, payload.venue_id
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return {"admin": admin}
+
+
 @app.get("/api/v1/system/readiness")
 def get_readiness() -> dict[str, Any]:
     return get_db().readiness()
@@ -266,12 +402,45 @@ def list_tenants() -> dict[str, list[dict[str, str]]]:
 
 
 @app.get("/api/v1/venues")
-def list_venues() -> dict[str, Any]:
+def list_venues(request: Request) -> dict[str, Any]:
     db = get_db()
     readiness = db.readiness()
     if readiness.get("status") != "ready":
         return {"venues": [], "status": readiness}
-    return {"venues": [_venue(row) for row in db.list_venues()], "status": readiness}
+    venues = [_venue(row) for row in db.list_venues()]
+    principal = _admin(request)
+    if not principal_has_permission(principal, "platform.manage"):
+        allowed = {item["venue_id"] for item in principal.get("roles") or [] if item.get("venue_id")}
+        venues = [venue for venue in venues if venue["id"] in allowed]
+    return {"venues": venues, "status": readiness}
+
+
+@app.get("/api/v1/venues/{venue_id}/players")
+def list_players(request: Request, venue_id: Annotated[str, ApiPath(min_length=1)]) -> dict[str, list[dict]]:
+    return {"players": get_db().list_players(venue_id)}
+
+
+@app.post("/api/v1/venues/{venue_id}/players", status_code=status.HTTP_201_CREATED)
+def create_player(
+    request: Request,
+    venue_id: Annotated[str, ApiPath(min_length=1)],
+    payload: PlayerCreateRequest,
+) -> dict[str, dict]:
+    return {"player": get_db().create_player(venue_id, payload.nickname, _admin(request)["id"])}
+
+
+@app.patch("/api/v1/venues/{venue_id}/players/{player_id}")
+def update_player(
+    request: Request,
+    venue_id: Annotated[str, ApiPath(min_length=1)],
+    player_id: Annotated[str, ApiPath(min_length=1)],
+    payload: PlayerUpdateRequest,
+) -> dict[str, dict]:
+    return {
+        "player": get_db().update_player(
+            venue_id, player_id, payload.nickname, payload.status, _admin(request)["id"]
+        )
+    }
 
 
 @app.post("/api/v1/venue-registrations", status_code=status.HTTP_201_CREATED)
