@@ -143,6 +143,39 @@ class OperatorAuthApiTests(unittest.TestCase):
         self.assertEqual(resources.status_code, 200)
         self.assertEqual(full.status_code, 403)
 
+    def test_platform_admin_controls_the_global_retention_switch(self):
+        app.state.auth_override = {
+            "id": "admin-1",
+            "username": "platform-admin",
+            "must_change_password": False,
+            "roles": [{"role": "platform_admin", "venue_id": None}],
+        }
+
+        class Database:
+            policy = {
+                "enabled": False, "retention_days": 7, "timezone": "Asia/Shanghai",
+                "daily_run_time": "03:00:00", "last_started_at": None,
+                "last_completed_at": None, "updated_at": "2026-09-24T00:00:00Z",
+            }
+
+            def get_video_retention_policy(self):
+                return self.policy
+
+            def update_video_retention_policy(self, **values):
+                self.policy = {**self.policy, "enabled": values["enabled"], "retention_days": values["retention_days"]}
+                return self.policy
+
+        database = Database()
+        with patch("operator_api.main.get_db", return_value=database):
+            before = TestClient(app).get("/api/v1/settings/video-retention")
+            updated = TestClient(app).patch(
+                "/api/v1/settings/video-retention",
+                json={"enabled": True, "retention_days": 7, "timezone": "Asia/Shanghai", "daily_run_time": "03:00"},
+            )
+
+        self.assertFalse(before.json()["policy"]["enabled"])
+        self.assertTrue(updated.json()["policy"]["enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()

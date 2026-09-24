@@ -144,6 +144,13 @@ class PlayerUpdateRequest(BaseModel):
     status: Literal["active", "disabled"]
 
 
+class VideoRetentionPolicyRequest(BaseModel):
+    enabled: bool
+    retention_days: int = Field(default=7, ge=1, le=3650)
+    timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=80)
+    daily_run_time: str = Field(default="03:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
 def _origins() -> list[str]:
     configured = os.environ.get("GOOD_BADMINTON_OPERATOR_API_ALLOWED_ORIGINS", "")
     return [item.strip() for item in configured.split(",") if item.strip()] or [
@@ -201,7 +208,7 @@ async def require_admin_session(request: Request, call_next):
         return JSONResponse(status_code=403, content={"error": {"code": "password_change_required", "message": "首次登录必须先修改密码。"}})
     platform_only = (
         "/api/v1/admins", "/api/v1/tenants", "/api/v1/venue-registrations",
-        "/api/v1/dashboard", "/api/v1/gpu", "/api/v1/cases",
+        "/api/v1/dashboard", "/api/v1/gpu", "/api/v1/cases", "/api/v1/settings",
     )
     if path.startswith(platform_only) and not principal_has_permission(principal, "platform.manage"):
         return JSONResponse(status_code=403, content={"error": {"code": "permission_denied", "message": "仅平台管理员可执行此操作。"}})
@@ -393,6 +400,23 @@ def create_admin(request: Request, payload: AdminCreateRequest) -> dict[str, dic
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"admin": admin}
+
+
+@app.get("/api/v1/settings/video-retention")
+def get_video_retention_policy() -> dict[str, dict]:
+    return {"policy": get_db().get_video_retention_policy()}
+
+
+@app.patch("/api/v1/settings/video-retention")
+def update_video_retention_policy(request: Request, payload: VideoRetentionPolicyRequest) -> dict[str, dict]:
+    policy = get_db().update_video_retention_policy(
+        enabled=payload.enabled,
+        retention_days=payload.retention_days,
+        timezone_name=payload.timezone,
+        daily_run_time=payload.daily_run_time,
+        actor_admin_id=_admin(request)["id"],
+    )
+    return {"policy": policy}
 
 
 def _authorized_asset(request: Request, asset_id: str, permission: str) -> tuple[BusinessResourceService, dict]:

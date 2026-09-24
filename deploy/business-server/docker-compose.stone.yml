@@ -77,6 +77,22 @@ services:
     restart: unless-stopped
     networks: [private, stone_proxy]
 
+  retention-worker:
+    container_name: good-badminton-retention-worker
+    build:
+      context: ../..
+      dockerfile: deploy/business-server/Dockerfile.backend
+    env_file: /etc/good-badminton/business.env
+    command: ["python", "deploy/business-server/retention_worker.py"]
+    volumes:
+      - business_media:/var/lib/good-badminton/business-media
+      - edge_recordings:/var/lib/good-badminton/edge-recordings
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [private, stone_proxy]
+
   operator-web:
     container_name: good-badminton-operator-web
     build:

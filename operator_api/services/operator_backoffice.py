@@ -1195,6 +1195,94 @@ class BusinessDatabase:
             (status, asset_id),
         )
 
+    def expired_media_asset_ids(self, cutoff: datetime) -> list[str]:
+        return [
+            row["id"]
+            for row in self._dict_rows(
+                "SELECT id::text FROM business.media_assets "
+                "WHERE asset_type='video' AND upload_succeeded_at <= %s "
+                "AND status IN ('active', 'delete_failed') ORDER BY upload_succeeded_at, id",
+                (cutoff,),
+            )
+        ]
+
+    def audit_media_resource_deletion(self, asset_id: str, actor_admin_id: str | None, result: dict) -> None:
+        rows = self._dict_rows(
+            "SELECT tenant_id, venue_id FROM business.media_assets WHERE id=%s",
+            (asset_id,),
+        )
+        if not rows:
+            return
+        self._execute(
+            "INSERT INTO business.audit_events "
+            "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, tenant_id, venue_id, after_summary) "
+            "VALUES (%s, %s, %s, 'media.resources_deleted', 'media_asset', %s, %s, %s, %s::jsonb)",
+            (
+                str(uuid.uuid4()), "admin" if actor_admin_id else "system", actor_admin_id, asset_id,
+                rows[0]["tenant_id"], rows[0]["venue_id"], json.dumps(result, ensure_ascii=False),
+            ),
+        )
+
+    def get_video_retention_policy(self) -> dict[str, Any]:
+        rows = self._dict_rows(
+            "SELECT enabled, retention_days, timezone, daily_run_time::text, "
+            "last_started_at::text, last_completed_at::text, updated_at::text "
+            "FROM business.video_retention_policy WHERE id=1"
+        )
+        if not rows:
+            raise BackofficeError("视频保留策略尚未初始化。")
+        return rows[0]
+
+    def update_video_retention_policy(
+        self,
+        *,
+        enabled: bool,
+        retention_days: int,
+        timezone_name: str,
+        daily_run_time: str,
+        actor_admin_id: str,
+    ) -> dict[str, Any]:
+        try:
+            ZoneInfo(timezone_name)
+            parsed_time = datetime.strptime(daily_run_time, "%H:%M").time()
+        except (ValueError, TypeError) as exc:
+            raise BackofficeError("时区或每日执行时间无效。") from exc
+        if not 1 <= retention_days <= 3650:
+            raise BackofficeError("视频保留天数必须在 1 到 3650 之间。")
+        with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE business.video_retention_policy SET enabled=%s, retention_days=%s, timezone=%s, "
+                "daily_run_time=%s, updated_by_admin_id=%s, updated_at=now() WHERE id=1",
+                (enabled, retention_days, timezone_name, parsed_time, actor_admin_id),
+            )
+            cursor.execute(
+                "INSERT INTO business.audit_events "
+                "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, after_summary) "
+                "VALUES (%s, 'admin', %s, 'video_retention.updated', 'video_retention_policy', '1', %s::jsonb)",
+                (str(uuid.uuid4()), actor_admin_id, json.dumps({
+                    "enabled": enabled, "retention_days": retention_days,
+                    "timezone": timezone_name, "daily_run_time": daily_run_time,
+                }, ensure_ascii=False)),
+            )
+        return self.get_video_retention_policy()
+
+    def claim_video_retention_run(self) -> dict[str, Any] | None:
+        rows = self._dict_rows(
+            "UPDATE business.video_retention_policy SET last_started_at=now() WHERE id=1 AND enabled=true "
+            "AND (now() AT TIME ZONE timezone)::time >= daily_run_time "
+            "AND (last_completed_at IS NULL OR (last_completed_at AT TIME ZONE timezone)::date "
+            "< (now() AT TIME ZONE timezone)::date) "
+            "AND (last_started_at IS NULL OR last_started_at < now() - interval '1 hour') "
+            "RETURNING enabled, retention_days, timezone, daily_run_time::text, last_started_at::text",
+        )
+        return rows[0] if rows else None
+
+    def complete_video_retention_run(self) -> None:
+        self._execute(
+            "UPDATE business.video_retention_policy SET last_completed_at=now(), updated_at=now() WHERE id=1",
+            (),
+        )
+
     def delete_media_asset(self, asset_id: str, actor_admin_id: str) -> None:
         with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
             cursor.execute("SELECT tenant_id, venue_id FROM business.media_assets WHERE id=%s", (asset_id,))

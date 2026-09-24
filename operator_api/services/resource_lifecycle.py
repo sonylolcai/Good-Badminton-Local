@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from operator_api.services.remote_gpu import delete_remote_job, delete_remote_stream, submit_remote_job
@@ -84,7 +84,7 @@ class BusinessResourceService:
     def list_assets(self, venue_id: str | None = None) -> list[dict]:
         return self.database.list_media_assets(venue_id)
 
-    def delete_asset(self, asset_id: str, actor_admin_id: str, *, full: bool = False) -> dict:
+    def delete_asset(self, asset_id: str, actor_admin_id: str | None, *, full: bool = False) -> dict:
         asset = self.database.get_media_asset(asset_id)
         results = []
         for location in asset["locations"]:
@@ -107,7 +107,7 @@ class BusinessResourceService:
             self.database.delete_media_asset(asset_id, actor_admin_id)
         else:
             self.database.mark_media_asset_status(asset_id, "resources_deleted")
-        return {
+        result = {
             "id": asset_id,
             "venue_id": asset["venue_id"],
             "mode": "all" if full else "resources",
@@ -116,6 +116,18 @@ class BusinessResourceService:
             "record_deleted": bool(full and not failed),
             "locations": results,
         }
+        if hasattr(self.database, "audit_media_resource_deletion"):
+            self.database.audit_media_resource_deletion(asset_id, actor_admin_id, result)
+        return result
+
+    def cleanup_expired_videos(self, retention_days: int, *, now: datetime | None = None) -> dict:
+        current = now or datetime.now(timezone.utc)
+        cutoff = current - timedelta(days=retention_days)
+        results = [
+            self.delete_asset(asset_id, None)
+            for asset_id in self.database.expired_media_asset_ids(cutoff)
+        ]
+        return {"retention_days": retention_days, "cutoff": cutoff.isoformat(), "resources": results}
 
     def trigger_analysis(
         self,
