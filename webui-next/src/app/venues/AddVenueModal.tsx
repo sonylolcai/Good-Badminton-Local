@@ -2,7 +2,7 @@
 
 import { FormEvent, useMemo, useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
-import { operatorApiBaseUrl, readApiError, Tenant, VenueRegistrationCourt } from '@/lib/operator-api';
+import { apiFetch, readApiError, Tenant, VenueRegistrationCourt } from '@/lib/operator-api';
 import { useRouter } from 'next/navigation';
 
 const blankCourt = (sortOrder: number): VenueRegistrationCourt => ({
@@ -54,7 +54,7 @@ export default function AddVenueModal({ tenants }: { tenants: Tenant[] }) {
     }
     setLoading(true);
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venue-registrations`, {
+      const response = await apiFetch('/api/v1/venue-registrations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

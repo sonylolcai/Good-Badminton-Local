@@ -1,25 +1,28 @@
 import Link from 'next/link';
 import AddVenueModal from './AddVenueModal';
-import { operatorApiBaseUrl, Tenant, Venue } from '@/lib/operator-api';
+import { AdminPrincipal, isPlatformAdmin, Tenant, Venue } from '@/lib/operator-api';
+import { operatorServerFetch } from '@/lib/operator-api-server';
 
-async function loadData(): Promise<{ venues: Venue[]; tenants: Tenant[] }> {
+async function loadData(): Promise<{ venues: Venue[]; tenants: Tenant[]; platform: boolean }> {
   try {
-    const [venuesResponse, tenantsResponse] = await Promise.all([
-      fetch(`${operatorApiBaseUrl}/api/v1/venues`, { cache: 'no-store' }),
-      fetch(`${operatorApiBaseUrl}/api/v1/tenants`, { cache: 'no-store' }),
+    const [venuesResponse, tenantsResponse, meResponse] = await Promise.all([
+      operatorServerFetch('/api/v1/venues'),
+      operatorServerFetch('/api/v1/tenants'),
+      operatorServerFetch('/api/v1/auth/me'),
     ]);
     const venuesPayload = venuesResponse.ok ? await venuesResponse.json() as { venues?: Venue[] } : {};
     const tenantsPayload = tenantsResponse.ok ? await tenantsResponse.json() as { tenants?: Tenant[] } : {};
-    return { venues: venuesPayload.venues ?? [], tenants: tenantsPayload.tenants ?? [] };
+    const mePayload = meResponse.ok ? await meResponse.json() as { admin: AdminPrincipal } : null;
+    return { venues: venuesPayload.venues ?? [], tenants: tenantsPayload.tenants ?? [], platform: Boolean(mePayload && isPlatformAdmin(mePayload.admin)) };
   } catch {
-    return { venues: [], tenants: [] };
+    return { venues: [], tenants: [], platform: false };
   }
 }
 
 const venueStatusLabel = { active: '可用', inactive: '停用' } as const;
 
 export default async function VenuesPage() {
-  const { venues, tenants } = await loadData();
+  const { venues, tenants, platform } = await loadData();
 
   return (
     <div className="p-8">
@@ -28,7 +31,7 @@ export default async function VenuesPage() {
           <h1 className="text-3xl font-bold text-slate-900">球馆与场地</h1>
           <p className="text-slate-500 mt-2">注册后即可管理场地状态，并为现场终端绑定摄像头。</p>
         </div>
-        <AddVenueModal tenants={tenants} />
+        {platform && <AddVenueModal tenants={tenants} />}
       </div>
 
       <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">

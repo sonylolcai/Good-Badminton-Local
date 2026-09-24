@@ -1,7 +1,7 @@
 'use client';
 
 import { MouseEvent, useMemo, useState } from 'react';
-import { CourtOperation, operatorApiBaseUrl, readApiError } from '@/lib/operator-api';
+import { apiFetch, CourtOperation, readApiError } from '@/lib/operator-api';
 
 type Point = { x: number; y: number };
 type LineKey = 'left' | 'right' | 'cross0' | 'cross1';
@@ -108,7 +108,7 @@ export default function CourtCalibrationPanel({
   async function calculate() {
     setBusy('candidate'); setError('');
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venueId}/courts/${operation.court.id}/calibration-candidate`, {
+      const response = await apiFetch(`/api/v1/venues/${venueId}/courts/${operation.court.id}/calibration-candidate`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       });
       if (!response.ok) throw new Error(await readApiError(response));
@@ -123,7 +123,7 @@ export default function CourtCalibrationPanel({
     if (!candidate) return;
     setBusy('save'); setError('');
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venueId}/courts/${operation.court.id}/calibration`, {
+      const response = await apiFetch(`/api/v1/venues/${venueId}/courts/${operation.court.id}/calibration`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       });
       if (!response.ok) throw new Error(await readApiError(response));

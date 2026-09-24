@@ -1,16 +1,19 @@
 'use client'
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, MapPin, Server } from 'lucide-react';
+import { Database, LayoutDashboard, LogOut, MapPin, Server, Settings, Users } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
-export function Sidebar() {
+export function Sidebar({ platformAdmin, username, onLogout }: { platformAdmin: boolean; username: string; onLogout: () => void }) {
   const pathname = usePathname();
 
   const links = [
-    { name: 'Dashboard', href: '/', icon: LayoutDashboard },
-    { name: 'Venues & Courts', href: '/venues', icon: MapPin },
-    { name: 'GPU Services', href: '/gpu', icon: Server },
+    { name: '运营概览', href: '/', icon: LayoutDashboard, platformOnly: true },
+    { name: '球馆与场地', href: '/venues', icon: MapPin },
+    { name: '用户与球员', href: '/users', icon: Users },
+    { name: '视频资源', href: '/resources', icon: Database },
+    { name: 'GPU 服务', href: '/gpu', icon: Server, platformOnly: true },
+    { name: '系统设置', href: '/settings', icon: Settings, platformOnly: true },
   ];
 
   return (
@@ -19,8 +22,8 @@ export function Sidebar() {
         <h1 className="text-xl font-bold tracking-wider text-indigo-400">Good Badminton</h1>
       </div>
       <nav className="flex-1 px-4 py-6 space-y-2">
-        {links.map((link) => {
-          const isActive = pathname === link.href;
+        {links.filter((link) => !link.platformOnly || platformAdmin).map((link) => {
+          const isActive = pathname === link.href || (link.href !== '/' && pathname.startsWith(`${link.href}/`));
           const Icon = link.icon;
           return (
             <Link
@@ -37,6 +40,7 @@ export function Sidebar() {
           );
         })}
       </nav>
+      <div className="border-t border-slate-800 p-4"><p className="truncate px-2 text-sm text-slate-300">{username}</p><button type="button" onClick={onLogout} className="mt-2 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"><LogOut className="h-4 w-4"/>退出登录</button></div>
     </div>
   );
 }

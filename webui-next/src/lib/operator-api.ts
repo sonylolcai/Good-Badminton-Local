@@ -1,11 +1,26 @@
 export const operatorApiBaseUrl =
-  process.env.NEXT_PUBLIC_OPERATOR_API_BASE_URL ?? 'http://127.0.0.1:8000';
+  process.env.NEXT_PUBLIC_OPERATOR_API_BASE_URL ?? 'http://localhost:8000';
 
 // Server-rendered pages use Docker's private service network rather than the
 // public, Basic-Auth-protected reverse-proxy URL. Browser code must keep using
 // `operatorApiBaseUrl` so it goes through the public operator API route.
 export const operatorApiServerBaseUrl =
   process.env.OPERATOR_API_SERVER_BASE_URL ?? operatorApiBaseUrl;
+
+export function apiFetch(path: string, init: RequestInit = {}) {
+  return fetch(`${operatorApiBaseUrl}${path}`, { ...init, credentials: 'include' });
+}
+
+export interface AdminPrincipal {
+  id: string;
+  username: string;
+  must_change_password: boolean;
+  roles: { role: 'platform_admin' | 'venue_admin'; venue_id: string | null }[];
+}
+
+export function isPlatformAdmin(admin: AdminPrincipal) {
+  return admin.roles.some((assignment) => assignment.role === 'platform_admin');
+}
 
 export type CourtStatus = 'active' | 'maintenance' | 'inactive';
 export type CaptureMode = 'idle' | 'preview' | 'record';

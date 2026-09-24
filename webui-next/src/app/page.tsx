@@ -1,11 +1,11 @@
 import { MapPin, Users, Calendar } from 'lucide-react';
-import { operatorApiServerBaseUrl } from '@/lib/operator-api';
+import { operatorServerFetch } from '@/lib/operator-api-server';
 
 export const dynamic = 'force-dynamic';
 
 async function getDashboardData() {
   try {
-    const res = await fetch(`${operatorApiServerBaseUrl}/api/v1/dashboard`, { next: { revalidate: 10 } });
+    const res = await operatorServerFetch('/api/v1/dashboard');
     if (!res.ok) return null;
     return res.json();
   } catch {

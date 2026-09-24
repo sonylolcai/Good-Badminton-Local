@@ -1,12 +1,13 @@
 import Link from 'next/link';
 import CourtManagementClient from './CourtManagementClient';
-import { Court, operatorApiBaseUrl, Venue } from '@/lib/operator-api';
+import { Court, Venue } from '@/lib/operator-api';
+import { operatorServerFetch } from '@/lib/operator-api-server';
 
 async function loadVenue(venueId: string): Promise<{ venue: Venue | null; courts: Court[] }> {
   try {
     const [venueResponse, courtsResponse] = await Promise.all([
-      fetch(`${operatorApiBaseUrl}/api/v1/venues/${venueId}`, { cache: 'no-store' }),
-      fetch(`${operatorApiBaseUrl}/api/v1/venues/${venueId}/courts`, { cache: 'no-store' }),
+      operatorServerFetch(`/api/v1/venues/${venueId}`),
+      operatorServerFetch(`/api/v1/venues/${venueId}/courts`),
     ]);
     if (!venueResponse.ok || !courtsResponse.ok) return { venue: null, courts: [] };
     const venuePayload = await venueResponse.json() as { venue: Venue };

@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { Server, Activity, Cpu, AlertCircle, RefreshCw } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { operatorApiBaseUrl, readApiError } from '@/lib/operator-api';
+import { apiFetch, readApiError } from '@/lib/operator-api';
 
 type GpuStatus = {
   status?: string;
@@ -27,7 +27,7 @@ export default function GpuClient({ initialStatus }: { initialStatus: GpuStatus 
     e.preventDefault();
     setLoading(true);
     try {
-      const res = await fetch(`${operatorApiBaseUrl}/api/v1/gpu/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      const res = await apiFetch('/api/v1/gpu/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
         base_url: baseUrl,
         api_key: apiKey
       }) });
@@ -45,7 +45,7 @@ export default function GpuClient({ initialStatus }: { initialStatus: GpuStatus 
   const handleCheckHealth = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${operatorApiBaseUrl}/api/v1/gpu/status`);
+      const res = await apiFetch('/api/v1/gpu/status');
       if (!res.ok) throw new Error(await readApiError(res));
       setStatus(await res.json());
       setMessage('GPU 健康状态已刷新。');
@@ -58,7 +58,7 @@ export default function GpuClient({ initialStatus }: { initialStatus: GpuStatus 
   const handleOperation = async (op: 'start' | 'stop') => {
     setLoading(true);
     try {
-      const res = await fetch(`${operatorApiBaseUrl}/api/v1/gpu/operate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operation: op }) });
+      const res = await apiFetch('/api/v1/gpu/operate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operation: op }) });
       if (!res.ok) throw new Error(await readApiError(res));
       const result = await res.json();
       setMessage(result.message || `GPU ${op} 操作已提交。`);

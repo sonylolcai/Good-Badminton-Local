@@ -3,7 +3,7 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
-  CaptureMode, Court, CourtOperation, CourtStatus, GpuExecutionEvent, operatorApiBaseUrl, ReplayClip,
+  apiFetch, CaptureMode, Court, CourtOperation, CourtStatus, GpuExecutionEvent, operatorApiBaseUrl, ReplayClip,
   readApiError, Venue, VenueOperationsResponse,
 } from '@/lib/operator-api';
 import { formatChinaTime } from '@/lib/utils';
@@ -37,15 +37,15 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
 
   const loadOperations = useCallback(async () => {
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/operations`, { cache: 'no-store' });
+      const response = await apiFetch(`/api/v1/venues/${venue.id}/operations`, { cache: 'no-store' });
       if (!response.ok) throw new Error(await readApiError(response));
       const payload = await response.json() as VenueOperationsResponse;
       setOperations(payload.courts);
       const activeCases = payload.courts.flatMap((item) => item.case ? [{ courtId: item.court.id, caseItem: item.case }] : []);
       const loaded = await Promise.all(activeCases.map(async ({ courtId, caseItem }) => {
         const [eventResponse, replayResponse] = await Promise.all([
-          caseItem.gpu_analysis_session_id ? fetch(`${operatorApiBaseUrl}/api/v1/cases/${caseItem.id}/gpu-events?limit=8`, { cache: 'no-store' }) : null,
-          fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/courts/${courtId}/case/replays`, { cache: 'no-store' }),
+          caseItem.gpu_analysis_session_id ? apiFetch(`/api/v1/cases/${caseItem.id}/gpu-events?limit=8`, { cache: 'no-store' }) : null,
+          apiFetch(`/api/v1/venues/${venue.id}/courts/${courtId}/case/replays`, { cache: 'no-store' }),
         ]);
         const eventPayload = eventResponse?.ok ? await eventResponse.json() as { events?: GpuExecutionEvent[]; persisted_events?: GpuExecutionEvent[] } : {};
         const replayPayload = replayResponse.ok ? await replayResponse.json() as { replays?: ReplayClip[] } : {};
@@ -71,7 +71,7 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
   async function changeStatus(court: Court, nextStatus: CourtStatus) {
     setBusy(court.id); setError('');
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/courts/${court.id}/status`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: nextStatus }) });
+      const response = await apiFetch(`/api/v1/venues/${venue.id}/courts/${court.id}/status`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: nextStatus }) });
       if (!response.ok) throw new Error(await readApiError(response));
       const payload = await response.json() as { court: Court };
       setCourts((current) => current.map((item) => item.id === court.id ? payload.court : item));
@@ -86,7 +86,7 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
     if (!activeCase || !operation.camera.connected) return;
     setBusy(activeCase.id); setError('');
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/courts/${operation.court.id}/case/gpu-forwarding`, {
+      const response = await apiFetch(`/api/v1/venues/${venue.id}/courts/${operation.court.id}/case/gpu-forwarding`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !activeCase.gpu_forwarding_enabled }),
       });
       if (!response.ok) throw new Error(await readApiError(response));
@@ -99,7 +99,7 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
   async function setCaptureMode(operation: CourtOperation, mode: CaptureMode) {
     setBusy(operation.court.id); setError('');
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/courts/${operation.court.id}/capture`, {
+      const response = await apiFetch(`/api/v1/venues/${venue.id}/courts/${operation.court.id}/capture`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }),
       });
       if (!response.ok) throw new Error(await readApiError(response));
@@ -114,7 +114,7 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
     if (!activeCase) return;
     setBusy(`replay-${activeCase.id}`); setError('');
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/courts/${operation.court.id}/case/replays`, {
+      const response = await apiFetch(`/api/v1/venues/${venue.id}/courts/${operation.court.id}/case/replays`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seconds: 20 }),
       });
       if (!response.ok) throw new Error(await readApiError(response));
@@ -128,7 +128,7 @@ export default function CourtManagementClient({ venue, initialCourts }: { venue:
   async function addCourt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy('new'); setError('');
     try {
-      const response = await fetch(`${operatorApiBaseUrl}/api/v1/venues/${venue.id}/courts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, code, sort_order: courts.length, status: 'active' }) });
+      const response = await apiFetch(`/api/v1/venues/${venue.id}/courts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, code, sort_order: courts.length, status: 'active' }) });
       if (!response.ok) throw new Error(await readApiError(response));
       const payload = await response.json() as { court: Court };
       setCourts((current) => [...current, payload.court]); setName(''); setCode(''); setMessage('新场地已创建。'); router.refresh(); await loadOperations();

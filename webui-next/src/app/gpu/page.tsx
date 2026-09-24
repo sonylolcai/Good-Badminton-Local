@@ -1,11 +1,11 @@
 import GpuClient from './GpuClient';
-import { operatorApiServerBaseUrl } from '@/lib/operator-api';
+import { operatorServerFetch } from '@/lib/operator-api-server';
 
 export const dynamic = 'force-dynamic';
 
 async function getGpuStatus() {
   try {
-    const res = await fetch(`${operatorApiServerBaseUrl}/api/v1/gpu/status`, { next: { revalidate: 0 } });
+    const res = await operatorServerFetch('/api/v1/gpu/status');
     if (!res.ok) return null;
     return res.json();
   } catch {
