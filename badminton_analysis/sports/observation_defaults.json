@@ -1,0 +1,9 @@
+{
+  "motion_min_speed_diagonals_s": 0.02,
+  "motion_min_duration_s": 0.1,
+  "stationary_duration_s": 0.5,
+  "stationary_radius_diagonals": 0.002,
+  "stationary_max_speed_diagonals_s": 0.01,
+  "max_observation_gap_s": 0.15,
+  "turn_angle_degrees": 90.0
+}

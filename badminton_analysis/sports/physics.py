@@ -1,8 +1,4 @@
-"""Decoupled Physical Trajectory Analysis Layer.
-
-This module is strictly Newtonian physics, coordinate geometry, and kinematics.
-It does NOT contain any sport-specific scoring or game rules.
-"""
+"""Image-space motion evidence; no sample-specific geometry or assumed metric scale."""
 
 from __future__ import annotations
 
@@ -10,7 +6,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
+from .observation import ObservationConfig, image_diagonal
 
 
 @dataclass
@@ -19,193 +15,131 @@ class TrajectoryPoint:
     timestamp_s: float
     x: float
     y: float
-    speed_kmh: float = 0.0
+    speed_kmh: Optional[float] = None
     vx: float = 0.0
     vy: float = 0.0
     visible: bool = True
     in_court_roi: bool = True
+    ground_contact: bool = False
 
 
 @dataclass
 class FlightArc:
-    """A continuous single-flight segment between two physical events (hit, net collision, bounce, or floor)."""
+    """Observed motion segment, not proof of a racket stroke or player identity."""
     start_frame: int
     end_frame: int
     start_time_s: float
     end_time_s: float
     start_xy: Tuple[float, float]
     end_xy: Tuple[float, float]
-    peak_speed_kmh: float
-    terminal_speed_kmh: float
+    peak_speed_kmh: Optional[float]
+    terminal_speed_kmh: Optional[float]
     dx_px: float
     dy_px: float
-    flight_direction: str  # "far_to_near", "near_to_far", "lateral"
-    tactical_line: str     # "straight", "cross_court"
+    flight_direction: str
+    tactical_line: str
     points: List[TrajectoryPoint] = field(default_factory=list)
 
 
 class PhysicalTrajectoryAnalyzer:
-    """Extracts physical dynamics, flight arcs, and turning points from raw ball detections."""
-
-    def __init__(
-        self,
-        fps: float = 29.57,
-        court_roi_y: Tuple[float, float] = (700.0, 2100.0),
-        court_roi_x: Tuple[float, float] = (500.0, 3500.0),
-        dead_speed_threshold_kmh: float = 5.0,
-        min_in_flight_speed_kmh: float = 15.0,
-    ):
+    def __init__(self, fps: float, image_size: Tuple[int, int], config: Optional[ObservationConfig] = None):
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError("fps must be finite and positive")
         self.fps = fps
-        self.court_roi_y = court_roi_y
-        self.court_roi_x = court_roi_x
-        self.dead_speed_threshold_kmh = dead_speed_threshold_kmh
-        self.min_in_flight_speed_kmh = min_in_flight_speed_kmh
-
-    def get_perspective_m_per_px(self, y: float) -> float:
-        """Dynamic depth-aware scaling from far court to near baseline."""
-        y_clamped = max(self.court_roi_y[0], min(self.court_roi_y[1], float(y)))
-        # Far court (0.0052 m/px) to near baseline (0.0024 m/px)
-        ratio = (y_clamped - self.court_roi_y[0]) / (self.court_roi_y[1] - self.court_roi_y[0])
-        return 0.0052 - ratio * (0.0052 - 0.0024)
+        self.diagonal = image_diagonal(image_size)
+        if self.diagonal is None:
+            raise ValueError("image_size is required for normalized motion thresholds")
+        self.config = config or ObservationConfig.load()
 
     def extract_trajectory_points(self, raw_detections: List[Dict]) -> List[TrajectoryPoint]:
-        """Convert raw detection dicts into physically validated, speed-calibrated trajectory points."""
-        points: List[TrajectoryPoint] = []
+        points = []
         for d in raw_detections:
-            vis = bool(d.get("visible", False))
-            x = float(d["x"]) if d.get("x") is not None else 0.0
-            y = float(d["y"]) if d.get("y") is not None else 0.0
-            f_idx = int(d.get("frame_index", 0))
-            t_sec = float(d.get("timestamp_s", f_idx / self.fps))
-            in_roi = (
-                self.court_roi_x[0] <= x <= self.court_roi_x[1]
-                and self.court_roi_y[0] <= y <= self.court_roi_y[1]
+            x, y = d.get("x"), d.get("y")
+            visible = bool(d.get("visible")) and d.get("status", "detected") == "detected"
+            visible = visible and x is not None and y is not None
+            visible = visible and math.isfinite(float(x)) and math.isfinite(float(y))
+            frame = int(d["frame_index"])
+            point = TrajectoryPoint(
+                frame_index=frame,
+                timestamp_s=float(d.get("timestamp_s", frame / self.fps)),
+                x=float(x) if visible else 0.0,
+                y=float(y) if visible else 0.0,
+                visible=visible,
+                ground_contact=visible and d.get("ground_contact") is True,
             )
-            points.append(
-                TrajectoryPoint(
-                    frame_index=f_idx,
-                    timestamp_s=t_sec,
-                    x=x,
-                    y=y,
-                    visible=vis,
-                    in_court_roi=in_roi,
-                )
-            )
-
-        # Compute velocities and physical speeds
-        n = len(points)
-        for i in range(1, n):
-            cur = points[i]
-            prev = points[i - 1]
-            if cur.visible and prev.visible and (cur.frame_index - prev.frame_index == 1):
-                dx = cur.x - prev.x
-                dy = cur.y - prev.y
-                mid_y = (cur.y + prev.y) / 2.0
-                m_px = self.get_perspective_m_per_px(mid_y)
-                dist_m = math.hypot(dx, dy) * m_px
-                speed_kmh = (dist_m * self.fps) * 3.6
-                cur.vx = dx * self.fps
-                cur.vy = dy * self.fps
-                # Clamp physical max at 450 km/h
-                cur.speed_kmh = min(speed_kmh, 450.0)
-            else:
-                cur.speed_kmh = 0.0
-                cur.vx = 0.0
-                cur.vy = 0.0
-
+            if not math.isfinite(point.timestamp_s):
+                raise ValueError("timestamps must be finite")
+            if points:
+                previous = points[-1]
+                dt = point.timestamp_s - previous.timestamp_s
+                if point.frame_index <= previous.frame_index or dt <= 0:
+                    raise ValueError("detections must be ordered by increasing frame and timestamp")
+                if visible and previous.visible and dt <= self.config.max_observation_gap_s:
+                    point.vx = (point.x - previous.x) / dt
+                    point.vy = (point.y - previous.y) / dt
+            # A 2D image displacement does not establish a physical km/h speed.
+            points.append(point)
         return points
 
     def segment_flight_arcs(self, points: List[TrajectoryPoint]) -> List[FlightArc]:
-        """Segment continuous flight arcs using velocity vector inflection and net crossings."""
-        vis_pts = [p for p in points if p.visible and p.in_court_roi]
-        if len(vis_pts) < 4:
-            return []
+        arcs = []
+        current = []
+        previous = None
+        previous_velocity = None
+        min_speed = self.config.motion_min_speed_diagonals_s * self.diagonal
+        turn_cos = math.cos(math.radians(self.config.turn_angle_degrees))
 
-        arcs: List[FlightArc] = []
-        cur_arc_pts: List[TrajectoryPoint] = []
-        slow_count = 0
+        def flush():
+            if len(current) >= 2 and current[-1].timestamp_s - current[0].timestamp_s >= self.config.motion_min_duration_s:
+                arcs.append(self._build_arc(current))
+            current.clear()
 
-        for p in vis_pts:
-            # Dead-ball check: if ball is stationary/rolling on ground (< 6 km/h)
-            if p.speed_kmh <= self.dead_speed_threshold_kmh:
-                slow_count += 1
-                if slow_count >= 5:
-                    if len(cur_arc_pts) >= 4:
-                        arcs.append(self._build_arc(cur_arc_pts))
-                    cur_arc_pts = []
-                    continue
+        for point in points:
+            if not point.visible:
+                flush()
+                previous = previous_velocity = None
+                continue
+            if previous is None:
+                previous = point
+                continue
+            dt = point.timestamp_s - previous.timestamp_s
+            if dt <= 0 or dt > self.config.max_observation_gap_s:
+                flush()
+                previous, previous_velocity = point, None
+                continue
+            dx, dy = point.x - previous.x, point.y - previous.y
+            speed = math.hypot(dx, dy) / dt
+            if speed < min_speed:
+                flush()
+                previous_velocity = None
             else:
-                slow_count = 0
-
-            if not cur_arc_pts:
-                cur_arc_pts.append(p)
+                if previous_velocity is not None and current:
+                    vx, vy = previous_velocity
+                    cosine = (dx * vx + dy * vy) / (math.hypot(dx, dy) * math.hypot(vx, vy))
+                    if cosine <= turn_cos:
+                        flush()
+                if not current:
+                    current.append(previous)
+                current.append(point)
+                previous_velocity = (dx, dy)
+            if point.ground_contact:
+                flush()
+                previous = previous_velocity = None
                 continue
-
-            last = cur_arc_pts[-1]
-            # Frame gap break (>4 frames without ball)
-            if p.frame_index - last.frame_index > 4:
-                if len(cur_arc_pts) >= 4:
-                    arcs.append(self._build_arc(cur_arc_pts))
-                cur_arc_pts = [p]
-                continue
-
-            # Check directional inflection (turning point / hit)
-            if len(cur_arc_pts) >= 3:
-                dy_prev = cur_arc_pts[-1].y - cur_arc_pts[-3].y
-                dy_next = p.y - cur_arc_pts[-1].y
-                if (dy_prev < -15 and dy_next > 15) or (dy_prev > 15 and dy_next < -15):
-                    # Physical apex check: if inflection is high up near ceiling (y < 550),
-                    # it is an aerodynamic arc apex (rising then descending), not a player hit!
-                    if p.y < 550 or cur_arc_pts[-1].y < 550:
-                        cur_arc_pts.append(p)
-                        continue
-                    cur_arc_pts.append(p)
-                    arc = self._build_arc(cur_arc_pts)
-                    if self._is_valid_arc(arc):
-                        arcs.append(arc)
-                    cur_arc_pts = [p]
-                    continue
-
-            cur_arc_pts.append(p)
-
-        if len(cur_arc_pts) >= 4:
-            arc = self._build_arc(cur_arc_pts)
-            if self._is_valid_arc(arc):
-                arcs.append(arc)
-
+            previous = point
+        flush()
         return arcs
 
-    def _is_valid_arc(self, arc: FlightArc) -> bool:
-        """Filter out tiny jitter, rolling noise, or micro-movements."""
-        disp = math.hypot(arc.dx_px, arc.dy_px)
-        # Valid shot must either have peak speed >= 12 km/h or displacement >= 80px
-        return arc.peak_speed_kmh >= 12.0 or disp >= 80.0
-
-    def _build_arc(self, pts: List[TrajectoryPoint]) -> FlightArc:
-        start = pts[0]
-        end = pts[-1]
-        dx = end.x - start.x
-        dy = end.y - start.y
-
-        vert_dir = "far_to_near" if dy > 0 else "near_to_far"
-        # Cross court threshold: horizontal displacement > 350px
-        tactical_line = "cross_court" if abs(dx) > 350 else "straight"
-
-        peak_spd = max(p.speed_kmh for p in pts)
-        term_spd = pts[-1].speed_kmh
-
+    @staticmethod
+    def _build_arc(points: List[TrajectoryPoint]) -> FlightArc:
+        first, last = points[0], points[-1]
+        speeds = [p.speed_kmh for p in points if p.speed_kmh is not None]
         return FlightArc(
-            start_frame=start.frame_index,
-            end_frame=end.frame_index,
-            start_time_s=start.timestamp_s,
-            end_time_s=end.timestamp_s,
-            start_xy=(start.x, start.y),
-            end_xy=(end.x, end.y),
-            peak_speed_kmh=round(peak_spd, 1),
-            terminal_speed_kmh=round(term_spd, 1),
-            dx_px=round(dx, 1),
-            dy_px=round(dy, 1),
-            flight_direction=vert_dir,
-            tactical_line=tactical_line,
-            points=pts,
+            start_frame=first.frame_index, end_frame=last.frame_index,
+            start_time_s=first.timestamp_s, end_time_s=last.timestamp_s,
+            start_xy=(first.x, first.y), end_xy=(last.x, last.y),
+            peak_speed_kmh=max(speeds) if speeds else None,
+            terminal_speed_kmh=last.speed_kmh,
+            dx_px=last.x - first.x, dy_px=last.y - first.y,
+            flight_direction="unknown", tactical_line="unknown", points=list(points),
         )
