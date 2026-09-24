@@ -10,12 +10,14 @@ import json
 import os
 import re
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 
-from fastapi import FastAPI, HTTPException, Path as ApiPath, Request, status
+from fastapi import FastAPI, File, Form, HTTPException, Path as ApiPath, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
@@ -33,6 +35,7 @@ from operator_api.services.auth import (  # noqa: E402
     SESSION_COOKIE,
     principal_has_permission,
 )
+from operator_api.services.resource_lifecycle import BusinessResourceService, VIDEO_SUFFIXES  # noqa: E402
 
 
 CourtStatus = Literal["active", "maintenance", "inactive"]
@@ -163,10 +166,15 @@ app.add_middleware(
 )
 app.state.auth_override = None
 app.state.auth_service_override = None
+app.state.resource_service_override = None
 
 
 def get_auth_service() -> AuthService:
     return app.state.auth_service_override or AuthService(get_db())
+
+
+def get_resource_service() -> BusinessResourceService:
+    return app.state.resource_service_override or BusinessResourceService(get_db())
 
 
 @app.on_event("startup")
@@ -207,6 +215,11 @@ async def require_admin_session(request: Request, call_next):
 @app.exception_handler(BackofficeError)
 async def business_error_handler(_: Request, exc: BackofficeError) -> JSONResponse:
     return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"error": {"code": "business_validation_failed", "message": str(exc)}})
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"error": {"code": "validation_failed", "message": str(exc)}})
 
 
 def get_service() -> OperatorBackoffice:
@@ -380,6 +393,125 @@ def create_admin(request: Request, payload: AdminCreateRequest) -> dict[str, dic
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"admin": admin}
+
+
+def _authorized_asset(request: Request, asset_id: str, permission: str) -> tuple[BusinessResourceService, dict]:
+    service = get_resource_service()
+    try:
+        asset = service.database.get_media_asset(asset_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not principal_has_permission(_admin(request), permission, asset["venue_id"]):
+        raise HTTPException(status_code=403, detail="无权管理该场馆的视频。")
+    return service, asset
+
+
+@app.get("/api/v1/resources")
+def list_resources(request: Request, venue_id: str | None = None) -> dict[str, list[dict]]:
+    principal = _admin(request)
+    service = get_resource_service()
+    if principal_has_permission(principal, "platform.manage"):
+        return {"resources": service.list_assets(venue_id)}
+    allowed = [item["venue_id"] for item in principal.get("roles") or [] if item.get("venue_id")]
+    if venue_id and venue_id not in allowed:
+        raise HTTPException(status_code=403, detail="无权访问该场馆的视频。")
+    venues = [venue_id] if venue_id else allowed
+    return {"resources": [item for current in venues for item in service.list_assets(current)]}
+
+
+@app.post("/api/v1/resources", status_code=status.HTTP_201_CREATED)
+async def upload_resource(
+    request: Request,
+    video: UploadFile = File(...),
+    venue_id: str = Form(...),
+    player_id: str | None = Form(default=None),
+    match_id: str | None = Form(default=None),
+) -> dict[str, dict]:
+    principal = _admin(request)
+    if not principal_has_permission(principal, "resources.upload", venue_id):
+        raise HTTPException(status_code=403, detail="无权向该场馆上传视频。")
+    filename = Path(video.filename or "").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in VIDEO_SUFFIXES or not (video.content_type or "").startswith("video/"):
+        raise HTTPException(status_code=422, detail="仅支持 mp4、mov、mkv、avi 或 webm 视频。")
+    db = get_db()
+    venue = _require_venue(db, venue_id)
+    service = get_resource_service()
+    asset_id = str(uuid.uuid4())
+    target = service.target_path(asset_id, suffix)
+    limit = int(os.environ.get("GOOD_BADMINTON_MAX_VIDEO_UPLOAD_BYTES", str(20 * 1024**3)))
+    size = 0
+    try:
+        with target.open("xb") as output:
+            while chunk := await video.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(status_code=413, detail="视频超过允许的上传大小。")
+                output.write(chunk)
+        asset = service.register_uploaded_video(
+            asset_id=asset_id,
+            path=target,
+            tenant_id=venue["tenant_id"],
+            venue_id=venue_id,
+            player_id=(player_id or "").strip() or None,
+            match_id=(match_id or "").strip() or None,
+            media_type=video.content_type or "video/mp4",
+            original_filename=filename,
+            actor_admin_id=principal["id"],
+        )
+    except Exception:
+        target.unlink(missing_ok=True)
+        try:
+            target.parent.rmdir()
+        except OSError:
+            pass
+        raise
+    return {"resource": asset}
+
+
+@app.post("/api/v1/resources/{asset_id}/analysis", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_resource_analysis(
+    request: Request,
+    asset_id: Annotated[str, ApiPath(min_length=1)],
+    template: UploadFile = File(...),
+    corners_json: str = Form(...),
+    options_json: str = Form("{}"),
+) -> dict[str, dict]:
+    service, _asset = _authorized_asset(request, asset_id, "analysis.create")
+    suffix = Path(template.filename or "").suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".bmp"}:
+        raise HTTPException(status_code=422, detail="场地图仅支持 png、jpg、jpeg 或 bmp。")
+    try:
+        corners = json.loads(corners_json)
+        options = json.loads(options_json)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="解析参数必须是有效 JSON。") from exc
+    if not isinstance(options, dict):
+        raise HTTPException(status_code=422, detail="options_json 必须是 JSON 对象。")
+    with tempfile.TemporaryDirectory(prefix="business-analysis-") as temporary:
+        template_path = Path(temporary) / f"court{suffix}"
+        data = await template.read(20 * 1024 * 1024 + 1)
+        if len(data) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="场地图超过 20 MB。")
+        template_path.write_bytes(data)
+        result = service.trigger_analysis(asset_id, _admin(request)["id"], template_path, corners, options)
+    return {"analysis": result}
+
+
+@app.delete("/api/v1/resources/{asset_id}/resources")
+def delete_resource_files(request: Request, asset_id: Annotated[str, ApiPath(min_length=1)]):
+    service, _asset = _authorized_asset(request, asset_id, "resources.delete")
+    result = service.delete_asset(asset_id, _admin(request)["id"])
+    return JSONResponse(status_code=409 if result["status"] == "partial" else 200, content=result)
+
+
+@app.delete("/api/v1/resources/{asset_id}")
+def delete_resource_record(request: Request, asset_id: Annotated[str, ApiPath(min_length=1)]):
+    if not principal_has_permission(_admin(request), "platform.manage"):
+        raise HTTPException(status_code=403, detail="仅平台管理员可删除全部数据。")
+    service, _asset = _authorized_asset(request, asset_id, "resources.delete")
+    result = service.delete_asset(asset_id, _admin(request)["id"], full=True)
+    return JSONResponse(status_code=409 if result["status"] == "partial" else 200, content=result)
 
 
 @app.get("/api/v1/system/readiness")

@@ -1084,6 +1084,161 @@ class BusinessDatabase:
                order by j.created_at desc limit 100"""
         )
 
+    def register_media_asset(
+        self,
+        *,
+        asset_id: str,
+        tenant_id: str,
+        venue_id: str,
+        player_id: str | None,
+        match_id: str | None,
+        media_type: str,
+        original_filename: str,
+        uploaded_at: datetime,
+        location_id: str,
+        location_ref: str,
+        sha256_digest: str,
+        size_bytes: int,
+        actor_admin_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT tenant_id::text FROM business.venues WHERE id=%s AND status='active'",
+                (venue_id,),
+            )
+            venue = cursor.fetchone()
+            if venue is None or venue["tenant_id"] != tenant_id:
+                raise BackofficeError("未找到可用场馆。")
+            if player_id:
+                cursor.execute(
+                    "SELECT 1 FROM business.venue_memberships WHERE venue_id=%s AND user_id=%s AND status='active'",
+                    (venue_id, player_id),
+                )
+                if cursor.fetchone() is None:
+                    raise BackofficeError("球员不属于该场馆。")
+            cursor.execute(
+                "INSERT INTO business.media_assets "
+                "(id, tenant_id, venue_id, player_id, match_id, asset_type, media_type, original_filename, upload_succeeded_at) "
+                "VALUES (%s, %s, %s, %s, %s, 'video', %s, %s, %s)",
+                (asset_id, tenant_id, venue_id, player_id, match_id, media_type, original_filename, uploaded_at),
+            )
+            cursor.execute(
+                "INSERT INTO business.media_asset_locations "
+                "(id, media_asset_id, storage_backend, location_ref, sha256, size_bytes) "
+                "VALUES (%s, %s, 'local_disk', %s, %s, %s)",
+                (location_id, asset_id, location_ref, sha256_digest, size_bytes),
+            )
+            cursor.execute(
+                "INSERT INTO business.audit_events "
+                "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, tenant_id, venue_id, after_summary) "
+                "VALUES (%s, 'admin', %s, 'media.uploaded', 'media_asset', %s, %s, %s, %s::jsonb)",
+                (str(uuid.uuid4()), actor_admin_id, asset_id, tenant_id, venue_id,
+                 json.dumps({"original_filename": original_filename, "size_bytes": size_bytes}, ensure_ascii=False)),
+            )
+        return {
+            "id": asset_id,
+            "tenant_id": tenant_id,
+            "venue_id": venue_id,
+            "player_id": player_id,
+            "match_id": match_id,
+            "media_type": media_type,
+            "original_filename": original_filename,
+            "upload_succeeded_at": uploaded_at.isoformat(),
+            "status": "active",
+        }
+
+    def list_media_assets(self, venue_id: str | None = None) -> list[dict[str, Any]]:
+        where = "WHERE a.venue_id=%s" if venue_id else ""
+        params = (venue_id,) if venue_id else ()
+        return self._dict_rows(
+            "SELECT a.id::text, a.tenant_id::text, a.venue_id::text, a.player_id::text, a.match_id::text, "
+            "a.media_type, coalesce(a.original_filename, '') AS original_filename, "
+            "a.upload_succeeded_at::text, a.status, "
+            "coalesce(sum(l.size_bytes) FILTER (WHERE l.deletion_status <> 'deleted'), 0)::bigint AS size_bytes "
+            "FROM business.media_assets a LEFT JOIN business.media_asset_locations l ON l.media_asset_id=a.id "
+            f"{where} GROUP BY a.id ORDER BY a.upload_succeeded_at DESC",
+            params,
+        )
+
+    def get_media_asset(self, asset_id: str) -> dict[str, Any]:
+        rows = self._dict_rows(
+            "SELECT a.id::text, a.tenant_id::text, a.venue_id::text, a.player_id::text, a.match_id::text, "
+            "a.media_type, coalesce(a.original_filename, '') AS original_filename, "
+            "a.upload_succeeded_at::text, a.status, l.id::text AS location_id, l.storage_backend, "
+            "l.location_ref, l.deletion_status FROM business.media_assets a "
+            "LEFT JOIN business.media_asset_locations l ON l.media_asset_id=a.id WHERE a.id=%s "
+            "ORDER BY l.created_at",
+            (asset_id,),
+        )
+        if not rows:
+            raise FileNotFoundError(f"media asset not found: {asset_id}")
+        asset = {key: rows[0][key] for key in (
+            "id", "tenant_id", "venue_id", "player_id", "match_id", "media_type",
+            "original_filename", "upload_succeeded_at", "status",
+        )}
+        asset["locations"] = [
+            {key: row[key] for key in ("location_id", "storage_backend", "location_ref", "deletion_status")}
+            for row in rows if row["location_id"]
+        ]
+        return asset
+
+    def mark_media_location(self, location_id: str, status: str, error: str | None = None) -> None:
+        self._execute(
+            "UPDATE business.media_asset_locations SET deletion_status=%s, deletion_error=%s, "
+            "deleted_at=CASE WHEN %s='deleted' THEN now() ELSE NULL END, updated_at=now() WHERE id=%s",
+            (status, error, status, location_id),
+        )
+
+    def mark_media_asset_status(self, asset_id: str, status: str) -> None:
+        self._execute(
+            "UPDATE business.media_assets SET status=%s, updated_at=now() WHERE id=%s",
+            (status, asset_id),
+        )
+
+    def delete_media_asset(self, asset_id: str, actor_admin_id: str) -> None:
+        with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
+            cursor.execute("SELECT tenant_id, venue_id FROM business.media_assets WHERE id=%s", (asset_id,))
+            asset = cursor.fetchone()
+            if asset is None:
+                raise FileNotFoundError(f"media asset not found: {asset_id}")
+            cursor.execute("DELETE FROM business.analysis_jobs WHERE input_media_asset_id=%s", (asset_id,))
+            cursor.execute("DELETE FROM business.media_assets WHERE id=%s", (asset_id,))
+            cursor.execute(
+                "INSERT INTO business.audit_events "
+                "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, tenant_id, venue_id, after_summary) "
+                "VALUES (%s, 'admin', %s, 'media.deleted', 'media_asset', %s, %s, %s, '{}'::jsonb)",
+                (str(uuid.uuid4()), actor_admin_id, asset_id, asset["tenant_id"], asset["venue_id"]),
+            )
+
+    def create_manual_analysis_job(self, asset_id: str, actor_admin_id: str) -> str:
+        job_id = str(uuid.uuid4())
+        self._execute(
+            "INSERT INTO business.analysis_jobs "
+            "(id, status, job_type, input_media_asset_id, requested_by_admin_id, trigger_type) "
+            "VALUES (%s, 'uploading', 'video_analysis', %s, %s, 'manual')",
+            (job_id, asset_id, actor_admin_id),
+        )
+        return job_id
+
+    def bind_manual_analysis_job(self, job_id: str, asset_id: str, remote_job_id: str) -> None:
+        with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE business.analysis_jobs SET status='queued', external_analysis_session_id=%s "
+                "WHERE id=%s AND input_media_asset_id=%s",
+                (remote_job_id, job_id, asset_id),
+            )
+            cursor.execute(
+                "INSERT INTO business.media_asset_locations "
+                "(id, media_asset_id, storage_backend, location_ref) VALUES (%s, %s, 'gpu_http', %s)",
+                (str(uuid.uuid4()), asset_id, f"job:{remote_job_id}"),
+            )
+
+    def fail_manual_analysis_job(self, job_id: str, message: str) -> None:
+        self._execute(
+            "UPDATE business.analysis_jobs SET status='failed', finished_at=now() WHERE id=%s",
+            (job_id,),
+        )
+
     def list_compute_instances(self) -> list[list[str]]:
         return self._rows(
             """select id::text, provider, external_instance_id, display_name, status,

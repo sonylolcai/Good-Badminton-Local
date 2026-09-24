@@ -66,6 +66,9 @@ services:
       dockerfile: deploy/business-server/Dockerfile.backend
     env_file: /etc/good-badminton/business.env
     command: ["uvicorn", "operator_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    volumes:
+      - business_media:/var/lib/good-badminton/business-media
+      - edge_recordings:/var/lib/good-badminton/edge-recordings
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,6 +99,7 @@ networks:
 
 volumes:
   good_badminton_postgres:
+  business_media:
   edge_staging:
   edge_preview:
   edge_recordings:

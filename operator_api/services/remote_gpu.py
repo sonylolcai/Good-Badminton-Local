@@ -141,6 +141,37 @@ def run_remote_analysis(video_path, template_path, corners, options, output_dir,
     return downloaded
 
 
+def submit_remote_job(video_path, template_path, corners, options, business_task_id):
+    """Upload one manually requested business video and return the GPU receipt."""
+    config = remote_gpu_config()
+    if not config["api_key"]:
+        raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured")
+    return _submit_multipart(
+        config,
+        video_path=video_path,
+        template_path=template_path,
+        corners=corners,
+        options=_remote_options(options),
+        idempotency_key=business_task_id,
+    )
+
+
+def delete_remote_job(job_id, *, full=False):
+    config = remote_gpu_config()
+    if not config["api_key"]:
+        raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured")
+    suffix = "data" if full else "resources"
+    return _json_request(config, f"/api/v1/jobs/{job_id}/{suffix}", method="DELETE")
+
+
+def delete_remote_stream(session_id, *, full=False):
+    config = remote_gpu_config()
+    if not config["api_key"]:
+        raise RemoteAnalysisError("GOOD_BADMINTON_GPU_API_KEY is not configured")
+    suffix = "data" if full else "resources"
+    return _json_request(config, f"/api/v1/stream-sessions/{session_id}/{suffix}", method="DELETE")
+
+
 def _remote_options(options):
     # GPU API intentionally rejects arbitrary model paths; it owns the pinned
     # deployed model artifacts.  Everything else is part of the public contract.

@@ -58,6 +58,7 @@ class OperatorAuthApiTests(unittest.TestCase):
     def tearDown(self):
         app.state.auth_override = None
         app.state.auth_service_override = None
+        app.state.resource_service_override = None
 
     def test_login_sets_an_http_only_strict_session_cookie(self):
         principal = {
@@ -114,6 +115,33 @@ class OperatorAuthApiTests(unittest.TestCase):
 
         self.assertEqual(own.status_code, 200)
         self.assertEqual(other.status_code, 403)
+
+    def test_venue_admin_can_delete_resources_but_not_the_full_record(self):
+        app.state.auth_override = {
+            "id": "admin-2",
+            "username": "venue-admin",
+            "must_change_password": False,
+            "roles": [{"role": "venue_admin", "venue_id": "venue-1"}],
+        }
+
+        class Database:
+            def get_media_asset(self, asset_id):
+                return {"id": asset_id, "venue_id": "venue-1"}
+
+        service = MagicMock()
+        service.database = Database()
+        service.delete_asset.return_value = {
+            "id": "asset-1", "venue_id": "venue-1", "mode": "resources",
+            "status": "deleted", "retryable": False, "record_deleted": False, "locations": [],
+        }
+        app.state.resource_service_override = service
+        client = TestClient(app)
+
+        resources = client.delete("/api/v1/resources/asset-1/resources")
+        full = client.delete("/api/v1/resources/asset-1")
+
+        self.assertEqual(resources.status_code, 200)
+        self.assertEqual(full.status_code, 403)
 
 
 if __name__ == "__main__":

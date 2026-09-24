@@ -35,6 +35,7 @@ class FakeRepository:
         self.heartbeats = []
         self.capture_mode = "preview"
         self.calibration_id = "804ff390-87e9-497c-aae9-e0a56942e7cf"
+        self.recording_assets = []
 
     def binding(self, device_id, camera_id):
         if device_id != DEVICE_ID or camera_id != CAMERA_ID:
@@ -94,6 +95,9 @@ class FakeRepository:
     def mark_completed(self, session_id, gpu_status, receipt):
         self.sessions[session_id]["completed"] = (gpu_status, receipt)
 
+    def register_recording_asset(self, session, receipt, path):
+        self.recording_assets.append((session["id"], receipt["status"], str(path)))
+
 
 class FakeRelay:
     def __init__(self):
@@ -118,6 +122,9 @@ class FakeRecordingStore:
     def complete(self, session_id, expected_last_segment_index):
         self.completed.append((session_id, expected_last_segment_index))
         return {"status": "completed", "file_name": "recording.mp4", "segment_count": expected_last_segment_index + 1}
+
+    def recording_path(self, session_id):
+        return Path("recordings") / session_id / "recording.mp4"
 
     def save_latest_replay(self, session_id, seconds):
         self.stored.append((session_id, "replay", seconds, b""))
@@ -345,6 +352,7 @@ class EdgeIngestApiTests(unittest.TestCase):
         self.assertEqual(response.json()["gpu_status"], "finalized")
         self.assertEqual(response.json()["recording"]["status"], "completed")
         self.assertEqual(recording.completed, [(session["id"], 0)])
+        self.assertEqual(self.repository.recording_assets[0][0:2], (session["id"], "completed"))
         self.assertEqual(session["completed"][0], "finalized")
 
     def test_operator_replay_save_requires_the_server_secret(self):

@@ -140,6 +140,12 @@ class SessionRecordingStore:
             "sha256": hashlib.sha256(recording_path.read_bytes()).hexdigest(),
         }
 
+    def recording_path(self, session_id: str) -> Path:
+        path = self._session_root(session_id) / "recording.mp4"
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+
     def save_latest_replay(self, session_id: str, seconds: int) -> dict[str, Any]:
         session_root = self._session_root(session_id)
         segments = self._segments(session_root / "segments")
@@ -348,6 +354,43 @@ class PostgresEdgeRepository:
                where s.id=%s""",
             (session_id,),
         )
+
+    def register_recording_asset(self, session: dict[str, Any], receipt: dict[str, Any], path: Path) -> str:
+        asset_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"good-badminton-edge-recording:{session['id']}"))
+        location_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"good-badminton-edge-location:{session['id']}"))
+        with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
+            cursor.execute("SELECT tenant_id FROM business.venues WHERE id=%s", (session["venue_id"],))
+            venue = cursor.fetchone()
+            if venue is None:
+                raise ValueError("edge session venue was not found")
+            cursor.execute(
+                "INSERT INTO business.media_assets "
+                "(id, tenant_id, venue_id, asset_type, media_type, original_filename, upload_succeeded_at, metadata) "
+                "VALUES (%s, %s, %s, 'video', 'video/mp4', 'recording.mp4', now(), %s::jsonb) "
+                "ON CONFLICT (id) DO NOTHING",
+                (asset_id, venue["tenant_id"], session["venue_id"], json.dumps({"edge_ingest_session_id": session["id"]})),
+            )
+            cursor.execute(
+                "INSERT INTO business.media_asset_locations "
+                "(id, media_asset_id, storage_backend, location_ref, sha256, size_bytes) "
+                "VALUES (%s, %s, 'local_disk', %s, %s, %s) "
+                "ON CONFLICT (media_asset_id, storage_backend, location_ref) DO NOTHING",
+                (location_id, asset_id, str(path.resolve()), receipt.get("sha256"), path.stat().st_size),
+            )
+            if session.get("gpu_analysis_session_id"):
+                cursor.execute(
+                    "INSERT INTO business.media_asset_locations "
+                    "(id, media_asset_id, storage_backend, location_ref) VALUES (%s, %s, 'gpu_http', %s) "
+                    "ON CONFLICT (media_asset_id, storage_backend, location_ref) DO NOTHING",
+                    (str(uuid.uuid4()), asset_id, f"stream:{session['gpu_analysis_session_id']}"),
+                )
+            cursor.execute(
+                "INSERT INTO business.audit_events "
+                "(id, actor_type, action, resource_type, resource_id, venue_id, after_summary) "
+                "VALUES (%s, 'edge_gateway', 'media.uploaded', 'media_asset', %s, %s, %s::jsonb)",
+                (str(uuid.uuid4()), asset_id, session["venue_id"], json.dumps({"edge_ingest_session_id": session["id"]})),
+            )
+        return asset_id
 
     def receive_segment(self, session: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
         with self._connect() as connection, connection.cursor() as cursor:
@@ -725,6 +768,12 @@ def create_edge_app(
                 recording_store.complete(session_id, payload["expected_last_segment_index"])
                 if recording_store else {"status": "not_configured"}
             )
+            if recording.get("status") == "completed" and hasattr(repository, "register_recording_asset"):
+                repository.register_recording_asset(
+                    stored,
+                    recording,
+                    recording_store.recording_path(session_id),
+                )
             # A pilot court is allowed to stop a capture before the operator
             # enables GPU forwarding.  It has no upstream GPU session to
             # complete, but the edge session must still leave the active-set
