@@ -378,6 +378,59 @@ assert prepare_court_from_video
         self.assertEqual(trace["task"]["status"], "cancelled")
         self.assertEqual(trace["timing"]["current_stage"], "cancelled")
 
+    def test_video_resource_deletion_keeps_job_and_json_evidence(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "resource-delete-01"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={"court_corners": "[[1,1],[2,1],[2,2],[1,2]]"},
+        )
+        job_id = response.json()["job_id"]
+        self.client.delete(f"/api/v1/jobs/{job_id}", headers={"X-API-Key": "test-api-key"})
+        job_dir = Path(self.temp_dir.name) / "jobs" / job_id
+        (job_dir / "output" / "analysis.json").write_text("{}", encoding="utf-8")
+        (job_dir / "output" / "annotated.mp4").write_bytes(b"annotated-video")
+
+        deleted = self.client.delete(
+            f"/api/v1/jobs/{job_id}/resources",
+            headers={"X-API-Key": "test-api-key"},
+        )
+
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json()["mode"], "resources")
+        self.assertTrue((job_dir / "job.json").is_file())
+        self.assertTrue((job_dir / "output" / "analysis.json").is_file())
+        self.assertFalse(any(job_dir.rglob("*.mp4")))
+
+        removed = self.client.delete(
+            f"/api/v1/jobs/{job_id}/data",
+            headers={"X-API-Key": "test-api-key"},
+        )
+        self.assertEqual(removed.status_code, 200, removed.text)
+        self.assertEqual(removed.json()["mode"], "all")
+        self.assertFalse(job_dir.exists())
+
+    def test_running_job_resources_cannot_be_deleted(self):
+        response = self.client.post(
+            "/api/v1/jobs",
+            headers={"X-API-Key": "test-api-key", "X-Idempotency-Key": "active-resource-01"},
+            files={
+                "video": ("match.mp4", b"video-bytes", "video/mp4"),
+                "template": ("court.png", b"image-bytes", "image/png"),
+            },
+            data={"court_corners": "[[1,1],[2,1],[2,2],[1,2]]"},
+        )
+
+        deleted = self.client.delete(
+            f"/api/v1/jobs/{response.json()['job_id']}/resources",
+            headers={"X-API-Key": "test-api-key"},
+        )
+
+        self.assertEqual(deleted.status_code, 409)
+
     def test_job_uses_960_and_10hz_pose_defaults(self):
         response = self.client.post(
             "/api/v1/jobs",

@@ -92,7 +92,7 @@ class StreamSessionManager:
         configured_retention = (
             retention_hours
             if retention_hours is not None
-            else os.environ.get("GOOD_BADMINTON_STREAM_RETENTION_HOURS", "72")
+            else os.environ.get("GOOD_BADMINTON_STREAM_RETENTION_HOURS", "168")
         )
         self.retention_hours = float(configured_retention)
         if self.retention_hours <= 0:
@@ -301,7 +301,7 @@ class StreamSessionManager:
         return sessions
 
     def cleanup_expired_terminal_sessions(self, *, dry_run=True, now=None):
-        """List or remove only terminal session directories older than the TTL.
+        """List or remove terminal video bytes older than the upload TTL.
 
         Cleanup is never triggered implicitly by an API request. Operations can
         run this method from a scheduled maintenance command with ``dry_run``
@@ -317,15 +317,17 @@ class StreamSessionManager:
         for session in self._list_sessions():
             if session.get("status") not in TERMINAL_SESSION_STATES:
                 continue
+            uploaded_at = max(
+                (segment.get("received_at") for segment in (session.get("segments") or {}).values()),
+                default=(session.get("request") or {}).get("accepted_at"),
+            )
             try:
-                updated = datetime.fromisoformat(
-                    str(session.get("updated_at") or "").replace("Z", "+00:00")
-                )
+                uploaded = datetime.fromisoformat(str(uploaded_at or "").replace("Z", "+00:00"))
             except ValueError:
                 continue
-            if updated.tzinfo is None:
-                updated = updated.replace(tzinfo=timezone.utc)
-            if updated > cutoff:
+            if uploaded.tzinfo is None:
+                uploaded = uploaded.replace(tzinfo=timezone.utc)
+            if uploaded > cutoff:
                 continue
             session_id = str(session.get("analysis_session_id") or "")
             directory = self._session_dir(session_id).resolve()
@@ -335,16 +337,55 @@ class StreamSessionManager:
                 {
                     "analysis_session_id": session_id,
                     "status": session["status"],
-                    "updated_at": session.get("updated_at"),
+                    "uploaded_at": uploaded_at,
                     "path": str(directory),
                     "deleted": False,
                 }
             )
         if not dry_run:
             for candidate in candidates:
-                shutil.rmtree(candidate["path"])
-                candidate["deleted"] = True
+                result = self.delete_video_resources(candidate["analysis_session_id"])
+                candidate["deleted"] = result[1]["status"] == "deleted"
         return candidates
+
+    def delete_video_resources(self, session_id):
+        session = self._load(session_id)
+        if session is None:
+            raise session_not_found(session_id)
+        if session.get("status") not in TERMINAL_SESSION_STATES:
+            raise invalid_state("session must be terminal before deleting resources", session_id)
+        directory = self._session_dir(session_id).resolve()
+        segments = (directory / "segments").resolve()
+        if directory.parent != self.sessions_dir.resolve() or segments.parent != directory:
+            raise invalid_state("invalid session resource path", session_id)
+        if segments.is_dir():
+            shutil.rmtree(segments)
+        session["resource_deletion"] = {"status": "deleted", "updated_at": utc_now()}
+        self._save(session)
+        return 200, {
+            "analysis_session_id": session_id,
+            "mode": "resources",
+            "status": "deleted",
+        }
+
+    def delete_session_data(self, session_id):
+        session = self._load(session_id)
+        if session is None:
+            raise session_not_found(session_id)
+        if session.get("status") not in TERMINAL_SESSION_STATES:
+            raise invalid_state("session must be terminal before deleting data", session_id)
+        directory = self._session_dir(session_id).resolve()
+        if directory.parent != self.sessions_dir.resolve() or not directory.is_dir():
+            raise invalid_state("invalid session data path", session_id)
+        shutil.rmtree(directory)
+        self._engines.pop(session_id, None)
+        self._event_ids.pop(session_id, None)
+        self._cancelled_sessions.discard(session_id)
+        return 200, {
+            "analysis_session_id": session_id,
+            "mode": "all",
+            "status": "deleted",
+        }
 
     def _find_by_idempotency_key(self, key):
         if not key:

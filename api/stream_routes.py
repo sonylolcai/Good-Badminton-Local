@@ -164,3 +164,19 @@ def register_stream_routes(
     async def cancel_stream_session(session_id: str):
         response_status, payload = cancel_session_handler(stream_manager, session_id)
         return JSONResponse(status_code=response_status, content=payload)
+
+    @app.delete(
+        "/api/v1/stream-sessions/{session_id}/resources",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def delete_stream_resources(session_id: str):
+        response_status, payload = stream_manager.delete_video_resources(session_id)
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.delete(
+        "/api/v1/stream-sessions/{session_id}/data",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def delete_stream_data(session_id: str):
+        response_status, payload = stream_manager.delete_session_data(session_id)
+        return JSONResponse(status_code=response_status, content=payload)

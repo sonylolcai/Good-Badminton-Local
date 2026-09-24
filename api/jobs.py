@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import queue
+import shutil
 import threading
 import time
 import traceback
@@ -20,6 +21,7 @@ from badminton_analysis.cancellation import AnalysisCancelled
 
 
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 
 
 def utc_now():
@@ -176,6 +178,64 @@ class AnalysisJobManager:
                 self._set_status(job, "cancelling")
             self._write_job(job)
             return job
+
+    def delete_video_resources(self, job_id):
+        """Delete video bytes for a terminal job while retaining JSON evidence."""
+        with self._lock:
+            job = self.get_job(job_id)
+            if job is None:
+                return None
+            if job.get("status") not in TERMINAL_JOB_STATUSES:
+                raise ValueError(f"Job is {job.get('status')}")
+            directory = (self.jobs_dir / job_id).resolve()
+            if directory.parent != self.jobs_dir.resolve():
+                raise ValueError("Invalid job path")
+            deleted = []
+            try:
+                for path in directory.rglob("*"):
+                    resolved = path.resolve()
+                    if (
+                        path.is_file()
+                        and path.suffix.lower() in VIDEO_SUFFIXES
+                        and directory in resolved.parents
+                    ):
+                        path.unlink()
+                        deleted.append(path.relative_to(directory).as_posix())
+            except OSError as exc:
+                job["resource_deletion"] = {
+                    "status": "failed",
+                    "updated_at": utc_now(),
+                    "error": str(exc),
+                }
+                self._write_job(job)
+                raise
+            job["resource_deletion"] = {
+                "status": "deleted",
+                "updated_at": utc_now(),
+                "deleted_paths": deleted,
+            }
+            self._write_job(job)
+            return {
+                "job_id": job_id,
+                "mode": "resources",
+                "status": "deleted",
+                "deleted_paths": deleted,
+            }
+
+    def delete_job_data(self, job_id):
+        """Delete all persisted data for a terminal job."""
+        with self._lock:
+            job = self.get_job(job_id)
+            if job is None:
+                return None
+            if job.get("status") not in TERMINAL_JOB_STATUSES:
+                raise ValueError(f"Job is {job.get('status')}")
+            directory = (self.jobs_dir / job_id).resolve()
+            if directory.parent != self.jobs_dir.resolve() or not directory.is_dir():
+                raise ValueError("Invalid job path")
+            shutil.rmtree(directory)
+            self._cancel_events.pop(job_id, None)
+            return {"job_id": job_id, "mode": "all", "status": "deleted"}
 
     def get_job(self, job_id):
         path = self._job_path(job_id)

@@ -485,7 +485,7 @@ class StreamSessionManagerTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(status["progress"]["processed_segments"], 1)
 
-    def test_retention_cleanup_is_terminal_only_and_dry_run_by_default(self):
+    def test_retention_cleanup_removes_only_video_bytes_and_is_dry_run_by_default(self):
         manager = StreamSessionManager(
             Path(self.temp_dir.name),
             processor_factory=counting_processor_factory(),
@@ -494,6 +494,12 @@ class StreamSessionManagerTests(unittest.TestCase):
         )
         _, created = manager.create_session(create_request(), "business-stream-retention-01")
         session_id = created["analysis_session_id"]
+        manager.receive_segment(
+            session_id,
+            0,
+            segment_metadata(0, self.segment_bytes),
+            self.segment_bytes,
+        )
         manager.cancel(session_id)
         future = datetime.now(timezone.utc) + timedelta(hours=2)
 
@@ -505,7 +511,9 @@ class StreamSessionManagerTests(unittest.TestCase):
 
         deleted = manager.cleanup_expired_terminal_sessions(dry_run=False, now=future)
         self.assertTrue(deleted[0]["deleted"])
-        self.assertIsNone(manager.get_session(session_id))
+        self.assertIsNotNone(manager.get_session(session_id))
+        self.assertTrue(manager._manifest_path(session_id).is_file())
+        self.assertFalse(manager._segment_path(session_id, 0).exists())
 
 if __name__ == "__main__":
     unittest.main()

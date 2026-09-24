@@ -97,6 +97,39 @@ class StreamProductionRouteTests(unittest.TestCase):
         response = self.client.post("/api/v1/stream-sessions", json=create_request())
         self.assertEqual(response.status_code, 401)
 
+    def test_stream_video_resources_and_full_data_have_distinct_deletes(self):
+        response = self.client.post(
+            "/api/v1/stream-sessions",
+            headers={**self.headers, "X-Idempotency-Key": "resource-delete-session-01"},
+            json=create_request(),
+        )
+        session_id = response.json()["analysis_session_id"]
+        received = self.client.post(
+            f"/api/v1/stream-sessions/{session_id}/segments/0",
+            headers=self.headers,
+            files={"segment": ("segment-0.mp4", self.segment, "video/mp4")},
+            data={"metadata": json.dumps(segment_metadata(0, self.segment))},
+        )
+        self.assertEqual(received.status_code, 202, received.text)
+        self.client.delete(f"/api/v1/stream-sessions/{session_id}", headers=self.headers)
+        session_dir = Path(self.temporary.name) / "stream_sessions" / session_id
+
+        resources = self.client.delete(
+            f"/api/v1/stream-sessions/{session_id}/resources",
+            headers=self.headers,
+        )
+
+        self.assertEqual(resources.status_code, 200, resources.text)
+        self.assertTrue((session_dir / "manifest.json").is_file())
+        self.assertFalse((session_dir / "segments").exists())
+
+        full = self.client.delete(
+            f"/api/v1/stream-sessions/{session_id}/data",
+            headers=self.headers,
+        )
+        self.assertEqual(full.status_code, 200, full.text)
+        self.assertFalse(session_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

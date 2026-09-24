@@ -205,6 +205,20 @@ def create_app(
         job = manager.cancel_job(job_id)
         return _job_response(job)
 
+    @app.delete("/api/v1/jobs/{job_id}/resources", dependencies=[Depends(require_api_key)])
+    def delete_job_resources(job_id: str):
+        job = _require_job(manager, job_id)
+        if job["status"] not in {"succeeded", "failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail=f"Job is {job['status']}")
+        return manager.delete_video_resources(job_id)
+
+    @app.delete("/api/v1/jobs/{job_id}/data", dependencies=[Depends(require_api_key)])
+    def delete_job_data(job_id: str):
+        job = _require_job(manager, job_id)
+        if job["status"] not in {"succeeded", "failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail=f"Job is {job['status']}")
+        return manager.delete_job_data(job_id)
+
     @app.get("/api/v1/jobs/{job_id}/result", dependencies=[Depends(require_api_key)])
     def get_result(job_id: str):
         job = _require_job(manager, job_id)
