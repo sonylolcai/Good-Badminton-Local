@@ -27,8 +27,13 @@ def main() -> None:
             cursor.execute(
                 """create table if not exists business.schema_migrations (
                        version text primary key,
+                       description text not null default '',
                        applied_at timestamptz not null default now()
                    )"""
+            )
+            cursor.execute(
+                "alter table business.schema_migrations "
+                "add column if not exists description text not null default ''"
             )
             for migration_path in migration_files:
                 version = migration_path.name
@@ -37,7 +42,10 @@ def main() -> None:
                     print(f"skip {version}")
                     continue
                 cursor.execute(migration_path.read_text(encoding="utf-8"))
-                cursor.execute("insert into business.schema_migrations (version) values (%s)", (version,))
+                cursor.execute(
+                    "insert into business.schema_migrations (version, description) values (%s, %s)",
+                    (version, migration_path.stem),
+                )
                 print(f"apply {version}")
         connection.commit()
 

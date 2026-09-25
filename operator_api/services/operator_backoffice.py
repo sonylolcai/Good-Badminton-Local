@@ -1117,13 +1117,13 @@ class BusinessDatabase:
                 if cursor.fetchone() is None:
                     raise BackofficeError("球员不属于该场馆。")
             cursor.execute(
-                "INSERT INTO business.media_assets "
+                "INSERT INTO business.managed_media_resources "
                 "(id, tenant_id, venue_id, player_id, match_id, asset_type, media_type, original_filename, upload_succeeded_at) "
                 "VALUES (%s, %s, %s, %s, %s, 'video', %s, %s, %s)",
                 (asset_id, tenant_id, venue_id, player_id, match_id, media_type, original_filename, uploaded_at),
             )
             cursor.execute(
-                "INSERT INTO business.media_asset_locations "
+                "INSERT INTO business.managed_media_resource_locations "
                 "(id, media_asset_id, storage_backend, location_ref, sha256, size_bytes) "
                 "VALUES (%s, %s, 'local_disk', %s, %s, %s)",
                 (location_id, asset_id, location_ref, sha256_digest, size_bytes),
@@ -1155,7 +1155,7 @@ class BusinessDatabase:
             "a.media_type, coalesce(a.original_filename, '') AS original_filename, "
             "a.upload_succeeded_at::text, a.status, "
             "coalesce(sum(l.size_bytes) FILTER (WHERE l.deletion_status <> 'deleted'), 0)::bigint AS size_bytes "
-            "FROM business.media_assets a LEFT JOIN business.media_asset_locations l ON l.media_asset_id=a.id "
+            "FROM business.managed_media_resources a LEFT JOIN business.managed_media_resource_locations l ON l.media_asset_id=a.id "
             f"{where} GROUP BY a.id ORDER BY a.upload_succeeded_at DESC",
             params,
         )
@@ -1165,8 +1165,8 @@ class BusinessDatabase:
             "SELECT a.id::text, a.tenant_id::text, a.venue_id::text, a.player_id::text, a.match_id::text, "
             "a.media_type, coalesce(a.original_filename, '') AS original_filename, "
             "a.upload_succeeded_at::text, a.status, l.id::text AS location_id, l.storage_backend, "
-            "l.location_ref, l.deletion_status FROM business.media_assets a "
-            "LEFT JOIN business.media_asset_locations l ON l.media_asset_id=a.id WHERE a.id=%s "
+            "l.location_ref, l.deletion_status FROM business.managed_media_resources a "
+            "LEFT JOIN business.managed_media_resource_locations l ON l.media_asset_id=a.id WHERE a.id=%s "
             "ORDER BY l.created_at",
             (asset_id,),
         )
@@ -1184,14 +1184,14 @@ class BusinessDatabase:
 
     def mark_media_location(self, location_id: str, status: str, error: str | None = None) -> None:
         self._execute(
-            "UPDATE business.media_asset_locations SET deletion_status=%s, deletion_error=%s, "
+            "UPDATE business.managed_media_resource_locations SET deletion_status=%s, deletion_error=%s, "
             "deleted_at=CASE WHEN %s='deleted' THEN now() ELSE NULL END, updated_at=now() WHERE id=%s",
             (status, error, status, location_id),
         )
 
     def mark_media_asset_status(self, asset_id: str, status: str) -> None:
         self._execute(
-            "UPDATE business.media_assets SET status=%s, updated_at=now() WHERE id=%s",
+            "UPDATE business.managed_media_resources SET status=%s, updated_at=now() WHERE id=%s",
             (status, asset_id),
         )
 
@@ -1199,7 +1199,7 @@ class BusinessDatabase:
         return [
             row["id"]
             for row in self._dict_rows(
-                "SELECT id::text FROM business.media_assets "
+                "SELECT id::text FROM business.managed_media_resources "
                 "WHERE asset_type='video' AND upload_succeeded_at <= %s "
                 "AND status IN ('active', 'delete_failed') ORDER BY upload_succeeded_at, id",
                 (cutoff,),
@@ -1208,7 +1208,7 @@ class BusinessDatabase:
 
     def audit_media_resource_deletion(self, asset_id: str, actor_admin_id: str | None, result: dict) -> None:
         rows = self._dict_rows(
-            "SELECT tenant_id, venue_id FROM business.media_assets WHERE id=%s",
+            "SELECT tenant_id, venue_id FROM business.managed_media_resources WHERE id=%s",
             (asset_id,),
         )
         if not rows:
@@ -1258,7 +1258,7 @@ class BusinessDatabase:
             cursor.execute(
                 "INSERT INTO business.audit_events "
                 "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, after_summary) "
-                "VALUES (%s, 'admin', %s, 'video_retention.updated', 'video_retention_policy', '1', %s::jsonb)",
+                "VALUES (%s, 'admin', %s, 'video_retention.updated', 'video_retention_policy', NULL, %s::jsonb)",
                 (str(uuid.uuid4()), actor_admin_id, json.dumps({
                     "enabled": enabled, "retention_days": retention_days,
                     "timezone": timezone_name, "daily_run_time": daily_run_time,
@@ -1285,12 +1285,12 @@ class BusinessDatabase:
 
     def delete_media_asset(self, asset_id: str, actor_admin_id: str) -> None:
         with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
-            cursor.execute("SELECT tenant_id, venue_id FROM business.media_assets WHERE id=%s", (asset_id,))
+            cursor.execute("SELECT tenant_id, venue_id FROM business.managed_media_resources WHERE id=%s", (asset_id,))
             asset = cursor.fetchone()
             if asset is None:
                 raise FileNotFoundError(f"media asset not found: {asset_id}")
             cursor.execute("DELETE FROM business.analysis_jobs WHERE input_media_asset_id=%s", (asset_id,))
-            cursor.execute("DELETE FROM business.media_assets WHERE id=%s", (asset_id,))
+            cursor.execute("DELETE FROM business.managed_media_resources WHERE id=%s", (asset_id,))
             cursor.execute(
                 "INSERT INTO business.audit_events "
                 "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, tenant_id, venue_id, after_summary) "
@@ -1316,7 +1316,7 @@ class BusinessDatabase:
                 (remote_job_id, job_id, asset_id),
             )
             cursor.execute(
-                "INSERT INTO business.media_asset_locations "
+                "INSERT INTO business.managed_media_resource_locations "
                 "(id, media_asset_id, storage_backend, location_ref) VALUES (%s, %s, 'gpu_http', %s)",
                 (str(uuid.uuid4()), asset_id, f"job:{remote_job_id}"),
             )

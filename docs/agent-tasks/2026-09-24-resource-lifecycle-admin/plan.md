@@ -16,7 +16,7 @@
 ```text
 管理员浏览器
   -> operator-api 会话认证 + RBAC
-  -> business.media_assets / media_asset_locations / analysis_jobs
+  -> business.managed_media_resources / managed_media_resource_locations / analysis_jobs
   -> 业务独立媒体根目录
   -> 共享 GPU API（任务 id + API key）
 
@@ -40,8 +40,8 @@ retention-worker（单实例）
 - `business.admin_accounts`：用户名、scrypt 参数/盐/摘要、状态、必须改密、微信扩展字段、时间戳。
 - `business.admin_role_assignments`：固定角色 `platform_admin|venue_admin`，平台角色不带球馆，球馆角色必须带 `venue_id`。
 - `business.admin_sessions`：会话令牌摘要、过期、撤销、最近使用时间。
-- `business.media_assets`：逻辑资源，关联 tenant/venue/player/match/analysis job，类型、媒体类型、上传成功时间、保留状态。
-- `business.media_asset_locations`：每个本地/GPU/未来对象存储位置一行，含 backend、location、object key、sha256、size、删除状态/错误/时间。
+- `business.managed_media_resources`：后台资源生命周期账本，关联 tenant/venue/player/match/analysis job，类型、媒体类型、上传成功时间、保留状态；与既有交付表 `business.media_assets` 分离。
+- `business.managed_media_resource_locations`：每个本地/GPU/未来对象存储位置一行，含 backend、location、object key、sha256、size、删除状态/错误/时间。
 - `business.video_retention_policy`：单行配置，默认 `enabled=false`、`retention_days=7`、时区与每日执行时间。
 - 扩展 `business.analysis_jobs`：输入资源、请求管理员和手动触发信息。
 - 复用 `business.users` 作为球员资产，复用 `business.venue_memberships` 表示球员与球馆关系；后台登录身份不写入此表。

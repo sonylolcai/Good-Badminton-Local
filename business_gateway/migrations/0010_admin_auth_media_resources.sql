@@ -51,7 +51,7 @@ CREATE INDEX IF NOT EXISTS admin_sessions_account_active_idx
   ON business.admin_sessions (admin_account_id, expires_at DESC)
   WHERE revoked_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS business.media_assets (
+CREATE TABLE IF NOT EXISTS business.managed_media_resources (
   id uuid PRIMARY KEY,
   tenant_id uuid REFERENCES business.tenants(id),
   venue_id uuid REFERENCES business.venues(id),
@@ -68,15 +68,15 @@ CREATE TABLE IF NOT EXISTS business.media_assets (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS media_assets_venue_uploaded_idx
-  ON business.media_assets (venue_id, upload_succeeded_at DESC);
-CREATE INDEX IF NOT EXISTS media_assets_video_retention_idx
-  ON business.media_assets (upload_succeeded_at)
+CREATE INDEX IF NOT EXISTS managed_media_resources_venue_uploaded_idx
+  ON business.managed_media_resources (venue_id, upload_succeeded_at DESC);
+CREATE INDEX IF NOT EXISTS managed_media_resources_video_retention_idx
+  ON business.managed_media_resources (upload_succeeded_at)
   WHERE asset_type = 'video' AND status IN ('active', 'delete_failed');
 
-CREATE TABLE IF NOT EXISTS business.media_asset_locations (
+CREATE TABLE IF NOT EXISTS business.managed_media_resource_locations (
   id uuid PRIMARY KEY,
-  media_asset_id uuid NOT NULL REFERENCES business.media_assets(id) ON DELETE CASCADE,
+  media_asset_id uuid NOT NULL REFERENCES business.managed_media_resources(id) ON DELETE CASCADE,
   storage_backend text NOT NULL CHECK (storage_backend IN ('local_disk', 'gpu_http', 'object_storage')),
   location_ref text NOT NULL,
   object_key text,
@@ -90,8 +90,8 @@ CREATE TABLE IF NOT EXISTS business.media_asset_locations (
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (media_asset_id, storage_backend, location_ref)
 );
-CREATE INDEX IF NOT EXISTS media_asset_locations_delete_retry_idx
-  ON business.media_asset_locations (media_asset_id, deletion_status);
+CREATE INDEX IF NOT EXISTS managed_media_resource_locations_retry_idx
+  ON business.managed_media_resource_locations (media_asset_id, deletion_status);
 
 CREATE TABLE IF NOT EXISTS business.video_retention_policy (
   id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -109,12 +109,17 @@ VALUES (1)
 ON CONFLICT (id) DO NOTHING;
 
 ALTER TABLE business.analysis_jobs
-  ADD COLUMN IF NOT EXISTS input_media_asset_id uuid REFERENCES business.media_assets(id),
+  ADD COLUMN IF NOT EXISTS input_media_asset_id uuid REFERENCES business.managed_media_resources(id),
   ADD COLUMN IF NOT EXISTS requested_by_admin_id uuid REFERENCES business.admin_accounts(id),
   ADD COLUMN IF NOT EXISTS trigger_type text NOT NULL DEFAULT 'automatic'
     CHECK (trigger_type IN ('automatic', 'manual'));
 
 ALTER TABLE business.audit_events
   ADD COLUMN IF NOT EXISTS actor_admin_account_id uuid REFERENCES business.admin_accounts(id);
+ALTER TABLE business.audit_events
+  DROP CONSTRAINT IF EXISTS audit_events_actor_type_check;
+ALTER TABLE business.audit_events
+  ADD CONSTRAINT audit_events_actor_type_check
+  CHECK (actor_type IN ('user', 'system', 'edge', 'gpu', 'admin'));
 
 COMMIT;

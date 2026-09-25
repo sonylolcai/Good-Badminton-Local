@@ -12,10 +12,12 @@ class AdminResourceMigrationContractTests(unittest.TestCase):
         self.assertIn("business.admin_accounts", self.sql)
         self.assertIn("business.admin_role_assignments", self.sql)
         self.assertIn("business.admin_sessions", self.sql)
+        self.assertIn("'gpu', 'admin'", self.sql)
 
     def test_media_inventory_and_retention_policy_tables_exist(self):
-        self.assertIn("business.media_assets", self.sql)
-        self.assertIn("business.media_asset_locations", self.sql)
+        self.assertIn("business.managed_media_resources", self.sql)
+        self.assertIn("business.managed_media_resource_locations", self.sql)
+        self.assertNotIn("create table if not exists business.media_assets", self.sql)
         self.assertIn("business.video_retention_policy", self.sql)
 
 
