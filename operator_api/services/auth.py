@@ -233,6 +233,40 @@ class AuthService:
             self._audit(cursor, actor["id"], "admin.created", "admin_account", account_id, {"role": role, "venue_id": venue_id})
         return {"id": account_id, "username": username.strip(), "role": role, "venue_id": venue_id}
 
+    def set_admin_status(self, actor: dict, admin_id: str, status: str) -> dict:
+        if not principal_has_permission(actor, "admins.manage"):
+            raise PermissionError("platform administrator permission is required")
+        if status not in {"active", "disabled"}:
+            raise ValueError("invalid admin status")
+        if actor["id"] == admin_id and status == "disabled":
+            raise ValueError("cannot disable the current administrator")
+        with self.database._connect() as connection, connection.transaction(), connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT a.username, a.status, bool_or(r.role='platform_admin') AS is_platform "
+                "FROM business.admin_accounts a JOIN business.admin_role_assignments r ON r.admin_account_id=a.id "
+                "WHERE a.id=%s GROUP BY a.id",
+                (admin_id,),
+            )
+            account = cursor.fetchone()
+            if account is None:
+                raise ValueError("administrator not found")
+            if status == "disabled" and account["is_platform"]:
+                cursor.execute(
+                    "SELECT count(DISTINCT a.id) AS count FROM business.admin_accounts a "
+                    "JOIN business.admin_role_assignments r ON r.admin_account_id=a.id "
+                    "WHERE a.status='active' AND r.role='platform_admin'"
+                )
+                if int(cursor.fetchone()["count"]) <= 1:
+                    raise ValueError("cannot disable the last platform administrator")
+            cursor.execute("UPDATE business.admin_accounts SET status=%s, updated_at=now() WHERE id=%s", (status, admin_id))
+            if status == "disabled":
+                cursor.execute(
+                    "UPDATE business.admin_sessions SET revoked_at=now() WHERE admin_account_id=%s AND revoked_at IS NULL",
+                    (admin_id,),
+                )
+            self._audit(cursor, actor["id"], "admin.status_changed", "admin_account", admin_id, {"status": status})
+        return {"id": admin_id, "username": account["username"], "status": status}
+
     @staticmethod
     def _audit(cursor, actor_id: str, action: str, resource_type: str, resource_id: str, summary: dict) -> None:
         cursor.execute(

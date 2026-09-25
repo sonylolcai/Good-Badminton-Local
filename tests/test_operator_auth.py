@@ -30,6 +30,27 @@ class OperatorAuthTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "12"):
             hash_password("too-short")
 
+    def test_cannot_disable_the_last_platform_admin(self):
+        connection, cursor = MagicMock(), MagicMock()
+        connection.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.fetchone.side_effect = [
+            {"username": "other-admin", "status": "active", "is_platform": True},
+            {"count": 1},
+        ]
+        database = MagicMock()
+        database._connect.return_value = connection
+
+        with self.assertRaisesRegex(ValueError, "last platform"):
+            AuthService(database).set_admin_status(
+                {"id": "admin-1", "roles": [{"role": "platform_admin", "venue_id": None}]},
+                "admin-2",
+                "disabled",
+            )
+
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertFalse(any(statement.startswith("UPDATE business.admin_accounts") for statement in statements))
+
     def test_empty_database_bootstraps_one_forced_change_platform_admin(self):
         connection, cursor = MagicMock(), MagicMock()
         connection.__enter__.return_value = connection

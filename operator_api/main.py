@@ -135,6 +135,10 @@ class AdminCreateRequest(BaseModel):
     venue_id: str | None = None
 
 
+class AdminStatusRequest(BaseModel):
+    status: Literal["active", "disabled"]
+
+
 class PlayerCreateRequest(BaseModel):
     nickname: str = Field(min_length=1, max_length=120)
 
@@ -397,6 +401,19 @@ def create_admin(request: Request, payload: AdminCreateRequest) -> dict[str, dic
         admin = get_auth_service().create_admin(
             _admin(request), payload.username, payload.password, payload.role, payload.venue_id
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return {"admin": admin}
+
+
+@app.patch("/api/v1/admins/{admin_id}")
+def update_admin_status(
+    request: Request,
+    admin_id: Annotated[str, ApiPath(min_length=1)],
+    payload: AdminStatusRequest,
+) -> dict[str, dict]:
+    try:
+        admin = get_auth_service().set_admin_status(_admin(request), admin_id, payload.status)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"admin": admin}
