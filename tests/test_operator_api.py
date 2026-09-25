@@ -68,6 +68,20 @@ class FakeDatabase:
     def provision_edge_camera(self, *_):
         return {"device_id": "device-1", "camera_id": "camera-1", "device_secret": "one-time"}
 
+    def list_players(self):
+        return [{"id": "player-1", "nickname": "测试球员", "status": "active", "profile_visibility": "private"}]
+
+    def create_player(self, nickname, actor_admin_id):
+        self.player_create = (nickname, actor_admin_id)
+        return {"id": "player-2", "nickname": nickname, "status": "active", "profile_visibility": "private"}
+
+    def update_player(self, player_id, nickname, status, actor_admin_id):
+        self.player_update = (player_id, nickname, status, actor_admin_id)
+        return {"id": player_id, "nickname": nickname, "status": status, "profile_visibility": "private"}
+
+    def list_player_play_records(self, player_id):
+        return [{"player_id": player_id, "match_id": "match-1", "venue_id": "venue-1", "venue_name": "测试球馆", "court_id": "court-1", "court_name": "一号场"}]
+
 
 class OperatorApiTests(unittest.TestCase):
     def setUp(self):
@@ -103,6 +117,30 @@ class OperatorApiTests(unittest.TestCase):
             "tenant_name": "新租户", "venue_code": "new-venue", "venue_name": "新球馆", "courts": [],
         })
         self.assertEqual(response.status_code, 422)
+
+    def test_players_are_managed_globally_not_under_a_venue(self):
+        listed = self.client.get("/api/v1/players")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["players"][0]["id"], "player-1")
+
+        created = self.client.post("/api/v1/players", json={"nickname": "新球员"})
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(self.database.player_create, ("新球员", "admin-1"))
+
+        records = self.client.get("/api/v1/players/player-1/play-records")
+        self.assertEqual(records.status_code, 200)
+        self.assertEqual(records.json()["records"][0]["court_id"], "court-1")
+
+    def test_venue_admin_can_read_but_not_manage_global_players(self):
+        app.state.auth_override = {
+            "id": "venue-admin-1",
+            "username": "venue-admin",
+            "must_change_password": False,
+            "roles": [{"role": "venue_admin", "venue_id": "venue-1"}],
+        }
+        self.assertEqual(self.client.get("/api/v1/players").status_code, 200)
+        self.assertEqual(self.client.post("/api/v1/players", json={"nickname": "越权新增"}).status_code, 403)
+        self.assertEqual(self.client.get("/api/v1/players/player-1/play-records").status_code, 403)
 
     def test_court_status_is_a_patch_with_named_response(self):
         response = self.client.patch("/api/v1/venues/venue-1/courts/court-1/status", json={"status": "maintenance"})

@@ -19,7 +19,7 @@ ROLE_PERMISSIONS = {
     "platform_admin": {"*"},
     "venue_admin": {
         "venues.read",
-        "players.manage",
+        "players.read",
         "resources.read",
         "resources.upload",
         "resources.delete",

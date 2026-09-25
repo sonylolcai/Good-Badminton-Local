@@ -24,7 +24,7 @@ export default function ResourcesPage() {
 
   const loadVenueData = useCallback(async (selected: string) => {
     if (!selected) return;
-    const [resourcesResponse, playersResponse] = await Promise.all([apiFetch(`/api/v1/resources?venue_id=${encodeURIComponent(selected)}`), apiFetch(`/api/v1/venues/${selected}/players`)]);
+    const [resourcesResponse, playersResponse] = await Promise.all([apiFetch(`/api/v1/resources?venue_id=${encodeURIComponent(selected)}`), apiFetch('/api/v1/players')]);
     if (resourcesResponse.ok) setResources(((await resourcesResponse.json()) as { resources: MediaResource[] }).resources);
     if (playersResponse.ok) setPlayers(((await playersResponse.json()) as { players: Player[] }).players);
   }, []);

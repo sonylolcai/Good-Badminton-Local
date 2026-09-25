@@ -20,6 +20,13 @@ class AdminResourceMigrationContractTests(unittest.TestCase):
         self.assertNotIn("create table if not exists business.media_assets", self.sql)
         self.assertIn("business.video_retention_policy", self.sql)
 
+    def test_players_are_global_and_play_records_bind_venue_and_court(self):
+        self.assertIn("business.player_play_records", self.sql)
+        self.assertIn("mp.user_id as player_id", self.sql)
+        self.assertIn("m.venue_id", self.sql)
+        self.assertIn("m.court_id", self.sql)
+        self.assertIn("must not represent player ownership", self.sql)
+
 
 if __name__ == "__main__":
     unittest.main()

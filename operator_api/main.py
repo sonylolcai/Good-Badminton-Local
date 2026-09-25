@@ -588,32 +588,46 @@ def list_venues(request: Request) -> dict[str, Any]:
     return {"venues": venues, "status": readiness}
 
 
-@app.get("/api/v1/venues/{venue_id}/players")
-def list_players(request: Request, venue_id: Annotated[str, ApiPath(min_length=1)]) -> dict[str, list[dict]]:
-    return {"players": get_db().list_players(venue_id)}
+@app.get("/api/v1/players")
+def list_players(request: Request) -> dict[str, list[dict]]:
+    return {"players": get_db().list_players()}
 
 
-@app.post("/api/v1/venues/{venue_id}/players", status_code=status.HTTP_201_CREATED)
+@app.post("/api/v1/players", status_code=status.HTTP_201_CREATED)
 def create_player(
     request: Request,
-    venue_id: Annotated[str, ApiPath(min_length=1)],
     payload: PlayerCreateRequest,
 ) -> dict[str, dict]:
-    return {"player": get_db().create_player(venue_id, payload.nickname, _admin(request)["id"])}
+    principal = _admin(request)
+    if not principal_has_permission(principal, "players.manage"):
+        raise HTTPException(status_code=403, detail="仅平台管理员可新增球员。")
+    return {"player": get_db().create_player(payload.nickname, principal["id"])}
 
 
-@app.patch("/api/v1/venues/{venue_id}/players/{player_id}")
+@app.patch("/api/v1/players/{player_id}")
 def update_player(
     request: Request,
-    venue_id: Annotated[str, ApiPath(min_length=1)],
     player_id: Annotated[str, ApiPath(min_length=1)],
     payload: PlayerUpdateRequest,
 ) -> dict[str, dict]:
+    principal = _admin(request)
+    if not principal_has_permission(principal, "players.manage"):
+        raise HTTPException(status_code=403, detail="仅平台管理员可修改球员。")
     return {
         "player": get_db().update_player(
-            venue_id, player_id, payload.nickname, payload.status, _admin(request)["id"]
+            player_id, payload.nickname, payload.status, principal["id"]
         )
     }
+
+
+@app.get("/api/v1/players/{player_id}/play-records")
+def list_player_play_records(
+    request: Request,
+    player_id: Annotated[str, ApiPath(min_length=1)],
+) -> dict[str, list[dict]]:
+    if not principal_has_permission(_admin(request), "platform.manage"):
+        raise HTTPException(status_code=403, detail="仅平台管理员可查看完整打球记录。")
+    return {"records": get_db().list_player_play_records(player_id)}
 
 
 @app.post("/api/v1/venue-registrations", status_code=status.HTTP_201_CREATED)

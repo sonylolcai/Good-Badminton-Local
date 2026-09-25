@@ -22,8 +22,8 @@ class OperatorAuthTests(unittest.TestCase):
         venue = {"roles": [{"role": "venue_admin", "venue_id": "venue-1"}]}
 
         self.assertTrue(principal_has_permission(platform, "admins.manage"))
-        self.assertTrue(principal_has_permission(venue, "players.manage", "venue-1"))
-        self.assertFalse(principal_has_permission(venue, "players.manage", "venue-2"))
+        self.assertTrue(principal_has_permission(venue, "players.read", "venue-1"))
+        self.assertFalse(principal_has_permission(venue, "players.manage", "venue-1"))
         self.assertFalse(principal_has_permission(venue, "admins.manage", "venue-1"))
 
     def test_short_password_is_rejected(self):

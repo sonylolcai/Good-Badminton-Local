@@ -983,71 +983,63 @@ class BusinessDatabase:
     def list_people(self) -> list[list[str]]:
         return self._rows(
             """select u.id::text, coalesce(u.nickname, ''), u.status, u.profile_visibility,
-                      coalesce(string_agg(v.name || ':' || vm.role, ', ' order by v.name), '')
+                      count(r.match_id)::text
                from business.users u
-               left join business.venue_memberships vm on vm.user_id = u.id and vm.status = 'active'
-               left join business.venues v on v.id = vm.venue_id
+               left join business.player_play_records r on r.player_id = u.id
                group by u.id order by u.created_at desc"""
         )
 
-    def list_players(self, venue_id: str | None = None) -> list[dict[str, Any]]:
-        where = "WHERE vm.venue_id = %s" if venue_id else ""
-        params = (venue_id,) if venue_id else ()
+    def list_players(self) -> list[dict[str, Any]]:
         return self._dict_rows(
             "SELECT u.id::text, coalesce(u.nickname, '') AS nickname, u.status, "
-            "u.profile_visibility, vm.venue_id::text, v.name AS venue_name "
-            "FROM business.users u JOIN business.venue_memberships vm ON vm.user_id=u.id "
-            "AND vm.status='active' JOIN business.venues v ON v.id=vm.venue_id "
-            f"{where} ORDER BY u.created_at DESC",
-            params,
+            "u.profile_visibility FROM business.users u ORDER BY u.created_at DESC"
         )
 
-    def create_player(self, venue_id: str, nickname: str, actor_admin_id: str) -> dict[str, str]:
-        if not venue_id.strip() or not nickname.strip():
-            raise BackofficeError("场馆和球员名称均为必填项。")
+    def create_player(self, nickname: str, actor_admin_id: str) -> dict[str, str]:
+        if not nickname.strip():
+            raise BackofficeError("球员名称为必填项。")
         player_id = str(uuid.uuid4())
         with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
-            cursor.execute("SELECT name FROM business.venues WHERE id=%s AND status='active'", (venue_id,))
-            venue = cursor.fetchone()
-            if venue is None:
-                raise BackofficeError("未找到可用场馆。")
             cursor.execute(
                 "INSERT INTO business.users (id, nickname, status, profile_visibility) "
-                "VALUES (%s, %s, 'active', 'venue')",
+                "VALUES (%s, %s, 'active', 'private')",
                 (player_id, nickname.strip()),
             )
             cursor.execute(
-                "INSERT INTO business.venue_memberships (venue_id, user_id, role, status) "
-                "VALUES (%s, %s, 'viewer', 'active')",
-                (venue_id, player_id),
-            )
-            cursor.execute(
                 "INSERT INTO business.audit_events "
-                "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, venue_id, after_summary) "
-                "VALUES (%s, 'admin', %s, 'player.created', 'user', %s, %s, %s::jsonb)",
-                (str(uuid.uuid4()), actor_admin_id, player_id, venue_id, json.dumps({"nickname": nickname.strip()}, ensure_ascii=False)),
+                "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, after_summary) "
+                "VALUES (%s, 'admin', %s, 'player.created', 'player', %s, %s::jsonb)",
+                (str(uuid.uuid4()), actor_admin_id, player_id, json.dumps({"nickname": nickname.strip()}, ensure_ascii=False)),
             )
-        return {"id": player_id, "nickname": nickname.strip(), "status": "active", "venue_id": venue_id}
+        return {"id": player_id, "nickname": nickname.strip(), "status": "active", "profile_visibility": "private"}
 
-    def update_player(self, venue_id: str, player_id: str, nickname: str, status: str, actor_admin_id: str) -> dict[str, str]:
+    def update_player(self, player_id: str, nickname: str, status: str, actor_admin_id: str) -> dict[str, str]:
         if status not in _USER_STATUSES or not nickname.strip():
             raise BackofficeError("球员名称或状态无效。")
         with self._connect() as connection, connection.transaction(), connection.cursor() as cursor:
             cursor.execute(
-                "UPDATE business.users u SET nickname=%s, status=%s, updated_at=now() "
-                "FROM business.venue_memberships vm WHERE u.id=%s AND vm.user_id=u.id "
-                "AND vm.venue_id=%s AND vm.status='active'",
-                (nickname.strip(), status, player_id, venue_id),
+                "UPDATE business.users SET nickname=%s, status=%s, updated_at=now() WHERE id=%s",
+                (nickname.strip(), status, player_id),
             )
             if cursor.rowcount != 1:
-                raise BackofficeError("未找到该场馆中的球员。")
+                raise BackofficeError("未找到指定球员。")
             cursor.execute(
                 "INSERT INTO business.audit_events "
-                "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, venue_id, after_summary) "
-                "VALUES (%s, 'admin', %s, 'player.updated', 'user', %s, %s, %s::jsonb)",
-                (str(uuid.uuid4()), actor_admin_id, player_id, venue_id, json.dumps({"nickname": nickname.strip(), "status": status}, ensure_ascii=False)),
+                "(id, actor_type, actor_admin_account_id, action, resource_type, resource_id, after_summary) "
+                "VALUES (%s, 'admin', %s, 'player.updated', 'player', %s, %s::jsonb)",
+                (str(uuid.uuid4()), actor_admin_id, player_id, json.dumps({"nickname": nickname.strip(), "status": status}, ensure_ascii=False)),
             )
-        return {"id": player_id, "nickname": nickname.strip(), "status": status, "venue_id": venue_id}
+        return {"id": player_id, "nickname": nickname.strip(), "status": status, "profile_visibility": "private"}
+
+    def list_player_play_records(self, player_id: str) -> list[dict[str, Any]]:
+        return self._dict_rows(
+            """select player_id::text, match_id::text, venue_id::text, venue_name,
+                      court_id::text, court_name, match_format, lifecycle_status,
+                      team_id, slot_id, result_confirmation, started_at, ended_at
+               from business.player_play_records where player_id=%s
+               order by coalesce(started_at, created_at) desc""",
+            (player_id,),
+        )
 
     def save_person(self, user_id: str, nickname: str, status: str, visibility: str) -> str:
         if status not in _USER_STATUSES or visibility not in {"private", "venue"}:
@@ -1063,18 +1055,7 @@ class BusinessDatabase:
         return created_id
 
     def assign_membership(self, venue_id: str, user_id: str, role: str, status: str) -> None:
-        if role not in _MEMBERSHIP_ROLES or status not in {"active", "revoked"}:
-            raise BackofficeError("成员角色或状态无效。")
-        if not venue_id.strip() or not user_id.strip():
-            raise BackofficeError("场馆 ID 和用户 ID 均为必填项。")
-        self._execute(
-            """insert into business.venue_memberships (venue_id, user_id, role, status, revoked_at)
-               values (%s, %s, %s, %s, case when %s = 'revoked' then now() else null end)
-               on conflict (venue_id, user_id) do update set role=excluded.role, status=excluded.status,
-               revoked_at=case when excluded.status='revoked' then now() else null end""",
-            (venue_id.strip(), user_id.strip(), role, status, status),
-        )
-        self._audit("venue_membership.updated", "venue_membership", None, {"venue_ref": venue_id.strip(), "member_ref": user_id.strip(), "role": role, "status": status})
+        raise BackofficeError("球员不隶属于球馆；请通过比赛参与记录关联球员、球馆和球场。")
 
     def list_analysis_jobs(self) -> list[list[str]]:
         return self._rows(
@@ -1111,11 +1092,11 @@ class BusinessDatabase:
                 raise BackofficeError("未找到可用场馆。")
             if player_id:
                 cursor.execute(
-                    "SELECT 1 FROM business.venue_memberships WHERE venue_id=%s AND user_id=%s AND status='active'",
-                    (venue_id, player_id),
+                    "SELECT 1 FROM business.users WHERE id=%s AND status='active'",
+                    (player_id,),
                 )
                 if cursor.fetchone() is None:
-                    raise BackofficeError("球员不属于该场馆。")
+                    raise BackofficeError("未找到可用球员。")
             cursor.execute(
                 "INSERT INTO business.managed_media_resources "
                 "(id, tenant_id, venue_id, player_id, match_id, asset_type, media_type, original_filename, upload_succeeded_at) "
