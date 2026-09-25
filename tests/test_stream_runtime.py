@@ -10,6 +10,7 @@ from unittest.mock import patch
 import numpy as np
 
 from api.stream_runtime import StreamProcessorFactory
+from api.tracknet_stream import TrackNetStreamProcessor
 from api.vision_profiles import BADMINTON_PROFILE, TENNIS_PROFILE
 from badminton_analysis.streaming import FinalizationContext, FrameContext
 from tests.stream_test_utils import create_request
@@ -229,13 +230,17 @@ class StreamRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"missing required class \[badminton\]"):
             factory(session)
 
-    def test_tracknet_mode_requires_and_uses_explicit_temporal_adapter(self):
+    def test_tracknet_mode_requires_checkpoint_or_uses_explicit_temporal_adapter(self):
         session = create_request()
         session["configuration"]["shuttle_detector"] = "tracknet_v3"
         session["configuration"]["tracknet_overlap_frames"] = 7
         missing = self.factory()
-        with self.assertRaisesRegex(ValueError, "bounded-state temporal"):
-            missing.validate_session_request(session)
+        with patch.dict(
+            "os.environ",
+            {"GOOD_BADMINTON_STREAM_TRACKNET_MODEL": str(self.root / "missing.pt")},
+        ):
+            with self.assertRaisesRegex(ValueError, "bounded-state temporal model checkpoint"):
+                missing.validate_session_request(session)
 
         configured = self.factory(
             tracknet_processor_factory=lambda _session, _calibration: _TemporalProcessor()
@@ -243,6 +248,16 @@ class StreamRuntimeTests(unittest.TestCase):
         measurement, temporal = configured(session)
         self.assertIsNotNone(measurement)
         self.assertIsInstance(temporal, _TemporalProcessor)
+
+        model_path = self.root / "tracknet.pt"
+        model_path.write_bytes(b"stream checkpoint")
+        with patch.dict("os.environ", {"GOOD_BADMINTON_STREAM_TRACKNET_MODEL": str(model_path)}), patch(
+            "api.stream_runtime._load_tracknet_detector",
+            return_value=SimpleNamespace(seq_len=8),
+        ):
+            measurement, temporal = missing(session)
+        self.assertIsNotNone(measurement)
+        self.assertIsInstance(temporal, TrackNetStreamProcessor)
 
     def test_tennis_yolo_requires_tennis_checkpoint_and_emits_ball_observation(self):
         checkpoint = self.root / "tennis-ball-yolo.pt"

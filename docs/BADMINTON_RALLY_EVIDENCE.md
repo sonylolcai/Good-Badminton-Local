@@ -76,6 +76,8 @@ CSV 中 `ground_contact` 可为 `1`/`true`，但必须来自独立落地检测�
 TrackNet 主流程直接消费时序检测结果。在 `system.py` 中，TrackNet 分支调用
 `update_external_measurement()`，明确绕过 YOLO 距离门控；轻量离线工具直接
 使用 `LightweightTrackNetDetector` 的输出。流式 TrackNet 分支使用独立时序处理器。
+GPU 流式会话现在能跨切片保存 TrackNet 的 8 帧窗口并输出逐帧球观测；
+本文件的死球/界外规则仍只在离线分析路径运行，尚未接入流式事件。
 
 此前新增的 `tools/run_dynamic_gated_analysis.py` 是独立的 YOLO 实验脚本，
 把 TrackNet 当对比数据，并不是 TrackNet 的处理环节。仓库未发现主流程调用；

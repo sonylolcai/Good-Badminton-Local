@@ -4,15 +4,14 @@ The business service owns camera calibration.  Every stream session and its
 segments carry the same four image-space court corners; the GPU uses only that
 per-session input, never estimates a court or keeps a camera registry.
 
-TrackNetV3 is a temporal plug-in seam here.  The repository's current official
-TrackNet runner is complete-file/batch oriented, so production streaming must
-provide a bounded-state temporal processor factory explicitly; the runtime
-fails clearly instead of silently substituting YOLO or fabricated ball data.
+TrackNetV3 uses a bounded source-frame window in the built-in streaming
+adapter. Its checkpoint is separate from the player processor's checkpoint.
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import threading
 from collections import deque
@@ -117,6 +116,15 @@ def _load_ultralytics_model(model_path: str, cache_kind: str, *, expected_task: 
                 )
             _MODEL_CACHE[key] = model
         return model
+
+
+@lru_cache(maxsize=4)
+def _load_tracknet_detector(model_path: str, model_sha256: str, device: str):
+    # The detector's neural model is read-only. Each stream processor owns its
+    # image window and background, so sessions can safely share model weights.
+    from badminton_analysis.detection.lightweight_tracknet import LightweightTrackNetDetector
+
+    return LightweightTrackNetDetector(weights_path=model_path, device=device)
 
 
 def _derived_far_court_roi(corners, frame_shape):
@@ -511,9 +519,8 @@ class StreamProcessorFactory:
                 "streaming annotated-video export is not implemented; keep generate_annotated_video=false"
             )
         if configuration.get("shuttle_detector") == "tracknet_v3" and self.tracknet_processor_factory is None:
-            raise ValueError(
-                "TrackNetV3 streaming requires a configured bounded-state temporal processor factory"
-            )
+            self._tracknet_model_path()
+            self._tracknet_max_frame_interval_ratio()
         if (
             self.vision_profile.sport_id == "tennis"
             and configuration.get("shuttle_detector") == "yolo"
@@ -523,6 +530,30 @@ class StreamProcessorFactory:
     def _profile_environment(self, suffix: str, default: str) -> str:
         key = f"{self.vision_profile.model_environment_prefix}_{suffix}"
         return str(os.environ.get(key) or default).strip()
+
+    @staticmethod
+    def _tracknet_model_path() -> Path:
+        project_root = Path(__file__).resolve().parents[1]
+        configured = os.environ.get("GOOD_BADMINTON_STREAM_TRACKNET_MODEL")
+        path = Path(configured) if configured else project_root / "weights" / "tracknetv3" / "ckpts" / "TrackNet_best.pt"
+        if not path.is_file():
+            raise ValueError(
+                "TrackNetV3 streaming requires a configured bounded-state temporal model checkpoint: "
+                f"{path}"
+            )
+        return path
+
+    @staticmethod
+    def _tracknet_max_frame_interval_ratio() -> float:
+        try:
+            value = float(
+                os.environ.get("GOOD_BADMINTON_STREAM_TRACKNET_MAX_FRAME_INTERVAL_RATIO") or "1.5"
+            )
+        except ValueError as exc:
+            raise ValueError("TrackNet frame interval ratio must be numeric") from exc
+        if not math.isfinite(value) or value < 1.0:
+            raise ValueError("TrackNet frame interval ratio must be finite and at least 1")
+        return value
 
     @staticmethod
     def _tennis_ball_model_spec() -> dict[str, object]:
@@ -708,7 +739,23 @@ class StreamProcessorFactory:
             )
             return CompositeMeasurementProcessor(person, shuttle, candidate_photos), None
 
-        temporal = self.tracknet_processor_factory(session, calibration)
+        if self.tracknet_processor_factory is not None:
+            temporal = self.tracknet_processor_factory(session, calibration)
+        else:
+            from .tracknet_stream import TrackNetStreamProcessor
+
+            model_path = self._tracknet_model_path()
+            model_sha256 = _checkpoint_sha256(str(model_path))
+            temporal = TrackNetStreamProcessor(
+                _load_tracknet_detector(
+                    str(model_path.resolve()),
+                    model_sha256,
+                    str(os.environ.get("GOOD_BADMINTON_STREAM_TRACKNET_DEVICE") or "auto"),
+                ),
+                model_sha256=model_sha256,
+                model_checkpoint=model_path.name,
+                max_frame_interval_ratio=self._tracknet_max_frame_interval_ratio(),
+            )
         if temporal is None:
             raise RuntimeError("TrackNetV3 temporal processor factory returned no processor")
         return CompositeMeasurementProcessor(person, candidate_photos=candidate_photos), temporal

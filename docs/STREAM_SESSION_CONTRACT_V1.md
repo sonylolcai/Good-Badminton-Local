@@ -11,9 +11,11 @@ match lifecycle and the GPU computer-vision service that owns anonymous visual
 measurements. It supports 1–2 second independently decodable video segments so
 analysis can start before a match ends.
 
-This document and its JSON Schema are a **contract only**. They do not claim that
-the stream endpoints, cross-segment model state, live-camera path, or streaming SLO
-are implemented. The existing `/api/v1/jobs` complete-file API remains unchanged.
+This document and its JSON Schema define the wire contract. The repository has
+stream endpoints and checkpointed cross-segment processors, including the
+TrackNet source-frame adapter. This does not establish live-camera reliability,
+model accuracy or the streaming SLO. The `/api/v1/jobs` complete-file API remains
+separate.
 
 Machine-readable assets:
 
@@ -132,8 +134,12 @@ accuracy. If neither model is available, only a `yolo` request fails; the
 pose-only service remains usable.
 
 If `shuttle_detector=tracknet_v3`, `tracknet_overlap_frames` MUST be 7 when present,
-because the verified temporal window length is 8. This contract does not claim that
-TrackNet can use the common 10Hz sampling without changing model semantics.
+because the temporal window length is 8. The built-in adapter reads every decoded
+source frame independently of the 10/15/30Hz person sampling rate. Its checkpoint
+retains the window across ordered segments. The current decoder derives absolute
+frame numbers from segment start time and local FPS; until the upload supplies
+verified source PTS/frame identity, this detects visible gaps but cannot prove
+that every camera frame arrived.
 
 ### 4.2 Submit a segment
 
