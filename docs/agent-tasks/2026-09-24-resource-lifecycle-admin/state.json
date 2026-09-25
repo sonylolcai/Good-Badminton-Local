@@ -1,0 +1,49 @@
+{
+  "schema_version": "long-task.v1",
+  "task_id": "2026-09-24-resource-lifecycle-admin",
+  "status": "completed",
+  "repositories": [
+    {
+      "path": "S:\\Code Base\\MiniProgram\\bdTeach\\Good-Badminton",
+      "baseline_commit": "74b5fe3d1e7f8e869060a1239409829f852fbdc1",
+      "branch": "feat/match-clip-delivery"
+    },
+    {
+      "path": "S:\\Code Base\\MiniProgram\\bdTeach\\Good-Badminton-Evaluation-Platform",
+      "baseline_commit": "dfd3af576e6e9729ebb6c3eb22e6031ec66583c4",
+      "branch": "feat/evaluation-backend-separation"
+    }
+  ],
+  "approvals": {
+    "plan": { "approved_at": "2026-09-24T22:02:31+08:00", "wording": "批准" },
+    "tests": { "approved_at": "2026-09-24T22:07:00+08:00", "wording": "批准" }
+  },
+  "current_task": "T08",
+  "commits": [
+    "Good-Badminton:35d4597",
+    "Good-Badminton:e8a1d15",
+    "Good-Badminton:23dea8a",
+    "Good-Badminton:2b29511",
+    "Good-Badminton:8d9b52f",
+    "Good-Badminton:c4c350d",
+    "Good-Badminton:b3f4be5",
+    "Good-Badminton-Evaluation-Platform:5708407",
+    "Good-Badminton-Evaluation-Platform:93e6395",
+    "Good-Badminton-Evaluation-Platform:22ce89c"
+  ],
+  "checks": [
+    { "repository": "Good-Badminton", "command": "python -m unittest discover -s tests", "result": "361/362 passed; one pre-existing GPU/UI boundary failure outside task diff" },
+    { "repository": "Good-Badminton", "command": "python -m unittest tests.test_retention_worker tests.test_resource_lifecycle tests.test_operator_auth tests.test_admin_resource_api tests.test_operator_api tests.test_edge_ingest", "result": "42 passed" },
+    { "repository": "Good-Badminton", "command": "python -m unittest tests.test_operator_auth tests.test_admin_resource_api tests.test_operator_api", "result": "26 passed after administrator status completion" },
+    { "repository": "Good-Badminton/webui-next", "command": "npm run lint; npm run build", "result": "passed" },
+    { "repository": "Good-Badminton-Evaluation-Platform/backend", "command": "python -m unittest discover -s tests", "result": "80 passed" },
+    { "repository": "Good-Badminton-Evaluation-Platform", "command": "npm run lint; npm run check:boundaries; npm run build", "result": "passed" },
+    { "repository": "Good-Badminton/webui-next", "command": "Playwright login and protected-route smoke", "result": "login form rendered; unauthenticated root redirected to /login" }
+  ],
+  "updated_at": "2026-09-25T08:13:27+08:00",
+  "notes": [
+    "No production data deletion, deployment, push, or migration was performed.",
+    "The sole business full-suite failure is a baseline import from badminton_analysis/pipeline.py to webui.player_results; the file is unchanged from baseline.",
+    "Live database role flows, real GPU deletion, 24-hour scheduling, object storage, and WeChat website login remain environment or future work."
+  ]
+}
