@@ -234,6 +234,8 @@
         "segment_index": { "type": "integer", "minimum": 0 },
         "source_start_time_sec": { "type": "number", "minimum": 0 },
         "duration_sec": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
+        "source_frame_start_index": { "type": "integer", "minimum": 0 },
+        "source_frame_count": { "type": "integer", "minimum": 1 },
         "sha256": { "$ref": "#/$defs/sha256" },
         "idempotency_key": { "$ref": "#/$defs/opaqueId" },
         "content_type": {
@@ -242,6 +244,10 @@
         },
         "content_length_bytes": { "type": "integer", "minimum": 1 }
         ,"court_corners": { "$ref": "#/$defs/courtCorners" }
+      },
+      "dependentRequired": {
+        "source_frame_start_index": ["source_frame_count"],
+        "source_frame_count": ["source_frame_start_index"]
       }
     },
     "segmentReceipt": {

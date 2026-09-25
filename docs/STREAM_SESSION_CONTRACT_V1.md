@@ -136,10 +136,10 @@ pose-only service remains usable.
 If `shuttle_detector=tracknet_v3`, `tracknet_overlap_frames` MUST be 7 when present,
 because the temporal window length is 8. The built-in adapter reads every decoded
 source frame independently of the 10/15/30Hz person sampling rate. Its checkpoint
-retains the window across ordered segments. The current decoder derives absolute
-frame numbers from segment start time and local FPS; until the upload supplies
-verified source PTS/frame identity, this detects visible gaps but cannot prove
-that every camera frame arrived.
+retains the window across ordered segments when capture-side frame identity is
+declared. Without it, the decoder estimates frame numbers from segment start
+time and local FPS, and TrackNet treats the segment boundary as unknown rather
+than asserting a continuous window.
 
 ### 4.2 Submit a segment
 
@@ -150,6 +150,17 @@ Success definition: `segmentReceiptResponse`
 
 The path `segment_index`, metadata `segment_index`, content SHA-256 and actual byte
 length MUST agree before a receipt is committed.
+
+For a source that can declare a decoded frame sequence, the caller may send
+`source_frame_start_index` and `source_frame_count` together. The GPU decoder
+uses the declared starting index instead of estimating it from segment time and
+local FPS, then checks that the decoded frame count matches. TrackNet may carry
+its 8-frame window across a segment boundary only when both neighboring
+segments declare source frame identity and their indices/timestamps are
+continuous. Otherwise it marks ball continuity `unknown` and starts a new
+window. A local file segmenter may declare its post-encode decoded sequence;
+live capture should declare capture-side frame numbers. Neither proves that the
+camera itself did not drop frames before numbering them.
 
 | Case | HTTP | Required behavior |
 |---|---:|---|

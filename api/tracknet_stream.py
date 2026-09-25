@@ -48,6 +48,8 @@ class TrackNetStreamProcessor:
         self.last_source_time_sec: float | None = None
         self.frame_interval_sec: float | None = None
         self.frame_shape: tuple[int, int] | None = None
+        self.last_segment_index: int | None = None
+        self.last_source_frame_identity_declared = False
 
     @staticmethod
     def _resized_rgb(frame: np.ndarray) -> np.ndarray:
@@ -147,7 +149,19 @@ class TrackNetStreamProcessor:
         frame_index = int(context.source_frame_index)
         source_time_sec = float(context.source_time_sec)
         shape = tuple(int(value) for value in frame.shape[:2])
-        gap = self._detect_gap(frame_index, source_time_sec, shape)
+        segment_index = int(context.segment_index)
+        identity_declared = bool(getattr(context, "source_frame_identity_declared", False))
+        crossed_segment = (
+            self.last_frame_index is not None
+            and (self.last_segment_index is None or segment_index != self.last_segment_index)
+        )
+        gap = (
+            "source_frame_identity_unverified"
+            if crossed_segment and not (
+                identity_declared and self.last_source_frame_identity_declared
+            )
+            else self._detect_gap(frame_index, source_time_sec, shape)
+        )
         events: list[ProcessorEvent] = []
         if gap is not None:
             self._reset_window()
@@ -162,6 +176,8 @@ class TrackNetStreamProcessor:
         self.last_frame_index = frame_index
         self.last_source_time_sec = source_time_sec
         self.frame_shape = shape
+        self.last_segment_index = segment_index
+        self.last_source_frame_identity_declared = identity_declared
         if len(self.frames) == WINDOW_FRAMES:
             events.append(self._infer(shape, int(context.measurement_bucket)))
         return events
@@ -181,6 +197,8 @@ class TrackNetStreamProcessor:
             "last_source_time_sec": self.last_source_time_sec,
             "frame_interval_sec": self.frame_interval_sec,
             "frame_shape": list(self.frame_shape) if self.frame_shape is not None else None,
+            "last_segment_index": self.last_segment_index,
+            "last_source_frame_identity_declared": self.last_source_frame_identity_declared,
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
@@ -214,5 +232,12 @@ class TrackNetStreamProcessor:
         if shape is not None and (not isinstance(shape, list) or len(shape) != 2):
             raise ValueError("invalid TrackNet checkpoint source shape")
         self.frame_shape = tuple(int(value) for value in shape) if shape is not None else None
+        self.last_segment_index = (
+            int(state["last_segment_index"])
+            if state.get("last_segment_index") is not None else None
+        )
+        self.last_source_frame_identity_declared = bool(
+            state.get("last_source_frame_identity_declared", False)
+        )
         if (self.last_frame_index is None) != (self.last_source_time_sec is None):
             raise ValueError("incomplete TrackNet checkpoint cursor")

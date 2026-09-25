@@ -63,6 +63,7 @@ def validate_instance(instance, schema, root_schema, path="$"):
         "required",
         "properties",
         "additionalProperties",
+        "dependentRequired",
         "items",
         "minimum",
         "maximum",
@@ -119,6 +120,13 @@ def validate_instance(instance, schema, root_schema, path="$"):
         missing = set(schema.get("required", [])) - set(instance)
         if missing:
             raise ContractValidationError(f"{path}: missing required keys {sorted(missing)}")
+        for key, dependencies in schema.get("dependentRequired", {}).items():
+            if key in instance:
+                missing_dependencies = set(dependencies) - set(instance)
+                if missing_dependencies:
+                    raise ContractValidationError(
+                        f"{path}: {key} requires {sorted(missing_dependencies)}"
+                    )
         properties = schema.get("properties", {})
         if schema.get("additionalProperties") is False:
             extras = set(instance) - set(properties)
@@ -257,6 +265,14 @@ class StreamSessionContractTests(unittest.TestCase):
         metadata["sha256"] = "not-a-sha256"
         with self.assertRaises(ContractValidationError):
             validate_instance(metadata, self.schema["$defs"]["segmentMetadata"], self.schema)
+
+    def test_declared_source_frame_fields_are_paired(self):
+        metadata = dict(self.examples["segment_metadata.json"])
+        metadata["source_frame_start_index"] = 90
+        with self.assertRaises(ContractValidationError):
+            validate_instance(metadata, self.schema["$defs"]["segmentMetadata"], self.schema)
+        metadata["source_frame_count"] = 30
+        validate_instance(metadata, self.schema["$defs"]["segmentMetadata"], self.schema)
 
 
 if __name__ == "__main__":

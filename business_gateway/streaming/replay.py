@@ -68,6 +68,8 @@ def replay_video(
             idempotency_prefix=create_idempotency_key,
             content_type=artifact.content_type,
             court_corners=create_request["court_corners"],
+            source_frame_start_index=getattr(artifact, "source_frame_start_index", None),
+            source_frame_count=getattr(artifact, "source_frame_count", None),
         )
         upload_started = time.perf_counter()
         receipt = client.submit_segment(artifact.path, metadata)

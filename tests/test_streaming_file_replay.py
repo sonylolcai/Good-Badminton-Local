@@ -10,6 +10,7 @@ from badminton_analysis.streaming import (
     AnalysisEngine,
     FileReplayAdapter,
     OpenCVSegmentDecoder,
+    ReplayDecodeError,
     ProcessorEvent,
     ReplayUsageError,
     SegmentDescriptor,
@@ -111,6 +112,24 @@ class StreamingFileReplayTests(unittest.TestCase):
         self.assertAlmostEqual(packets[0].source_time_sec, 6.0)
         self.assertAlmostEqual(packets[-1].source_time_sec, 6.0 + 44 / 30.0, places=3)
         self.assertEqual(packets[0].source_frame_index, 180)
+
+    def test_declared_source_frames_override_time_estimate_and_validate_count(self):
+        digest = hashlib.sha256(self.video_path.read_bytes()).hexdigest()
+        descriptor = SegmentDescriptor(
+            segment_index=3,
+            source_start_time_sec=6.0,
+            duration_sec=1.5,
+            sha256=digest,
+            idempotency_key="uploaded-segment-3",
+            content_length_bytes=self.video_path.stat().st_size,
+            source_frame_start_index=177,
+            source_frame_count=45,
+        )
+        packets = list(OpenCVSegmentDecoder().decode(self.video_path, descriptor).frames)
+        self.assertEqual([packets[0].source_frame_index, packets[-1].source_frame_index], [177, 221])
+        wrong = SegmentDescriptor(**{**descriptor.__dict__, "source_frame_count": 44})
+        with self.assertRaisesRegex(ReplayDecodeError, "decoded 45 frames, expected 44"):
+            list(OpenCVSegmentDecoder().decode(self.video_path, wrong).frames)
 
 
 if __name__ == "__main__":

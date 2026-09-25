@@ -692,6 +692,8 @@ class StreamSessionManager:
             idempotency_key=entry["idempotency_key"],
             content_type=entry["content_type"],
             content_length_bytes=entry["content_length_bytes"],
+            source_frame_start_index=entry.get("source_frame_start_index"),
+            source_frame_count=entry.get("source_frame_count"),
         )
 
     # -- events ---------------------------------------------------------
@@ -906,6 +908,20 @@ class StreamSessionManager:
                 same_idempotency_key = (
                     existing.get("idempotency_key") == metadata["idempotency_key"]
                 )
+                same_source_identity = all(
+                    existing.get(field) == metadata.get(field)
+                    for field in (
+                        "source_start_time_sec",
+                        "duration_sec",
+                        "source_frame_start_index",
+                        "source_frame_count",
+                    )
+                )
+                if same_content and same_idempotency_key and not same_source_identity:
+                    raise invalid_state(
+                        f"segment_index {path_index} was retried with different source metadata",
+                        session_id,
+                    )
                 if same_content and same_idempotency_key:
                     session["status"] = self._derive_status(session)
                     self._save(session)
@@ -959,6 +975,8 @@ class StreamSessionManager:
                 "content_type": metadata["content_type"],
                 "content_length_bytes": metadata["content_length_bytes"],
                 "court_corners": metadata["court_corners"],
+                "source_frame_start_index": metadata.get("source_frame_start_index"),
+                "source_frame_count": metadata.get("source_frame_count"),
                 "received_at": received_at,
                 "reused": False,
                 "processing_disposition": disposition,

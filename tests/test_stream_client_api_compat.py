@@ -154,6 +154,8 @@ class StreamClientApiCompatibilityTests(unittest.TestCase):
                     duration_sec=1.0,
                     idempotency_prefix="real-http-segment-0001",
                     court_corners=[[0, 0], [64, 0], [64, 64], [0, 64]],
+                    source_frame_start_index=0,
+                    source_frame_count=30,
                 )
                 client = StreamSessionClient(
                     StreamClientConfig(
@@ -168,6 +170,8 @@ class StreamClientApiCompatibilityTests(unittest.TestCase):
                     idempotency_key="real-http-create-0001",
                 )
                 receipt = client.submit_segment(segment_path, metadata)
+                stored = app.state.stream_manager.get_session(created["analysis_session_id"])
+                self.assertEqual(stored["segments"]["0"]["source_frame_count"], 30)
                 app.state.stream_manager.drain()
                 status = client.get_status()
                 completed = client.complete(0)

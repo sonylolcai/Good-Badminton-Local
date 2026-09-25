@@ -367,6 +367,7 @@ def iter_remote_two_second_stream(
             # complete-file upload cannot silently become one long fragment.
             encoding_mode="h264",
             preserve_audio=False,
+            declare_frame_sequence=stream_configuration["shuttle_detector"] == "tracknet_v3",
         )
         last_index = -1
         for artifact in segmenter.iter_input(str(source), overwrite=True):
@@ -378,6 +379,8 @@ def iter_remote_two_second_stream(
                 idempotency_prefix=request_id,
                 content_type=artifact.content_type,
                 court_corners=normalized_corners,
+                source_frame_start_index=artifact.source_frame_start_index,
+                source_frame_count=artifact.source_frame_count,
             )
             receipt = client.submit_segment(artifact.path, metadata)
             last_index = artifact.segment_index

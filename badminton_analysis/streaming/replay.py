@@ -51,7 +51,11 @@ class OpenCVSegmentDecoder:
             if fps <= 0:
                 capture.release()
                 raise ReplayDecodeError(f"unable to read segment FPS: {path}")
-            source_frame_start = int(round(descriptor.source_start_time_sec * fps))
+            source_frame_start = (
+                descriptor.source_frame_start_index
+                if descriptor.source_frame_start_index is not None
+                else int(round(descriptor.source_start_time_sec * fps))
+            )
             local_index = 0
             try:
                 while True:
@@ -65,6 +69,13 @@ class OpenCVSegmentDecoder:
                         segment_index=descriptor.segment_index,
                     )
                     local_index += 1
+                if (
+                    descriptor.source_frame_count is not None
+                    and local_index != descriptor.source_frame_count
+                ):
+                    raise ReplayDecodeError(
+                        f"decoded {local_index} frames, expected {descriptor.source_frame_count}"
+                    )
             finally:
                 capture.release()
 

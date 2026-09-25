@@ -61,6 +61,8 @@ class SegmentDescriptor:
     content_type: str = "video/mp4"
     content_length_bytes: int = 1
     schema_version: str = STREAM_SCHEMA_VERSION
+    source_frame_start_index: int | None = None
+    source_frame_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != STREAM_SCHEMA_VERSION:
@@ -79,6 +81,13 @@ class SegmentDescriptor:
             raise ValueError("content_type is required")
         if self.content_length_bytes <= 0:
             raise ValueError("content_length_bytes must be positive")
+        if (self.source_frame_start_index is None) != (self.source_frame_count is None):
+            raise ValueError("source frame start and count must be provided together")
+        if self.source_frame_start_index is not None:
+            if not isinstance(self.source_frame_start_index, int) or isinstance(self.source_frame_start_index, bool) or self.source_frame_start_index < 0:
+                raise ValueError("source_frame_start_index must be a non-negative integer")
+            if not isinstance(self.source_frame_count, int) or isinstance(self.source_frame_count, bool) or self.source_frame_count <= 0:
+                raise ValueError("source_frame_count must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -117,6 +126,7 @@ class FrameContext:
     source_time_sec: float
     is_measurement_frame: bool
     measurement_bucket: int
+    source_frame_identity_declared: bool = False
 
 
 @dataclass(frozen=True)

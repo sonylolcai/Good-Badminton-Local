@@ -37,6 +37,7 @@ def _context(index, segment_index, fps=30):
         source_time_sec=index / fps,
         is_measurement_frame=True,
         measurement_bucket=index,
+        source_frame_identity_declared=True,
     )
 
 
@@ -52,6 +53,8 @@ class TrackNetStreamTests(unittest.TestCase):
                 duration_sec=4 / 30.0,
                 sha256=hashlib.sha256(str(index).encode()).hexdigest(),
                 idempotency_key=f"segment-{index}",
+                source_frame_start_index=start,
+                source_frame_count=4,
             )
             return FrameSegment(descriptor, (
                 FramePacket(frame, source_frame_index=number,
@@ -126,6 +129,24 @@ class TrackNetStreamTests(unittest.TestCase):
         self.assertEqual(len(gap), 1)
         self.assertEqual(gap[0].data["ball_continuity"], "unknown")
         self.assertEqual(gap[0].data["reason"], "source_frame_index_gap")
+        self.assertEqual(len(processor.frames), 1)
+
+    def test_unverified_boundary_resets_window_without_claiming_continuity(self):
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        processor = TrackNetStreamProcessor(_Detector(), model_sha256="e" * 64)
+        for index in range(8):
+            processor.process_frame(frame, _context(index, 0))
+        unverified = FrameContext(
+            analysis_session_id="ssn_tracknet_stream",
+            segment_index=1,
+            source_frame_index=8,
+            source_time_sec=8 / 30,
+            is_measurement_frame=True,
+            measurement_bucket=8,
+        )
+        events = processor.process_frame(frame, unverified)
+        self.assertEqual([event.event_type for event in events], ["session_status"])
+        self.assertEqual(events[0].data["reason"], "source_frame_identity_unverified")
         self.assertEqual(len(processor.frames), 1)
 
     def test_restore_rejects_different_model(self):

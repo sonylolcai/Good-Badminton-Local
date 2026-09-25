@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import tempfile
@@ -6,6 +7,7 @@ from pathlib import Path
 
 import cv2
 
+from badminton_analysis.streaming import OpenCVSegmentDecoder, SegmentDescriptor
 from business_gateway.streaming.segmenter import GrowingVideoSegmenter, _find_ffmpeg
 
 
@@ -80,6 +82,14 @@ class GrowingVideoSegmenterTests(unittest.TestCase):
         reused = segmenter.segment_file(self.video)
         self.assertEqual(artifacts, reused)
 
+        # Legacy manifests created before declare_frame_sequence are accepted when defaulting to False
+        manifest_path = output / "segment_manifest.json"
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_data.pop("declare_frame_sequence", None)
+        manifest_path.write_text(json.dumps(manifest_data), encoding="utf-8")
+        legacy_reused = segmenter.segment_file(self.video)
+        self.assertEqual(len(artifacts), len(legacy_reused))
+
         incompatible = GrowingVideoSegmenter(
             output,
             segment_duration_sec=2.0,
@@ -96,6 +106,45 @@ class GrowingVideoSegmenterTests(unittest.TestCase):
         segmenter = GrowingVideoSegmenter(output, ffmpeg_path=self.ffmpeg)
         with self.assertRaisesRegex(RuntimeError, "unfinished prior run"):
             segmenter.segment_file(self.video)
+
+    def test_tracknet_mode_declares_contiguous_decoded_frame_sequence(self):
+        output = self.root / "tracknet-segments"
+        segmenter = GrowingVideoSegmenter(
+            output,
+            segment_duration_sec=1.0,
+            encoding_mode="h264",
+            ffmpeg_path=self.ffmpeg,
+            poll_interval_sec=0.01,
+            declare_frame_sequence=True,
+        )
+        artifacts = segmenter.segment_file(self.video)
+        self.assertGreater(len(artifacts), 1)
+        next_index = 0
+        for artifact in artifacts:
+            self.assertEqual(artifact.source_frame_start_index, next_index)
+            self.assertGreater(artifact.source_frame_count, 0)
+            next_index += artifact.source_frame_count
+        decoder = OpenCVSegmentDecoder()
+        frame_packets = []
+        for artifact in artifacts:
+            descriptor = SegmentDescriptor(
+                segment_index=artifact.segment_index,
+                source_start_time_sec=artifact.source_start_time_sec,
+                duration_sec=artifact.duration_sec,
+                sha256="a" * 64,
+                idempotency_key=f"segment-{artifact.segment_index}",
+                source_frame_start_index=artifact.source_frame_start_index,
+                source_frame_count=artifact.source_frame_count,
+            )
+            frame_packets.extend(decoder.decode(artifact.path, descriptor).frames)
+        self.assertEqual([packet.source_frame_index for packet in frame_packets], list(range(next_index)))
+        boundary = artifacts[0].source_frame_count
+        self.assertAlmostEqual(
+            frame_packets[boundary].source_time_sec - frame_packets[boundary - 1].source_time_sec,
+            1 / 30,
+            delta=0.01,
+        )
+        self.assertEqual(artifacts, segmenter.segment_file(self.video))
 
 
 if __name__ == "__main__":

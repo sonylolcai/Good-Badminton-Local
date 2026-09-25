@@ -128,6 +128,8 @@ class SegmentMetadata:
     content_length_bytes: int
     court_corners: list[list[float]]
     schema_version: str = STREAM_SCHEMA_VERSION
+    source_frame_start_index: int | None = None
+    source_frame_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != STREAM_SCHEMA_VERSION:
@@ -150,6 +152,13 @@ class SegmentMetadata:
         for point in self.court_corners:
             if not isinstance(point, (list, tuple)) or len(point) != 2:
                 raise ValueError("each court corner must be [x, y]")
+        if (self.source_frame_start_index is None) != (self.source_frame_count is None):
+            raise ValueError("source frame start and count must be provided together")
+        if self.source_frame_start_index is not None:
+            if not isinstance(self.source_frame_start_index, int) or isinstance(self.source_frame_start_index, bool) or self.source_frame_start_index < 0:
+                raise ValueError("source_frame_start_index must be non-negative")
+            if not isinstance(self.source_frame_count, int) or isinstance(self.source_frame_count, bool) or self.source_frame_count <= 0:
+                raise ValueError("source_frame_count must be positive")
 
     @classmethod
     def from_file(
@@ -162,6 +171,8 @@ class SegmentMetadata:
         idempotency_prefix: str,
         content_type: str = "video/mp4",
         court_corners: list[list[float]] | None = None,
+        source_frame_start_index: int | None = None,
+        source_frame_count: int | None = None,
     ) -> "SegmentMetadata":
         path = Path(path)
         digest = hashlib.sha256()
@@ -177,10 +188,16 @@ class SegmentMetadata:
             content_type=content_type,
             content_length_bytes=path.stat().st_size,
             court_corners=[[float(x), float(y)] for x, y in (court_corners or [])],
+            source_frame_start_index=source_frame_start_index,
+            source_frame_count=source_frame_count,
         )
 
     def to_payload(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if self.source_frame_start_index is None:
+            payload.pop("source_frame_start_index")
+            payload.pop("source_frame_count")
+        return payload
 
 
 class DeliveryLedger:

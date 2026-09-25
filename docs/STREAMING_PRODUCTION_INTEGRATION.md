@@ -92,7 +92,7 @@ GPU_ANALYSIS_MAX_BACKOFF_SECONDS=5
 - `shuttle_detector=yolo`：在同一个 10/15/30Hz 测量帧运行 YOLO 球检测；
 - `shuttle_detector=tracknet_v3`：使用内置的有界时序处理器，逐源帧运行 8 帧滑动窗口；需要配置 `GOOD_BADMINTON_STREAM_TRACKNET_MODEL` 指向已校验的 TrackNet 权重，也可由服务集成方显式注入处理器。
 
-离线完整文件 runner 仍是另一条流程。流式处理器的窗口和背景随会话检查点保存，跨切片及进程恢复时继续使用；前 7 帧因时序证据不足不输出球位置。帧号、时间或分辨率出现可见断点时，窗口重置并标记球连续性未知；帧间隔容差由 `GOOD_BADMINTON_STREAM_TRACKNET_MAX_FRAME_INTERVAL_RATIO` 配置。当前切片帧号由起始时间和片内 FPS 推算，尚不能证明源摄像头没有丢帧；真实源 PTS/帧序号需由上传端补充并校验。30/60 FPS 的处理吞吐和真实视频质量仍需目标 GPU 验证。
+离线完整文件 runner 仍是另一条流程。流式处理器的窗口和背景随会话检查点保存，跨切片及进程恢复时继续使用；前 7 帧因时序证据不足不输出球位置。上传端在每片元数据中同时提供 `source_frame_start_index` 与 `source_frame_count` 时，GPU 会核对解码帧数，TrackNet 只在相邻片都提供帧身份且序号/时间连续时跨片复用窗口。缺少该证据的片间边界会重置窗口并标记球连续性未知。帧间隔容差由 `GOOD_BADMINTON_STREAM_TRACKNET_MAX_FRAME_INTERVAL_RATIO` 配置。本地模拟上传选择 TrackNet 时，会额外解码并累计分片帧数，以验证切片后的序列；这会增加上传端 CPU 开销，也不能证明摄像头在进入分片器前没有丢帧。生产采集端应直接提供采集时的帧序号。30/60 FPS 的处理吞吐和真实视频质量仍需目标 GPU 验证。
 
 流式 `generate_annotated_video=true` 同样会被明确拒绝。生产流式路径只保存数据，旧 WebUI 仍可使用完整上传生成标注视频。
 

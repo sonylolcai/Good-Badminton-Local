@@ -228,6 +228,7 @@ def main() -> int:
         segment_duration_sec=args.segment_seconds,
         encoding_mode=args.encoding_mode,
         preserve_audio=False,
+        declare_frame_sequence=args.shuttle_detector == "tracknet_v3",
         ffmpeg_path=args.ffmpeg_bin or None,
         ffprobe_path=args.ffprobe_bin or None,
     )

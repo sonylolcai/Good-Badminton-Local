@@ -19,6 +19,8 @@ class SegmentArtifact:
     source_start_time_sec: float
     duration_sec: float
     content_type: str = "video/mp4"
+    source_frame_start_index: int | None = None
+    source_frame_count: int | None = None
 
 
 class GrowingVideoSegmenter:
@@ -45,6 +47,7 @@ class GrowingVideoSegmenter:
         ffprobe_path: Optional[str] = None,
         poll_interval_sec: float = 0.1,
         sleep_fn: Callable[[float], None] = time.sleep,
+        declare_frame_sequence: bool = False,
     ) -> None:
         if not 0.5 <= float(segment_duration_sec) <= 10:
             raise ValueError("segment_duration_sec must be between 0.5 and 10 seconds")
@@ -59,6 +62,7 @@ class GrowingVideoSegmenter:
         self.ffprobe_path = ffprobe_path or _find_ffprobe(self.ffmpeg_path)
         self.poll_interval_sec = max(0.01, float(poll_interval_sec))
         self.sleep_fn = sleep_fn
+        self.declare_frame_sequence = bool(declare_frame_sequence)
 
     def segment_file(self, source: Path, *, overwrite: bool = False) -> list[SegmentArtifact]:
         """Segment a complete local file using the same incremental path as live input."""
@@ -111,6 +115,7 @@ class GrowingVideoSegmenter:
         yielded: set[Path] = set()
         artifacts: list[SegmentArtifact] = []
         source_start = 0.0
+        source_frame_start = 0
         try:
             while True:
                 return_code = process.poll()
@@ -127,16 +132,22 @@ class GrowingVideoSegmenter:
                             f"segment {path.name} duration {duration:.3f}s violates stream-session.v1; "
                             "use encoding_mode='h264' or configure a shorter camera GOP"
                         )
-                    self._assert_decodable(path)
+                    frame_count = self._count_decoded_frames(path) if self.declare_frame_sequence else None
+                    if frame_count is None:
+                        self._assert_decodable(path)
                     artifact = SegmentArtifact(
                         path=path.resolve(),
                         segment_index=len(artifacts),
                         source_start_time_sec=round(source_start, 6),
                         duration_sec=round(duration, 6),
+                        source_frame_start_index=(source_frame_start if frame_count is not None else None),
+                        source_frame_count=frame_count,
                     )
                     artifacts.append(artifact)
                     yielded.add(resolved)
                     source_start += duration
+                    if frame_count is not None:
+                        source_frame_start += frame_count
                     yield artifact
                 if return_code is not None:
                     stderr = process.stderr.read() if process.stderr else ""
@@ -192,6 +203,8 @@ class GrowingVideoSegmenter:
                     f"expr:gte(t,n_forced*{self.segment_duration_sec:g})",
                 ]
             )
+            if self.declare_frame_sequence:
+                command.extend(["-fps_mode", "passthrough"])
         command.extend(
             [
                 "-f",
@@ -253,6 +266,28 @@ class GrowingVideoSegmenter:
         finally:
             capture.release()
 
+    @staticmethod
+    def _count_decoded_frames(path: Path) -> int:
+        import cv2
+
+        capture = cv2.VideoCapture(str(path))
+        count = 0
+        try:
+            if not capture.isOpened():
+                raise RuntimeError(f"segment is not independently decodable: {path}")
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if frame is None:
+                    raise RuntimeError(f"segment contains an invalid decoded frame: {path}")
+                count += 1
+            if count == 0:
+                raise RuntimeError(f"segment is not independently decodable: {path}")
+            return count
+        finally:
+            capture.release()
+
     def _write_manifest(
         self,
         path: Path,
@@ -267,6 +302,7 @@ class GrowingVideoSegmenter:
             "segment_duration_target_sec": self.segment_duration_sec,
             "encoding_mode": self.encoding_mode,
             "preserve_audio": self.preserve_audio,
+            "declare_frame_sequence": self.declare_frame_sequence,
             "ffmpeg_command": command,
             "segments": [
                 {
@@ -290,8 +326,12 @@ class GrowingVideoSegmenter:
             "segment_duration_target_sec": self.segment_duration_sec,
             "encoding_mode": self.encoding_mode,
             "preserve_audio": self.preserve_audio,
+            "declare_frame_sequence": self.declare_frame_sequence,
         }
-        actual = {key: payload.get(key) for key in expected}
+        actual = {
+            key: bool(payload.get(key, False)) if key == "declare_frame_sequence" else payload.get(key)
+            for key in expected
+        }
         if actual != expected:
             raise RuntimeError(
                 "completed segment output belongs to a different source or configuration; "
@@ -307,6 +347,8 @@ class GrowingVideoSegmenter:
                 source_start_time_sec=float(item["source_start_time_sec"]),
                 duration_sec=float(item["duration_sec"]),
                 content_type=str(item.get("content_type") or "video/mp4"),
+                source_frame_start_index=item.get("source_frame_start_index"),
+                source_frame_count=item.get("source_frame_count"),
             )
 
 

@@ -313,6 +313,8 @@ def validate_segment_metadata(body):
             "content_type",
             "content_length_bytes",
             "court_corners",
+            "source_frame_start_index",
+            "source_frame_count",
         },
         "segment metadata",
     )
@@ -339,7 +341,14 @@ def validate_segment_metadata(body):
         body.get("content_length_bytes"), "content_length_bytes", minimum=1
     )
     court_corners = _court_corners(body.get("court_corners"))
-    return {
+    source_frame_start_index = body.get("source_frame_start_index")
+    source_frame_count = body.get("source_frame_count")
+    if (source_frame_start_index is None) != (source_frame_count is None):
+        raise ValueError("source_frame_start_index and source_frame_count must be provided together")
+    if source_frame_start_index is not None:
+        source_frame_start_index = _int(source_frame_start_index, "source_frame_start_index", minimum=0)
+        source_frame_count = _int(source_frame_count, "source_frame_count", minimum=1)
+    normalized = {
         "schema_version": SCHEMA_VERSION,
         "segment_index": segment_index,
         "source_start_time_sec": source_start_time_sec,
@@ -350,6 +359,10 @@ def validate_segment_metadata(body):
         "content_length_bytes": content_length_bytes,
         "court_corners": court_corners,
     }
+    if source_frame_start_index is not None:
+        normalized["source_frame_start_index"] = source_frame_start_index
+        normalized["source_frame_count"] = source_frame_count
+    return normalized
 
 
 def validate_complete_request(body):

@@ -152,6 +152,9 @@ class AnalysisEngine:
                     source_time_sec=float(packet.source_time_sec),
                     is_measurement_frame=is_measurement,
                     measurement_bucket=measurement_bucket,
+                    source_frame_identity_declared=(
+                        descriptor.source_frame_start_index is not None
+                    ),
                 )
 
                 if self.temporal_processor is not None:
