@@ -219,9 +219,7 @@ def build_calibration_candidate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 OPERATOR_BACKOFFICE_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
-#component-0 .gradio-container { max-width: 1480px !important; background: #fcfcfc; font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+#component-0 .gradio-container { max-width: 1480px !important; background: #fcfcfc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 .saas-shell { max-width: 1280px; margin: 0 auto; padding: 24px; }
 .saas-eyebrow { margin: 0 0 8px; color: #6b7280; font-size: 13px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
 .saas-heading { margin: 0; color: #111827; font-size: 32px; font-weight: 700; letter-spacing: -0.02em; }
