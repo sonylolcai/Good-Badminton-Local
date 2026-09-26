@@ -194,14 +194,21 @@ class StreamSessionManagerTests(unittest.TestCase):
         _, created = self._create("business-stream-source-frames")
         session_id = created["analysis_session_id"]
         metadata = segment_metadata(0, self.segment_bytes)
-        metadata.update(source_frame_start_index=90, source_frame_count=30)
+        offsets = [round(index / 30, 6) for index in range(30)]
+        metadata.update(source_frame_start_index=90, source_frame_count=30,
+                        source_frame_time_offsets_sec=offsets)
         self.manager.receive_segment(session_id, 0, metadata, self.segment_bytes)
         entry = self.manager.get_session(session_id)["segments"]["0"]
         self.assertEqual(entry["source_frame_start_index"], 90)
         self.assertEqual(entry["source_frame_count"], 30)
+        self.assertEqual(entry["source_frame_time_offsets_sec"], offsets)
         changed = dict(metadata, source_frame_start_index=91)
         with self.assertRaises(StreamSessionError) as context:
             self.manager.receive_segment(session_id, 0, changed, self.segment_bytes)
+        self.assertEqual(context.exception.code, "invalid_state")
+        changed_time = dict(metadata, source_frame_time_offsets_sec=[*offsets[:20], *[value + 0.01 for value in offsets[20:]]])
+        with self.assertRaises(StreamSessionError) as context:
+            self.manager.receive_segment(session_id, 0, changed_time, self.segment_bytes)
         self.assertEqual(context.exception.code, "invalid_state")
 
     def test_each_segment_must_repeat_the_business_owned_court_corners(self):

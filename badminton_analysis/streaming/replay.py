@@ -62,10 +62,15 @@ class OpenCVSegmentDecoder:
                     ok, frame = capture.read()
                     if not ok:
                         break
+                    offsets = descriptor.source_frame_time_offsets_sec
+                    if offsets is not None and local_index >= len(offsets):
+                        raise ReplayDecodeError("decoded more frames than declared timestamps")
                     yield FramePacket(
                         frame=frame,
                         source_frame_index=source_frame_start + local_index,
-                        source_time_sec=descriptor.source_start_time_sec + local_index / fps,
+                        source_time_sec=descriptor.source_start_time_sec + (
+                            offsets[local_index] if offsets is not None else local_index / fps
+                        ),
                         segment_index=descriptor.segment_index,
                     )
                     local_index += 1

@@ -703,6 +703,7 @@ class StreamSessionManager:
             content_length_bytes=entry["content_length_bytes"],
             source_frame_start_index=entry.get("source_frame_start_index"),
             source_frame_count=entry.get("source_frame_count"),
+            source_frame_time_offsets_sec=entry.get("source_frame_time_offsets_sec"),
         )
 
     # -- events ---------------------------------------------------------
@@ -927,6 +928,7 @@ class StreamSessionManager:
                         "duration_sec",
                         "source_frame_start_index",
                         "source_frame_count",
+                        "source_frame_time_offsets_sec",
                     )
                 )
                 if same_content and same_idempotency_key and not same_source_identity:
@@ -989,6 +991,7 @@ class StreamSessionManager:
                 "court_corners": metadata["court_corners"],
                 "source_frame_start_index": metadata.get("source_frame_start_index"),
                 "source_frame_count": metadata.get("source_frame_count"),
+                "source_frame_time_offsets_sec": metadata.get("source_frame_time_offsets_sec"),
                 "received_at": received_at,
                 "reused": False,
                 "processing_disposition": disposition,

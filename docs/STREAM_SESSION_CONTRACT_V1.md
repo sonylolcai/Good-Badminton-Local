@@ -162,6 +162,14 @@ window. A local file segmenter may declare its post-encode decoded sequence;
 live capture should declare capture-side frame numbers. Neither proves that the
 camera itself did not drop frames before numbering them.
 
+The optional `source_frame_time_offsets_sec` array contains decoded-frame
+presentation times relative to the segment start. Its length must equal
+`source_frame_count`, begin at zero and increase strictly. The GPU decoder uses
+these times instead of synthesizing `local_index / fps`, so a timestamp jump
+inside a segment makes TrackNet reset its window and report continuity unknown.
+When the producer cannot verify the timestamps against decoded frame count, it
+must omit the array and refrain from declaring a continuous frame identity.
+
 | Case | HTTP | Required behavior |
 |---|---:|---|
 | First valid receipt | 202 | Persist bytes and receipt before responding; `reused=false`. |

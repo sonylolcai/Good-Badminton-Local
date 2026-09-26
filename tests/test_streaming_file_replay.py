@@ -113,6 +113,20 @@ class StreamingFileReplayTests(unittest.TestCase):
         self.assertAlmostEqual(packets[-1].source_time_sec, 6.0 + 44 / 30.0, places=3)
         self.assertEqual(packets[0].source_frame_index, 180)
 
+    def test_decoder_preserves_an_internal_frame_timestamp_gap(self):
+        digest = hashlib.sha256(self.video_path.read_bytes()).hexdigest()
+        offsets = [round(index / 30 + (0.1 if index >= 20 else 0), 6) for index in range(45)]
+        descriptor = SegmentDescriptor(
+            segment_index=0, source_start_time_sec=0, duration_sec=1.6,
+            sha256=digest, idempotency_key="uploaded-timestamp-gap-0",
+            content_length_bytes=self.video_path.stat().st_size,
+            source_frame_start_index=0, source_frame_count=45,
+            source_frame_time_offsets_sec=offsets,
+        )
+        packets = list(OpenCVSegmentDecoder().decode(self.video_path, descriptor).frames)
+        self.assertAlmostEqual(packets[20].source_time_sec - packets[19].source_time_sec,
+                               0.1 + 1 / 30, places=5)
+
     def test_declared_source_frames_override_time_estimate_and_validate_count(self):
         digest = hashlib.sha256(self.video_path.read_bytes()).hexdigest()
         descriptor = SegmentDescriptor(

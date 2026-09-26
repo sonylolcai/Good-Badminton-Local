@@ -238,6 +238,11 @@
         "duration_sec": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
         "source_frame_start_index": { "type": "integer", "minimum": 0 },
         "source_frame_count": { "type": "integer", "minimum": 1 },
+        "source_frame_time_offsets_sec": {
+          "type": "array", "minItems": 1,
+          "items": { "type": "number", "minimum": 0 },
+          "description": "Optional decoded-frame presentation times relative to source_start_time_sec; runtime validation requires exact frame-count length and strict increase."
+        },
         "sha256": { "$ref": "#/$defs/sha256" },
         "idempotency_key": { "$ref": "#/$defs/opaqueId" },
         "content_type": {
@@ -249,7 +254,8 @@
       },
       "dependentRequired": {
         "source_frame_start_index": ["source_frame_count"],
-        "source_frame_count": ["source_frame_start_index"]
+        "source_frame_count": ["source_frame_start_index"],
+        "source_frame_time_offsets_sec": ["source_frame_count", "source_frame_start_index"]
       }
     },
     "segmentReceipt": {

@@ -63,6 +63,7 @@ class SegmentDescriptor:
     schema_version: str = STREAM_SCHEMA_VERSION
     source_frame_start_index: int | None = None
     source_frame_count: int | None = None
+    source_frame_time_offsets_sec: list[float] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != STREAM_SCHEMA_VERSION:
@@ -88,6 +89,14 @@ class SegmentDescriptor:
                 raise ValueError("source_frame_start_index must be a non-negative integer")
             if not isinstance(self.source_frame_count, int) or isinstance(self.source_frame_count, bool) or self.source_frame_count <= 0:
                 raise ValueError("source_frame_count must be a positive integer")
+        offsets = self.source_frame_time_offsets_sec
+        if offsets is not None:
+            if self.source_frame_count is None or len(offsets) != self.source_frame_count:
+                raise ValueError("source frame time offsets must match declared frame count")
+            if offsets[0] != 0 or offsets[-1] >= self.duration_sec or any(
+                later <= earlier for earlier, later in zip(offsets, offsets[1:])
+            ):
+                raise ValueError("source frame time offsets must increase within segment duration")
 
 
 @dataclass(frozen=True)

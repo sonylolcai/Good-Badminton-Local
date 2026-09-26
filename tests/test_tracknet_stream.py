@@ -131,6 +131,21 @@ class TrackNetStreamTests(unittest.TestCase):
         self.assertEqual(gap[0].data["reason"], "source_frame_index_gap")
         self.assertEqual(len(processor.frames), 1)
 
+    def test_timestamp_gap_resets_window_even_with_consecutive_frame_indexes(self):
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        processor = TrackNetStreamProcessor(_Detector(), model_sha256="f" * 64)
+        for index in range(8):
+            processor.process_frame(frame, _context(index, 0))
+        discontinuous = FrameContext(
+            analysis_session_id="ssn_tracknet_stream", segment_index=0,
+            source_frame_index=8, source_time_sec=8 / 30 + 0.1,
+            is_measurement_frame=True, measurement_bucket=8,
+            source_frame_identity_declared=True,
+        )
+        events = processor.process_frame(frame, discontinuous)
+        self.assertEqual(events[0].data["ball_continuity"], "unknown")
+        self.assertEqual(events[0].data["reason"], "source_timestamp_gap")
+
     def test_unverified_boundary_resets_window_without_claiming_continuity(self):
         frame = np.zeros((64, 64, 3), dtype=np.uint8)
         processor = TrackNetStreamProcessor(_Detector(), model_sha256="e" * 64)

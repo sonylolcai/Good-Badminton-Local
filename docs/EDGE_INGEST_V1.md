@@ -91,6 +91,8 @@ JSON 请求的 payload 摘要为 key 排序、无空格的 UTF-8 JSON SHA-256。
 
 `court_corners` 由业务服务器对照已验证标定校验，不接受终端覆盖。相同 `segment_index + sha256 + idempotency_key` 的重试返回同一回执；冲突哈希返回 `409`。若业务服务器未获得 GPU 回执，终端不得把分片当作成功，应以同一幂等键重试。
 
+TrackNet 分片可附带 `source_frame_start_index`、`source_frame_count` 和同长度的 `source_frame_time_offsets_sec`。后者来自编码视频的逐帧呈现时间，业务服务器会持久化首次接受的时间序列供重试；GPU 按真实时间差识别片内丢帧并重置时间窗口。时间戳与解码帧数不一致时，终端不得宣称该片段的连续帧身份。
+
 若前序分片超过本地配置的等待时间仍未出现，终端调用签名的 `POST /api/v1/edge/sessions/{edge_ingest_session_id}/gaps/{segment_index}`，正文包含通用签名字段及 `source_start_time_sec`、`duration_sec`、`reason: "source_segment_missing"`。业务服务器核对设备、摄像头及当前会话，再将缺口转发给 GPU。仅在收到确认后终端才能继续上传后续分片；晚到的缺口文件不得补入已声明缺失的索引。缺口之后的帧连续性标为未知，结束时使用 `allow_partial=true`，最终状态为部分完成。
 
 若运营端在预览一段时间后才开启 GPU 分析，业务服务器把首个 GPU 分片映射为该 GPU 会话的索引 0，后续索引依次递增；预览阶段已接收但未分析的视频仍保留其原始球馆侧索引，不会导致 GPU 等待不存在的前驱。分析启动后再次暂停推送时，业务服务器为暂停期间的分片声明 GPU 缺口，恢复后继续同一索引序列；因此暂停区间的分析结果只能是部分完成。

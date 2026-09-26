@@ -315,6 +315,7 @@ def validate_segment_metadata(body):
             "court_corners",
             "source_frame_start_index",
             "source_frame_count",
+            "source_frame_time_offsets_sec",
         },
         "segment metadata",
     )
@@ -348,6 +349,15 @@ def validate_segment_metadata(body):
     if source_frame_start_index is not None:
         source_frame_start_index = _int(source_frame_start_index, "source_frame_start_index", minimum=0)
         source_frame_count = _int(source_frame_count, "source_frame_count", minimum=1)
+    offsets = body.get("source_frame_time_offsets_sec")
+    if offsets is not None:
+        if source_frame_count is None or not isinstance(offsets, list) or len(offsets) != source_frame_count:
+            raise ValueError("source_frame_time_offsets_sec must match source_frame_count")
+        offsets = [_number(value, "source frame time offset", minimum=0) for value in offsets]
+        if offsets[0] != 0 or offsets[-1] >= duration_sec or any(
+            later <= earlier for earlier, later in zip(offsets, offsets[1:])
+        ):
+            raise ValueError("source frame time offsets must start at zero and increase within duration_sec")
     normalized = {
         "schema_version": SCHEMA_VERSION,
         "segment_index": segment_index,
@@ -362,6 +372,8 @@ def validate_segment_metadata(body):
     if source_frame_start_index is not None:
         normalized["source_frame_start_index"] = source_frame_start_index
         normalized["source_frame_count"] = source_frame_count
+        if offsets is not None:
+            normalized["source_frame_time_offsets_sec"] = offsets
     return normalized
 
 
