@@ -239,6 +239,32 @@ class StreamSessionManagerTests(unittest.TestCase):
         status, status_payload = self.manager.get_status(session_id)
         self.assertEqual(status_payload["progress"]["processed_segments"], 3)
 
+    def test_ready_segments_rotate_between_camera_sessions(self):
+        _, first = self.manager.create_session(create_request(), "court-one-stream-001")
+        second_request = create_request()
+        second_request["camera_id"] = "court-02-camera-a"
+        second_request["calibration_id"] = "court-02-calibration"
+        _, second = self.manager.create_session(second_request, "court-two-stream-001")
+        first_id = first["analysis_session_id"]
+        second_id = second["analysis_session_id"]
+        self._receive(first_id, 0)
+        self._receive(first_id, 1, source_start=1.0)
+        self._receive(second_id, 0)
+
+        order = []
+        process = self.manager._process_segment
+
+        def record_processing(session_id, index):
+            order.append((session_id, index))
+            process(session_id, index)
+
+        with patch.object(self.manager, "_process_segment", side_effect=record_processing):
+            self.manager.drain()
+
+        self.assertEqual(order, [(first_id, 0), (second_id, 0), (first_id, 1)])
+        self.assertEqual(self.manager.get_status(first_id)[1]["progress"]["processed_segments"], 2)
+        self.assertEqual(self.manager.get_status(second_id)[1]["progress"]["processed_segments"], 1)
+
     def test_complete_with_gap_requires_partial_then_partial_finalizes(self):
         _, created = self._create()
         session_id = created["analysis_session_id"]
@@ -269,6 +295,79 @@ class StreamSessionManagerTests(unittest.TestCase):
         self.assertEqual(len(final_events), 1)
         self.assertEqual(final_events[0]["data"]["status"], "partial")
         self.assertEqual(final_events[0]["data"]["missing_segment_indexes"], [2])
+
+    def test_declared_missing_segment_allows_live_successor_in_new_epoch(self):
+        _, created = self._create()
+        session_id = created["analysis_session_id"]
+        self._receive(session_id, 0, source_start=0.0)
+        self._receive(session_id, 2, source_start=2.0)
+        gap = {"schema_version": "stream-session.v1", "source_start_time_sec": 1.0,
+               "duration_sec": 1.0, "reason": "source_segment_missing"}
+        self.assertEqual(self.manager.declare_gap(session_id, 1, gap)[0], 202)
+        self.assertEqual(self.manager.declare_gap(session_id, 1, gap)[0], 200)
+        with self.assertRaises(StreamSessionError):
+            self._receive(session_id, 1, source_start=1.0)
+        self.manager.drain()
+        status = self.manager.get_status(session_id)[1]
+        self.assertEqual(status["progress"]["processed_segments"], 2)
+        self.assertEqual(status["progress"]["missing_segment_indexes"], [1])
+        self.assertEqual(self.manager.get_session(session_id)["continuity_epoch"], 1)
+        events = self.manager.read_events(session_id)[1]["events"]
+        self.assertTrue(any(event["data"].get("segment_gap") == 1 for event in events))
+        self.assertEqual(self.manager.complete(session_id, {
+            "schema_version": "stream-session.v1", "expected_last_segment_index": 2,
+            "allow_partial": True,
+        })[1]["status"], "partial")
+
+    def test_declared_gap_survives_worker_restart_and_unblocks_successor(self):
+        _, created = self._create("business-stream-restart-gap")
+        session_id = created["analysis_session_id"]
+        self._receive(session_id, 0, source_start=0.0)
+        self._receive(session_id, 2, source_start=2.0)
+        declaration = {"schema_version": "stream-session.v1", "source_start_time_sec": 1.0,
+                       "duration_sec": 1.0, "reason": "source_segment_missing"}
+        self.manager.declare_gap(session_id, 1, declaration)
+        recovered = StreamSessionManager(
+            Path(self.temp_dir.name), processor_factory=counting_processor_factory(), start_worker=False,
+        )
+        self.assertEqual(recovered.declare_gap(session_id, 1, declaration)[0], 200)
+        recovered.drain()
+        status = recovered.get_status(session_id)[1]
+        self.assertEqual(status["progress"]["processed_segments"], 2)
+        self.assertEqual(status["progress"]["next_expected_segment_index"], 3)
+        self.assertEqual(status["current_stage"], "analyzing")
+
+    def test_partial_completion_waits_for_declared_gap_and_later_media(self):
+        _, created = self._create()
+        session_id = created["analysis_session_id"]
+        self._receive(session_id, 0, source_start=0.0)
+        self._receive(session_id, 2, source_start=2.0)
+        self.manager.declare_gap(session_id, 1, {
+            "schema_version": "stream-session.v1", "source_start_time_sec": 1.0,
+            "duration_sec": 1.0, "reason": "source_segment_missing",
+        })
+        completion = self.manager.complete(session_id, {
+            "schema_version": "stream-session.v1", "expected_last_segment_index": 2,
+            "allow_partial": True,
+        })[1]
+        self.assertNotEqual(completion["status"], "partial")
+        self.manager.drain()
+        status = self.manager.get_status(session_id)[1]
+        self.assertEqual(status["status"], "partial")
+        self.assertEqual(status["progress"]["processed_segments"], 2)
+
+    def test_partial_completion_rejects_undeclared_middle_gap(self):
+        _, created = self._create("business-stream-no-silent-drop")
+        session_id = created["analysis_session_id"]
+        self._receive(session_id, 0, source_start=0.0)
+        self._receive(session_id, 2, source_start=2.0)
+        with self.assertRaises(StreamSessionError) as context:
+            self.manager.complete(session_id, {
+                "schema_version": "stream-session.v1", "expected_last_segment_index": 2,
+                "allow_partial": True,
+            })
+        self.assertEqual(context.exception.code, "missing_segments")
+        self.assertFalse(self.manager.get_session(session_id)["sealed"])
 
     def test_backward_source_time_is_a_recorded_gap_without_requeue_loop(self):
         _, created = self._create()

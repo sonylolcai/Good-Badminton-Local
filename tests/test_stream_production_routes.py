@@ -97,6 +97,31 @@ class StreamProductionRouteTests(unittest.TestCase):
         response = self.client.post("/api/v1/stream-sessions", json=create_request())
         self.assertEqual(response.status_code, 401)
 
+    def test_gap_route_requires_auth_and_unblocks_later_segment(self):
+        created = self.client.post(
+            "/api/v1/stream-sessions",
+            headers={**self.headers, "X-Idempotency-Key": "task-f-gap-session-0001"},
+            json=create_request(),
+        )
+        session_id = created.json()["analysis_session_id"]
+        later = self.client.post(
+            f"/api/v1/stream-sessions/{session_id}/segments/1",
+            headers=self.headers,
+            files={"segment": ("segment-1.mp4", self.segment, "video/mp4")},
+            data={"metadata": json.dumps(segment_metadata(1, self.segment, source_start=1.0))},
+        )
+        self.assertEqual(later.status_code, 202, later.text)
+        path = f"/api/v1/stream-sessions/{session_id}/gaps/0"
+        declaration = {"schema_version": "stream-session.v1", "source_start_time_sec": 0,
+                       "duration_sec": 1, "reason": "source_segment_missing"}
+        self.assertEqual(self.client.post(path, json=declaration).status_code, 401)
+        declared = self.client.post(path, headers=self.headers, json=declaration)
+        self.assertEqual(declared.status_code, 202, declared.text)
+        self.app.state.stream_manager.drain()
+        status = self.client.get(f"/api/v1/stream-sessions/{session_id}", headers=self.headers).json()
+        self.assertEqual(status["progress"]["processed_segments"], 1)
+        self.assertEqual(status["current_stage"], "analyzing")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -110,6 +110,14 @@ def register_stream_routes(
         response_status, payload = get_session_status_handler(stream_manager, session_id)
         return JSONResponse(status_code=response_status, content=payload)
 
+    @app.post(
+        "/api/v1/stream-sessions/{session_id}/gaps/{segment_index}",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def declare_stream_gap(session_id: str, segment_index: int, body: dict):
+        response_status, payload = stream_manager.declare_gap(session_id, segment_index, body)
+        return JSONResponse(status_code=response_status, content=payload)
+
     @app.get(
         "/api/v1/stream-sessions/{session_id}/events",
         dependencies=[Depends(require_api_key)],

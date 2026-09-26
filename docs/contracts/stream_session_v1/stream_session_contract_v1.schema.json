@@ -8,6 +8,8 @@
     { "$ref": "#/$defs/createSessionResponse" },
     { "$ref": "#/$defs/segmentMetadata" },
     { "$ref": "#/$defs/segmentReceiptResponse" },
+    { "$ref": "#/$defs/gapDeclaration" },
+    { "$ref": "#/$defs/gapDeclarationResponse" },
     { "$ref": "#/$defs/sessionStatusResponse" },
     { "$ref": "#/$defs/eventsResponse" },
     { "$ref": "#/$defs/completeSessionRequest" },
@@ -291,6 +293,29 @@
         "session_status": { "$ref": "#/$defs/sessionState" },
         "receipt": { "$ref": "#/$defs/segmentReceipt" },
         "status_url": { "type": "string", "minLength": 1 }
+      }
+    },
+    "gapDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "source_start_time_sec", "duration_sec", "reason"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "source_start_time_sec": { "type": "number", "minimum": 0 },
+        "duration_sec": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
+        "reason": { "type": "string", "const": "source_segment_missing" }
+      }
+    },
+    "gapDeclarationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "analysis_session_id", "segment_index", "status", "reused"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "analysis_session_id": { "$ref": "#/$defs/sessionId" },
+        "segment_index": { "type": "integer", "minimum": 0 },
+        "status": { "type": "string", "const": "declared_missing" },
+        "reused": { "type": "boolean" }
       }
     },
     "trackCandidate": {

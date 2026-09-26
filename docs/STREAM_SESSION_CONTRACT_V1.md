@@ -174,6 +174,21 @@ camera itself did not drop frames before numbering them.
 
 The receipt confirms durable acceptance, not inference completion.
 
+### 4.2.1 Declare permanently missing source media
+
+`POST /api/v1/stream-sessions/{analysis_session_id}/gaps/{segment_index}`
+
+When a predecessor cannot be recovered after a producer-configured wait, send
+`{"schema_version":"stream-session.v1","source_start_time_sec":2,"duration_sec":2,"reason":"source_segment_missing"}`.
+The authenticated declaration is durable and idempotent for identical timing and
+reason. It conflicts with already accepted media or a different declaration for
+that index. The worker ends the previous continuity epoch, marks ball continuity
+unknown, and processes later accepted segments in a new epoch. A segment arriving
+after its index was declared missing is rejected. Sealing with a declared gap
+requires `allow_partial=true`; finalization waits until later accepted segments
+have been processed, then reports `partial` and the missing indexes. Each camera
+retains its own session, queue position and continuity state.
+
 ### 4.3 Query session status
 
 `GET /api/v1/stream-sessions/{analysis_session_id}`
@@ -236,6 +251,10 @@ Success definition: `completeSessionResponse`
   session open so the caller can upload missing pieces and retry completion.
 - With gaps and `allow_partial=true`, seal input, preserve the missing indexes and
   finalize as `partial`. Missing regions MUST NOT be filled with invented evidence.
+- If a missing index lies before an accepted later segment, declare that gap
+  explicitly before sealing. The service returns `409 missing_segments` until
+  it can process the later segment in a new continuity epoch; it never silently
+  drops accepted later media during partial completion.
 - A received fragment that fails GPU processing is a known processing gap. The
   service continues later fragments and ultimately finalizes as `partial` even if
   `allow_partial=false`; `failed_segment_indexes` and `processing_errors` make the

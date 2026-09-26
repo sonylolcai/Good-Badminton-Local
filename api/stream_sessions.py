@@ -54,6 +54,7 @@ from .stream_models import (
     utc_now,
     validate_complete_request,
     validate_create_request,
+    validate_gap_declaration,
     validate_segment_metadata,
     new_session_id,
 )
@@ -118,6 +119,7 @@ class StreamSessionManager:
         self._watchdog = None
         self._active_segment = None
         self._timed_out_segments = set()
+        self._last_scheduled_session_id = None
         self._recover_sessions()
         if start_worker:
             self.start()
@@ -419,7 +421,11 @@ class StreamSessionManager:
         index = 0
         while True:
             entry = session.get("segments", {}).get(str(index))
-            if entry is None or not self._entry_settled(entry):
+            gap = session.get("declared_gaps", {}).get(str(index))
+            if gap is not None:
+                if not gap.get("settled"):
+                    return index
+            elif entry is None or not self._entry_settled(entry):
                 return index
             index += 1
         return index
@@ -469,7 +475,10 @@ class StreamSessionManager:
         has_processing_errors = bool(progress["failed_segment_indexes"])
         if session.get("sealed"):
             return "draining_with_errors" if has_processing_errors else "draining_backlog"
-        if progress["missing_segment_indexes"]:
+        if any(
+            not session.get("declared_gaps", {}).get(str(index), {}).get("settled")
+            for index in progress["missing_segment_indexes"]
+        ):
             return "waiting_for_predecessor"
         if progress["received_segments"] > 0:
             return "analyzing_with_errors" if has_processing_errors else "analyzing"
@@ -844,6 +853,7 @@ class StreamSessionManager:
                     "cleanup_anchor": "updated_at_after_terminal",
                 },
                 "segments": {},
+                "declared_gaps": {},
                 "error": None,
                 "processing_errors": [],
                 "continuity_epoch": 0,
@@ -899,6 +909,8 @@ class StreamSessionManager:
             if session.get("status") in TERMINAL_SESSION_STATES:
                 raise invalid_state(f"cannot add a segment to a {session['status']} session", session_id)
             key = str(path_index)
+            if key in session.get("declared_gaps", {}):
+                raise invalid_state(f"segment_index {path_index} was already declared missing", session_id)
             existing = session["segments"].get(key)
             if existing is not None:
                 same_content = (
@@ -1015,6 +1027,51 @@ class StreamSessionManager:
                 self._notify()
             return 202, segment_receipt_response(session, path_index, receipt)
 
+    def declare_gap(self, session_id, segment_index, body):
+        """Durably record lost source media; the worker starts a new evidence epoch."""
+        if self._load(session_id) is None:
+            raise session_not_found(session_id)
+        try:
+            index = int(segment_index)
+            if index < 0 or isinstance(segment_index, bool):
+                raise ValueError("segment_index must be non-negative")
+            gap = validate_gap_declaration(body)
+        except (TypeError, ValueError) as exc:
+            raise validation_error(str(exc), analysis_session_id=session_id)
+        with self._lock:
+            session = self._load(session_id)
+            if session.get("sealed") or session.get("status") in TERMINAL_SESSION_STATES:
+                raise invalid_state("cannot declare a gap after session input is sealed", session_id)
+            key = str(index)
+            if key in session.get("segments", {}):
+                raise invalid_state(f"segment_index {index} already has accepted media", session_id)
+            existing = session.setdefault("declared_gaps", {}).get(key)
+            if existing is not None:
+                if any(existing[field] != gap[field] for field in ("source_start_time_sec", "duration_sec", "reason")):
+                    raise invalid_state(f"segment_index {index} has a conflicting gap declaration", session_id)
+                return 200, {"schema_version": SCHEMA_VERSION, "analysis_session_id": session_id,
+                             "segment_index": index, "status": "declared_missing", "reused": True}
+            for neighbor_index, is_previous in ((index - 1, True), (index + 1, False)):
+                neighbor = (session.get("segments", {}).get(str(neighbor_index))
+                            or session["declared_gaps"].get(str(neighbor_index)))
+                if neighbor is None:
+                    continue
+                if is_previous and gap["source_start_time_sec"] + 1e-6 < (
+                    float(neighbor["source_start_time_sec"]) + float(neighbor["duration_sec"])
+                ):
+                    raise validation_error("declared gap overlaps the preceding source interval", analysis_session_id=session_id)
+                if not is_previous and gap["source_start_time_sec"] + gap["duration_sec"] > (
+                    float(neighbor["source_start_time_sec"]) + 1e-6
+                ):
+                    raise validation_error("declared gap overlaps the following source interval", analysis_session_id=session_id)
+            session["declared_gaps"][key] = {**gap, "settled": False, "declared_at": utc_now()}
+            session["status"] = self._derive_status(session)
+            self._append_state_history(session, session["status"], "source_segment_missing_declared")
+            self._save(session)
+            self._notify()
+            return 202, {"schema_version": SCHEMA_VERSION, "analysis_session_id": session_id,
+                         "segment_index": index, "status": "declared_missing", "reused": False}
+
     def get_status(self, session_id):
         session = self._load(session_id)
         if session is None:
@@ -1100,6 +1157,8 @@ class StreamSessionManager:
             expected_last = request["expected_last_segment_index"]
             allow_partial = request["allow_partial"]
             received = self._received_indexes(session)
+            if received and max(received) > expected_last:
+                raise invalid_state("completion range excludes already accepted media", session_id)
             missing = sorted(index for index in range(0, expected_last + 1) if index not in received)
             if missing and not allow_partial:
                 raise StreamSessionError(
@@ -1110,15 +1169,33 @@ class StreamSessionManager:
                     details={"expected_last_segment_index": expected_last, "missing_segment_indexes": missing},
                     analysis_session_id=session_id,
                 )
+            undeclared_middle_gaps = [
+                index for index in missing
+                if received and index < max(received)
+                and str(index) not in session.get("declared_gaps", {})
+            ]
+            if undeclared_middle_gaps:
+                raise StreamSessionError(
+                    "missing_segments",
+                    "declare missing media before sealing so accepted successors can be analyzed",
+                    409,
+                    retryable=True,
+                    details={"missing_segment_indexes": undeclared_middle_gaps},
+                    analysis_session_id=session_id,
+                )
             session["sealed"] = True
             session["sealed_at"] = utc_now()
             session["expected_last_segment_index"] = expected_last
             session["allow_partial"] = allow_partial
             failures = self._failed_indexes(session)
-            if allow_partial and missing:
+            declared_gap_work = bool(session.get("declared_gaps")) and (
+                any(not gap.get("settled") for gap in session["declared_gaps"].values())
+                or any(not self._entry_settled(entry) for entry in session["segments"].values())
+            )
+            if allow_partial and missing and not declared_gap_work:
                 self._finalize_partial(session, missing, failures)
                 session = self._load(session_id) or session
-            elif self._processed_count(session) + self._failed_count(session) >= self._received_count(session):
+            elif not declared_gap_work and self._processed_count(session) + self._failed_count(session) >= self._received_count(session):
                 if failures:
                     self._finalize_partial(session, missing, failures)
                 else:
@@ -1303,7 +1380,10 @@ class StreamSessionManager:
                 break
             session_id, index = target
             before = self._load(session_id)
-            self._process_segment(session_id, index)
+            if before.get("declared_gaps", {}).get(str(index)) is not None:
+                self._process_declared_gap(session_id, index)
+            else:
+                self._process_segment(session_id, index)
             after = self._load(session_id)
             # A decoder/engine failure must either advance or terminate the
             # session.  If neither happened, stop rather than spin forever on
@@ -1313,6 +1393,11 @@ class StreamSessionManager:
 
     def _next_ready_segment(self):
         sessions = sorted(self._list_sessions(), key=lambda item: item.get("created_at", ""))
+        if self._last_scheduled_session_id is not None:
+            for position, session in enumerate(sessions):
+                if session["analysis_session_id"] == self._last_scheduled_session_id:
+                    sessions = sessions[position + 1:] + sessions[:position + 1]
+                    break
         for session in sessions:
             if session.get("status") in TERMINAL_SESSION_STATES:
                 continue
@@ -1321,9 +1406,60 @@ class StreamSessionManager:
             # evidence gap, allowing later fragments to run in a new epoch.
             next_index = self._next_expected_index(session)
             entry = session.get("segments", {}).get(str(next_index))
-            if entry is not None and not self._entry_settled(entry):
+            gap = session.get("declared_gaps", {}).get(str(next_index))
+            if (entry is not None and not self._entry_settled(entry)) or (gap is not None and not gap.get("settled")):
+                self._last_scheduled_session_id = session["analysis_session_id"]
                 return session["analysis_session_id"], next_index
         return None
+
+    def _process_declared_gap(self, session_id, index):
+        session = self._load(session_id)
+        if session is None or session.get("status") in TERMINAL_SESSION_STATES:
+            return
+        gap = session.get("declared_gaps", {}).get(str(index))
+        if gap is None or gap.get("settled"):
+            return
+        next_epoch = int(session.get("continuity_epoch", 0)) + 1
+        gap_indexes = self._failed_indexes(session) + [
+            int(key) for key, value in session.get("declared_gaps", {}).items()
+            if value.get("settled") or int(key) == index
+        ]
+        try:
+            replacement = self._create_engine(session)
+            begin_after_gap = getattr(replacement, "begin_after_gap", None)
+            if not callable(begin_after_gap):
+                raise RuntimeError("engine does not support safe continuation after lost media")
+            begin_after_gap(
+                next_segment_index=index + 1,
+                source_time_sec=float(gap["source_start_time_sec"]) + float(gap["duration_sec"]),
+                continuity_epoch=next_epoch,
+                gap_segment_indexes=gap_indexes,
+            )
+            checkpoint = replacement.checkpoint()
+        except Exception as exc:
+            self._fail_session(session_id, exc)
+            return
+        with self._lock:
+            latest = self._load(session_id)
+            if latest is None or latest.get("status") in TERMINAL_SESSION_STATES:
+                return
+            latest_gap = latest.get("declared_gaps", {}).get(str(index))
+            if latest_gap is None or latest_gap.get("settled"):
+                return
+            latest_gap["settled"] = True
+            latest["continuity_epoch"] = next_epoch
+            latest["status"] = self._derive_status(latest)
+            self._append_state_history(latest, latest["status"], "source_segment_missing_settled")
+            self._emit_status_event(
+                latest, "source_segment_missing_settled",
+                source_time_sec=float(gap["source_start_time_sec"]), segment_index=index,
+                extra={"ball_continuity": "unknown", "segment_gap": index,
+                       "continuity_epoch": next_epoch},
+            )
+            self._save_checkpoint(session_id, checkpoint)
+            self._save(latest)
+            self._engines[session_id] = replacement
+        self._finalize_if_ready(session_id)
 
     def _process_segment(self, session_id, index):
         session = self._load(session_id)
@@ -1596,10 +1732,14 @@ class StreamSessionManager:
             return
         missing = self._missing_indexes(session)
         failures = self._failed_indexes(session)
-        if session.get("allow_partial") and missing:
+        declared_gap_work = bool(session.get("declared_gaps")) and (
+            any(not gap.get("settled") for gap in session["declared_gaps"].values())
+            or any(not self._entry_settled(entry) for entry in session["segments"].values())
+        )
+        if session.get("allow_partial") and missing and not declared_gap_work:
             self._finalize_partial(session, missing, failures)
             return
-        if self._processed_count(session) + self._failed_count(session) >= self._received_count(session):
+        if not declared_gap_work and self._processed_count(session) + self._failed_count(session) >= self._received_count(session):
             if failures:
                 self._finalize_partial(session, missing, failures)
             else:

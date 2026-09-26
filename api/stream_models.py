@@ -365,6 +365,23 @@ def validate_segment_metadata(body):
     return normalized
 
 
+def validate_gap_declaration(body):
+    """Validate an explicit capture-side declaration that media was lost."""
+    if not isinstance(body, dict):
+        raise ValueError("request body must be a JSON object")
+    _reject_extra_keys(body, {"schema_version", "source_start_time_sec", "duration_sec", "reason"}, "gap declaration")
+    if body.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("schema_version must be stream-session.v1")
+    if body.get("reason") != "source_segment_missing":
+        raise ValueError("gap reason must be source_segment_missing")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source_start_time_sec": _number(body.get("source_start_time_sec"), "source_start_time_sec", minimum=0),
+        "duration_sec": _number(body.get("duration_sec"), "duration_sec", exclusive_minimum=0, maximum=MAX_SEGMENT_DURATION_SEC),
+        "reason": "source_segment_missing",
+    }
+
+
 def validate_complete_request(body):
     """Validate and normalise completeSessionRequest (raises ValueError)."""
     if not isinstance(body, dict):
