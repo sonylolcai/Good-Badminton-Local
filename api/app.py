@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import secrets
 import re
 import shutil
 import tempfile
@@ -64,8 +65,20 @@ def create_app(
         expected = os.environ.get("GOOD_BADMINTON_API_KEY")
         if not expected:
             raise HTTPException(status_code=503, detail="API authentication is not configured")
-        if x_api_key != expected:
+        if not x_api_key or not secrets.compare_digest(x_api_key, expected):
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+    def require_upload_access(
+        session_id: str,
+        x_api_key: Optional[str] = Header(default=None),
+        x_upload_token: Optional[str] = Header(default=None),
+    ):
+        expected = os.environ.get("GOOD_BADMINTON_API_KEY")
+        if expected and x_api_key and secrets.compare_digest(x_api_key, expected):
+            return
+        if stream_manager.verify_upload_token(session_id, x_upload_token):
+            return
+        raise HTTPException(status_code=401, detail="Invalid session upload credential")
 
     def stream_health_payload():
         return {
@@ -85,6 +98,7 @@ def create_app(
         app,
         stream_manager=stream_manager,
         require_api_key=require_api_key,
+        require_upload_access=require_upload_access,
         health_payload=stream_health_payload,
     )
 

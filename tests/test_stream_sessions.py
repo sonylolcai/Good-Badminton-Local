@@ -177,6 +177,61 @@ class StreamSessionManagerTests(unittest.TestCase):
         status, status_payload = self.manager.get_status(session_id)
         self.assertEqual(status_payload["progress"]["processed_segments"], 1)
 
+    def test_identical_retry_restores_missing_media_before_receipt(self):
+        _, created = self._create()
+        session_id = created["analysis_session_id"]
+        metadata = segment_metadata(0, self.segment_bytes)
+        self.manager.receive_segment(session_id, 0, metadata, self.segment_bytes)
+        segment_path = self.manager._segment_path(session_id, 0)
+        segment_path.unlink()
+
+        status, duplicate = self.manager.receive_segment(session_id, 0, metadata, self.segment_bytes)
+
+        self.assertEqual(status, 200)
+        self.assertTrue(duplicate["receipt"]["reused"])
+        self.assertEqual(segment_path.read_bytes(), self.segment_bytes)
+
+    def test_upload_token_is_session_scoped_rotatable_and_preserves_media(self):
+        environment = patch.dict("os.environ", {"GOOD_BADMINTON_UPLOAD_TOKEN_TTL_SECONDS": "3600",
+                                             "GOOD_BADMINTON_STREAM_MIN_FREE_BYTES": "1"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        _, first = self._create()
+        _, second = self._create("business-stream-0002")
+        first_id, second_id = first["analysis_session_id"], second["analysis_session_id"]
+        issued = self.manager.issue_upload_token(first_id)
+        self.assertTrue(self.manager.verify_upload_token(first_id, issued["upload_token"]))
+        self.assertFalse(self.manager.verify_upload_token(second_id, issued["upload_token"]))
+        self.assertNotIn(issued["upload_token"], self.manager._manifest_path(first_id).read_text())
+        self.assertEqual(self.manager.get_session(first_id)["retention"]["policy"], "persistent_media")
+        rotated = self.manager.issue_upload_token(first_id)
+        self.assertFalse(self.manager.verify_upload_token(first_id, issued["upload_token"]))
+        self.assertTrue(self.manager.verify_upload_token(first_id, rotated["upload_token"]))
+        self.manager.revoke_upload_token(first_id)
+        self.assertFalse(self.manager.verify_upload_token(first_id, rotated["upload_token"]))
+
+    def test_receipt_reports_missing_media_instead_of_claiming_acceptance(self):
+        _, created = self._create()
+        session_id = created["analysis_session_id"]
+        self.manager.receive_segment(session_id, 0, segment_metadata(0, self.segment_bytes), self.segment_bytes)
+        self.assertTrue(self.manager.get_segment_receipt(session_id, 0)["gpu_accepted"])
+        self.manager._segment_path(session_id, 0).unlink()
+        self.assertFalse(self.manager.get_segment_receipt(session_id, 0)["gpu_accepted"])
+
+    def test_direct_upload_refuses_receipt_when_media_reserve_would_be_crossed(self):
+        _, created = self._create()
+        session_id = created["analysis_session_id"]
+        with patch.dict("os.environ", {
+            "GOOD_BADMINTON_UPLOAD_TOKEN_TTL_SECONDS": "3600",
+            "GOOD_BADMINTON_STREAM_MIN_FREE_BYTES": "1",
+        }):
+            self.manager.issue_upload_token(session_id)
+        with patch.dict("os.environ", {"GOOD_BADMINTON_STREAM_MIN_FREE_BYTES": str(10**18)}):
+            with self.assertRaises(StreamSessionError) as error:
+                self.manager.receive_segment(session_id, 0, segment_metadata(0, self.segment_bytes), self.segment_bytes)
+        self.assertEqual(error.exception.status_code, 507)
+        self.assertFalse(self.manager._segment_path(session_id, 0).exists())
+
     def test_duplicate_segment_requires_the_same_idempotency_key(self):
         _, created = self._create()
         session_id = created["analysis_session_id"]

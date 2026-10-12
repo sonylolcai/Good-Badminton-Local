@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -58,6 +59,37 @@ from .stream_models import (
     validate_segment_metadata,
     new_session_id,
 )
+
+
+def _durable_replace(path: Path, payload: bytes) -> None:
+    """Publish media/receipt state only after the file reaches stable storage."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.urandom(8).hex()}.tmp")
+    try:
+        with temporary.open("wb") as target:
+            target.write(payload)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+        for directory in (path.parent, path.parent.parent):
+            try:
+                directory_fd = os.open(directory, os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 class StreamSessionManager:
@@ -166,12 +198,9 @@ class StreamSessionManager:
     def _save(self, session):
         session["updated_at"] = utc_now()
         path = self._manifest_path(session["analysis_session_id"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".json.tmp")
-        payload = json.dumps(session, ensure_ascii=False, indent=2) + "\n"
+        payload = (json.dumps(session, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         with self._lock:
-            temporary.write_text(payload, encoding="utf-8")
-            os.replace(temporary, path)
+            _durable_replace(path, payload)
 
     def _load_checkpoint(self, session_id):
         path = self._checkpoint_path(session_id)
@@ -318,6 +347,8 @@ class StreamSessionManager:
         candidates = []
         for session in self._list_sessions():
             if session.get("status") not in TERMINAL_SESSION_STATES:
+                continue
+            if session.get("retention", {}).get("policy") == "persistent_media":
                 continue
             try:
                 updated = datetime.fromisoformat(
@@ -870,6 +901,110 @@ class StreamSessionManager:
     def get_session(self, session_id):
         return self._load(session_id)
 
+    def issue_upload_token(self, session_id, *, ttl_seconds=None):
+        configured_ttl = ttl_seconds if ttl_seconds is not None else os.environ.get("GOOD_BADMINTON_UPLOAD_TOKEN_TTL_SECONDS")
+        if configured_ttl is None:
+            raise validation_error("GOOD_BADMINTON_UPLOAD_TOKEN_TTL_SECONDS must be configured",
+                                   analysis_session_id=session_id)
+        try:
+            ttl = int(configured_ttl)
+        except (TypeError, ValueError) as exc:
+            raise validation_error("upload token ttl_seconds must be an integer", analysis_session_id=session_id) from exc
+        if ttl <= 0:
+            raise validation_error("upload token ttl_seconds must be positive", analysis_session_id=session_id)
+        reserve = os.environ.get("GOOD_BADMINTON_STREAM_MIN_FREE_BYTES")
+        if reserve is None:
+            raise validation_error("GOOD_BADMINTON_STREAM_MIN_FREE_BYTES must be configured",
+                                   analysis_session_id=session_id)
+        try:
+            if int(reserve) <= 0:
+                raise ValueError
+        except ValueError as exc:
+            raise validation_error("GOOD_BADMINTON_STREAM_MIN_FREE_BYTES must be positive",
+                                   analysis_session_id=session_id) from exc
+        with self._lock:
+            session = self._load(session_id)
+            if session is None:
+                raise session_not_found(session_id)
+            if session.get("sealed") or session.get("status") in TERMINAL_SESSION_STATES:
+                raise invalid_state("cannot issue an upload token for a closed session", session_id)
+            token = secrets.token_urlsafe(32)
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+            session["upload_authorization"] = {
+                "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+                "revoked": False,
+            }
+            # A direct-ingest receipt allows the venue to delete its copy.
+            # The scheduled short-lived session cleanup must never erase it.
+            session["retention"] = {"policy": "persistent_media"}
+            self._save(session)
+            return {"analysis_session_id": session_id, "upload_token": token,
+                    "expires_at": session["upload_authorization"]["expires_at"]}
+
+    def revoke_upload_token(self, session_id):
+        with self._lock:
+            session = self._load(session_id)
+            if session is None:
+                raise session_not_found(session_id)
+            authorization = session.get("upload_authorization")
+            if authorization:
+                authorization["revoked"] = True
+                self._save(session)
+            return {"analysis_session_id": session_id, "revoked": True}
+
+    def verify_upload_token(self, session_id, token):
+        if not token:
+            return False
+        session = self._load(session_id)
+        authorization = session.get("upload_authorization") if session else None
+        if not authorization or authorization.get("revoked"):
+            return False
+        try:
+            expires_at = datetime.fromisoformat(authorization["expires_at"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            return False
+        actual_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return (datetime.now(timezone.utc) < expires_at
+                and secrets.compare_digest(actual_hash, authorization.get("token_sha256", "")))
+
+    def _ensure_direct_media_capacity(self, session_id, size):
+        configured = os.environ.get("GOOD_BADMINTON_STREAM_MIN_FREE_BYTES")
+        try:
+            reserve = int(configured) if configured is not None else 0
+        except ValueError:
+            reserve = 0
+        if reserve <= 0:
+            raise StreamSessionError(
+                "gpu_media_storage_unconfigured", "GPU media storage reserve is not configured", 503,
+                analysis_session_id=session_id,
+            )
+        if shutil.disk_usage(self.data_dir).free - size < reserve:
+            raise StreamSessionError(
+                "gpu_media_storage_full", "GPU media storage has insufficient free space", 507,
+                analysis_session_id=session_id,
+            )
+
+    def get_segment_receipt(self, session_id, segment_index):
+        session = self._load(session_id)
+        if session is None:
+            raise session_not_found(session_id)
+        segment = session.get("segments", {}).get(str(segment_index))
+        if segment is None:
+            raise session_not_found(session_id)
+        path = self._segment_path(session_id, segment_index)
+        present = (path.is_file() and path.stat().st_size == segment["content_length_bytes"]
+                   and _sha256_file(path) == segment["sha256"])
+        return {"analysis_session_id": session_id, "segment_index": segment_index,
+                "sha256": segment["sha256"], "content_length_bytes": segment["content_length_bytes"],
+                "gpu_accepted": present, "received_at": segment["received_at"],
+                "idempotency_key": segment["idempotency_key"],
+                "source_start_time_sec": segment["source_start_time_sec"],
+                "duration_sec": segment["duration_sec"],
+                "source_frame_start_index": segment.get("source_frame_start_index"),
+                "source_frame_count": segment.get("source_frame_count"),
+                "source_frame_time_offsets_sec": segment.get("source_frame_time_offsets_sec")}
+
     def receive_segment(self, session_id, path_index, metadata_body, data_bytes):
         session = self._load(session_id)
         if session is None:
@@ -937,6 +1072,16 @@ class StreamSessionManager:
                         session_id,
                     )
                 if same_content and same_idempotency_key:
+                    # A prior manifest can outlive a missing/corrupted media
+                    # file. Restore it from the verified idempotent retry
+                    # before returning a receipt that lets the edge delete.
+                    segment_path = self._segment_path(session_id, path_index)
+                    if (not segment_path.is_file()
+                            or segment_path.stat().st_size != actual_length
+                            or _sha256_file(segment_path) != metadata["sha256"]):
+                        if session.get("retention", {}).get("policy") == "persistent_media":
+                            self._ensure_direct_media_capacity(session_id, actual_length)
+                        _durable_replace(segment_path, data_bytes)
                     session["status"] = self._derive_status(session)
                     self._save(session)
                     receipt = {
@@ -970,10 +1115,9 @@ class StreamSessionManager:
                     analysis_session_id=session_id,
                 )
             segment_path = self._segment_path(session_id, path_index)
-            segment_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = segment_path.with_suffix(".bin.tmp")
-            temporary.write_bytes(data_bytes)
-            os.replace(temporary, segment_path)
+            if session.get("retention", {}).get("policy") == "persistent_media":
+                self._ensure_direct_media_capacity(session_id, actual_length)
+            _durable_replace(segment_path, data_bytes)
             received_at = utc_now()
             disposition = (
                 "queued"

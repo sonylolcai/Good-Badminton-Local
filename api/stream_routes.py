@@ -32,6 +32,7 @@ def register_stream_routes(
     *,
     stream_manager,
     require_api_key: Callable,
+    require_upload_access: Callable,
     health_payload: Callable[[], Mapping],
 ) -> None:
     """Attach the versioned stream API to an application composition root."""
@@ -75,7 +76,7 @@ def register_stream_routes(
 
     @app.post(
         "/api/v1/stream-sessions/{session_id}/segments/{segment_index}",
-        dependencies=[Depends(require_api_key)],
+        dependencies=[Depends(require_upload_access)],
     )
     async def submit_stream_segment(
         session_id: str,
@@ -112,11 +113,32 @@ def register_stream_routes(
 
     @app.post(
         "/api/v1/stream-sessions/{session_id}/gaps/{segment_index}",
-        dependencies=[Depends(require_api_key)],
+        dependencies=[Depends(require_upload_access)],
     )
     async def declare_stream_gap(session_id: str, segment_index: int, body: dict):
         response_status, payload = stream_manager.declare_gap(session_id, segment_index, body)
         return JSONResponse(status_code=response_status, content=payload)
+
+    @app.post(
+        "/api/v1/stream-sessions/{session_id}/upload-authorization",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def issue_upload_authorization(session_id: str):
+        return stream_manager.issue_upload_token(session_id)
+
+    @app.delete(
+        "/api/v1/stream-sessions/{session_id}/upload-authorization",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def revoke_upload_authorization(session_id: str):
+        return stream_manager.revoke_upload_token(session_id)
+
+    @app.get(
+        "/api/v1/stream-sessions/{session_id}/segments/{segment_index}/receipt",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def get_segment_receipt(session_id: str, segment_index: int):
+        return stream_manager.get_segment_receipt(session_id, segment_index)
 
     @app.get(
         "/api/v1/stream-sessions/{session_id}/events",
