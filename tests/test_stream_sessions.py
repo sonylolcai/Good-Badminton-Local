@@ -389,6 +389,44 @@ class StreamSessionManagerTests(unittest.TestCase):
             "allow_partial": True,
         })[1]["status"], "partial")
 
+    def test_events_revision_is_exposed_on_status_and_event_pages(self):
+        _, created = self._create("business-stream-events-revision")
+        session_id = created["analysis_session_id"]
+        self._receive(session_id, 0, source_start=0.0)
+        self.manager.drain()
+
+        self.assertEqual(self.manager.get_status(session_id)[1]["events_revision"], 1)
+        events = self.manager.read_events(session_id, limit=5)[1]
+        self.assertEqual(events["events_revision"], 1)
+        self.assertIsNotNone(events["next_cursor"])
+
+    def test_repair_epoch_borrow_cannot_collide_with_a_later_gap(self):
+        _, created = self._create("business-stream-epoch-collision")
+        session_id = created["analysis_session_id"]
+        self._receive(session_id, 0, source_start=0.0)
+        self._receive(session_id, 2, source_start=2.0)
+        self.manager.declare_gap(session_id, 1, {
+            "schema_version": "stream-session.v1", "source_start_time_sec": 1.0,
+            "duration_sec": 1.0, "reason": "source_segment_missing"})
+
+        # A repaired fragment borrows an epoch id for its own isolated evidence
+        # island; that must not advance the forward timeline it shares the session with.
+        with self.manager._lock:
+            session = self.manager._load(session_id)
+            borrowed = self.manager._allocate_epoch(session)
+            self.manager._save(session)
+        self.assertEqual(borrowed, 1)
+        self.assertEqual(self.manager.get_session(session_id)["continuity_epoch"], 0)
+
+        self.manager.drain()
+
+        # The gap settlement has to publish a strictly newer number than the borrowed
+        # one, otherwise two epochs share an id and epoch-scoped track ids merge
+        # trackers that never belonged together.
+        session = self.manager.get_session(session_id)
+        self.assertGreater(session["continuity_epoch"], borrowed)
+        self.assertEqual(session["max_epoch_issued"], session["continuity_epoch"])
+
     def test_declared_gap_survives_worker_restart_and_unblocks_successor(self):
         _, created = self._create("business-stream-restart-gap")
         session_id = created["analysis_session_id"]

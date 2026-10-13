@@ -467,6 +467,12 @@ def session_status_response(
         # completely failed session.
         "processing_errors": list(processing_errors or ()),
         "artifacts": artifacts,
+        # A repair rewrites evidence inside an already-consumed time range, and the
+        # event log is ordered by evidence time with a positional cursor.  That cursor
+        # cannot surface the inserted rows, so the log carries a monotonic revision:
+        # when it changes, consumers must re-pull from the beginning and de-duplicate
+        # by ``event_id`` (which the writer already does).
+        "events_revision": int(session.get("events_revision", 1)),
     }
 
 
@@ -476,6 +482,7 @@ def events_response(session, events, next_cursor):
         "analysis_session_id": session["analysis_session_id"],
         "events": events,
         "next_cursor": next_cursor,
+        "events_revision": int(session.get("events_revision", 1)),
     }
 
 

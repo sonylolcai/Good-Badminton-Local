@@ -422,6 +422,27 @@ class StreamSessionManager:
     def _entry_settled(entry):
         return bool(entry.get("processed") or entry.get("processing_failed"))
 
+    def _allocate_epoch(self, session):
+        """Issue the next continuity epoch without ever reusing a published number.
+
+        Gap settlement moves the forward timeline onto a new epoch, while a repaired
+        fragment only borrows a number for its own isolated evidence island.  Both
+        must draw from one monotonic counter, otherwise a session that repairs a
+        fragment and later loses media would publish two identical epochs and the
+        epoch-scoped track ids would collide across unrelated trackers.
+        """
+        issued = max(
+            int(session.get("continuity_epoch", 0) or 0),
+            int(session.get("max_epoch_issued", 0) or 0),
+        ) + 1
+        session["max_epoch_issued"] = issued
+        return issued
+
+    def _bump_events_revision(self, session):
+        """Mark that evidence was inserted below an already-issued event cursor."""
+        session["events_revision"] = int(session.get("events_revision", 1) or 1) + 1
+        return session["events_revision"]
+
     def _received_duration(self, session):
         return sum(float(entry.get("duration_sec", 0.0)) for entry in session.get("segments", {}).values())
 
@@ -889,6 +910,15 @@ class StreamSessionManager:
                 "error": None,
                 "processing_errors": [],
                 "continuity_epoch": 0,
+                # One monotonic epoch allocator feeds both the forward timeline (gap
+                # settlement) and repaired fragments, which borrow a number without
+                # moving the timeline.  Without it a repair followed by a later gap
+                # would publish two identical epochs.
+                "max_epoch_issued": 0,
+                # Repairs insert evidence into already-consumed time ranges; the event
+                # revision tells cursor-following consumers to re-pull the log.
+                "events_revision": 1,
+                "repair": {"window_open": False, "window_expires_at": None, "requests": {}},
                 "event_seq": 0,
                 "state_history": [{"at": now, "status": "accepted", "event": "durably_stored"}],
             }
@@ -1483,7 +1513,7 @@ class StreamSessionManager:
             latest_entry["processing_failed"] = True
             latest_entry["processed"] = False
             latest_entry["failure"] = failure
-            latest["continuity_epoch"] = int(latest.get("continuity_epoch", 0)) + 1
+            latest["continuity_epoch"] = self._allocate_epoch(latest)
             latest["processing_errors"] = list(latest.get("processing_errors") or ()) + [failure]
             latest["status"] = self._derive_status(latest)
             self._append_state_history(latest, latest["status"], "segment_timeout_restart")
@@ -1567,7 +1597,7 @@ class StreamSessionManager:
         gap = session.get("declared_gaps", {}).get(str(index))
         if gap is None or gap.get("settled"):
             return
-        next_epoch = int(session.get("continuity_epoch", 0)) + 1
+        next_epoch = self._allocate_epoch(session)
         gap_indexes = self._failed_indexes(session) + [
             int(key) for key, value in session.get("declared_gaps", {}).items()
             if value.get("settled") or int(key) == index
@@ -1596,6 +1626,11 @@ class StreamSessionManager:
                 return
             latest_gap["settled"] = True
             latest["continuity_epoch"] = next_epoch
+            # The number was allocated before this lock was taken; keep the shared
+            # counter ahead of it so a later repair cannot publish the same epoch.
+            latest["max_epoch_issued"] = max(
+                int(latest.get("max_epoch_issued", 0) or 0), next_epoch
+            )
             latest["status"] = self._derive_status(latest)
             self._append_state_history(latest, latest["status"], "source_segment_missing_settled")
             self._emit_status_event(
@@ -1776,7 +1811,7 @@ class StreamSessionManager:
             "source_start_time_sec": float(entry.get("source_start_time_sec", 0.0)),
             "duration_sec": float(entry.get("duration_sec", 0.0)),
         }
-        next_epoch = int(session.get("continuity_epoch", 0)) + 1
+        next_epoch = self._allocate_epoch(session)
         try:
             replacement = self._create_engine(session)
             begin_after_gap = getattr(replacement, "begin_after_gap", None)
@@ -1815,6 +1850,11 @@ class StreamSessionManager:
             latest_entry["processed"] = False
             latest_entry["failure"] = failure
             latest["continuity_epoch"] = next_epoch
+            # Keep the shared allocator ahead of the epoch published above so a later
+            # repaired fragment cannot borrow the same number.
+            latest["max_epoch_issued"] = max(
+                int(latest.get("max_epoch_issued", 0) or 0), next_epoch
+            )
             errors = list(latest.get("processing_errors") or ())
             errors.append(failure)
             latest["processing_errors"] = errors
