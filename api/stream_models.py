@@ -330,6 +330,7 @@ def validate_segment_metadata(body):
             "source_frame_start_index",
             "source_frame_count",
             "source_frame_time_offsets_sec",
+            "repair_request_id",
         },
         "segment metadata",
     )
@@ -375,6 +376,12 @@ def validate_segment_metadata(body):
             later <= earlier for earlier, later in zip(offsets, offsets[1:])
         ):
             raise ValueError("source frame time offsets must start at zero and increase within duration_sec")
+    raw_repair_request_id = body.get("repair_request_id")
+    # Present only on the repair data plane; the ordinary path never carries it.
+    repair_request_id = (
+        None if raw_repair_request_id is None
+        else _opaque_id(raw_repair_request_id, "repair_request_id")
+    )
     normalized = {
         "schema_version": SCHEMA_VERSION,
         "segment_index": segment_index,
@@ -385,6 +392,7 @@ def validate_segment_metadata(body):
         "content_type": content_type,
         "content_length_bytes": content_length_bytes,
         "court_corners": court_corners,
+        "repair_request_id": repair_request_id,
     }
     if source_frame_start_index is not None:
         normalized["source_frame_start_index"] = source_frame_start_index

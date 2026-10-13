@@ -202,6 +202,7 @@ class StreamSessionManager:
             "repair", {"window_open": False, "window_expires_at": None, "requests": {}}
         )
         session["repair"].setdefault("requests", {})
+        session.setdefault("repair_reanalysis", {})
         return session
 
     def _load(self, session_id):
@@ -934,6 +935,9 @@ class StreamSessionManager:
                 # revision tells cursor-following consumers to re-pull the log.
                 "events_revision": 1,
                 "repair": {"window_open": False, "window_expires_at": None, "requests": {}},
+                # Repaired fragments wait here for a throwaway engine; the forward
+                # timeline never looks at this queue.
+                "repair_reanalysis": {},
                 "event_seq": 0,
                 "state_history": [{"at": now, "status": "accepted", "event": "durably_stored"}],
             }
@@ -1219,6 +1223,243 @@ class StreamSessionManager:
             if disposition == "queued":
                 self._notify()
             return 202, segment_receipt_response(session, path_index, receipt)
+
+    def repair_segment(self, session_id, path_index, metadata_body, data_bytes, grant_token):
+        """Redeem one repair grant by accepting bytes for a registered index.
+
+        This path exists so the ordinary upload route can keep refusing
+        same-index/different-digest writes (decision D6, invariant 1): replacing
+        counted media has to be an explicit, per-index, expiring authorization.
+        """
+        session = self._load(session_id)
+        if session is None:
+            raise session_not_found(session_id)
+        try:
+            metadata = validate_segment_metadata(metadata_body)
+        except ValueError as exc:
+            raise validation_error(str(exc), analysis_session_id=session_id)
+        path_index = int(path_index)
+        if metadata["segment_index"] != path_index:
+            raise validation_error(
+                f"path segment_index {path_index} does not match metadata segment_index {metadata['segment_index']}",
+                analysis_session_id=session_id,
+            )
+        request_id = metadata["repair_request_id"]
+        if not request_id:
+            raise validation_error(
+                "repair metadata must carry the repair_request_id it was granted under",
+                analysis_session_id=session_id,
+            )
+        actual_sha256 = hashlib.sha256(data_bytes).hexdigest()
+        actual_length = len(data_bytes)
+        if actual_sha256 != metadata["sha256"]:
+            raise validation_error("metadata sha256 does not match the segment bytes", analysis_session_id=session_id)
+        if actual_length != metadata["content_length_bytes"]:
+            raise validation_error("metadata content_length_bytes does not match the segment bytes", analysis_session_id=session_id)
+        if actual_length > MAX_SEGMENT_BYTES:
+            raise validation_error(f"segment exceeds the {MAX_SEGMENT_BYTES} byte limit", analysis_session_id=session_id)
+        if metadata["court_corners"] is not None and metadata["court_corners"] != session.get("court_corners"):
+            raise validation_error(
+                "repair segment court_corners must exactly match the session court_corners",
+                analysis_session_id=session_id,
+            )
+        with self._lock:
+            session = self._load(session_id)
+            if session is None:
+                raise session_not_found(session_id)
+            if session.get("sealed") or session.get("status") in TERMINAL_SESSION_STATES:
+                raise StreamSessionError(
+                    "repair_after_seal",
+                    "session input is already sealed; a repaired segment cannot be added",
+                    409,
+                    analysis_session_id=session_id,
+                )
+            self._settle_repair_windows(session)
+            request = self._repair_requests(session).get(str(request_id))
+            grant = ((request or {}).get("grants") or {}).get(str(path_index))
+            if grant is None:
+                raise StreamSessionError(
+                    "repair_not_granted",
+                    f"segment_index {path_index} is not covered by repair request {request_id}",
+                    403,
+                    details={"segment_index": path_index, "repair_request_id": request_id},
+                    analysis_session_id=session_id,
+                )
+            # Authenticate before disclosing anything about the grant's state: a venue
+            # holding the wrong token learns nothing about whether the window survived.
+            submitted_hash = hashlib.sha256((grant_token or "").encode("utf-8")).hexdigest()
+            if not grant_token or not secrets.compare_digest(
+                submitted_hash, grant.get("token_sha256", "")
+            ):
+                raise StreamSessionError(
+                    "invalid_repair_grant",
+                    "the repair grant token does not match this segment",
+                    401,
+                    analysis_session_id=session_id,
+                )
+            fulfilled = grant.get("fulfilled_by") or {}
+            if (
+                grant.get("state") == "fulfilled"
+                and fulfilled.get("sha256") == actual_sha256
+                and fulfilled.get("idempotency_key") == metadata["idempotency_key"]
+            ):
+                # A retry of a delivery that already landed must not mint a third
+                # generation; hand back the receipt the first delivery earned.
+                return 200, segment_receipt_response(session, path_index, {
+                    "accepted": True,
+                    "repaired": True,
+                    "reused": True,
+                    "generation": int(fulfilled.get("generation", 1)),
+                    "received_at": fulfilled.get("at", utc_now()),
+                    "sha256": actual_sha256,
+                    "content_length_bytes": actual_length,
+                    "processing_disposition": "already_repaired",
+                    "repair_request_id": request_id,
+                })
+            if grant.get("state") != "open":
+                raise StreamSessionError(
+                    "repair_window_closed",
+                    f"the repair grant for segment_index {path_index} is {grant.get('state')}",
+                    409,
+                    details={
+                        "segment_index": path_index,
+                        "grant_state": grant.get("state"),
+                        "repair_request_id": request_id,
+                    },
+                    analysis_session_id=session_id,
+                )
+            if session.get("segments", {}).get(str(path_index)) is not None:
+                # Reaching here means a grant exists for media that is already present,
+                # which only a GPU integrity verdict may authorize (decision D6).
+                raise StreamSessionError(
+                    "repair_not_granted",
+                    f"segment_index {path_index} already has accepted media this repair may not replace",
+                    403,
+                    details={"segment_index": path_index},
+                    analysis_session_id=session_id,
+                )
+            expected = grant.get("expected") or {}
+            mismatched = [
+                field
+                for field in ("source_start_time_sec", "duration_sec")
+                if abs(float(metadata[field]) - float(expected[field])) > 1e-6
+            ]
+            for field in ("source_frame_start_index", "source_frame_count"):
+                if expected.get(field) is not None and metadata.get(field) != expected[field]:
+                    mismatched.append(field)
+            if mismatched:
+                # A repair must land on the interval the GPU already registered.  Filling
+                # an index with neighbouring footage would silently fabricate a timeline.
+                raise StreamSessionError(
+                    "repair_time_mismatch",
+                    f"segment_index {path_index} does not match its registered source interval",
+                    422,
+                    details={
+                        "segment_index": path_index,
+                        "expected": expected,
+                        "mismatched_fields": sorted(mismatched),
+                    },
+                    analysis_session_id=session_id,
+                )
+            if session.get("retention", {}).get("policy") == "persistent_media":
+                self._ensure_direct_media_capacity(session_id, actual_length)
+            key = str(path_index)
+            received_at = utc_now()
+            _durable_replace(self._segment_path(session_id, path_index), data_bytes)
+            session["segments"][key] = {
+                "segment_index": path_index,
+                "source_start_time_sec": metadata["source_start_time_sec"],
+                "duration_sec": metadata["duration_sec"],
+                "sha256": metadata["sha256"],
+                "idempotency_key": metadata["idempotency_key"],
+                "content_type": metadata["content_type"],
+                "content_length_bytes": metadata["content_length_bytes"],
+                "court_corners": metadata["court_corners"] or session.get("court_corners"),
+                "source_frame_start_index": metadata.get("source_frame_start_index"),
+                "source_frame_count": metadata.get("source_frame_count"),
+                "source_frame_time_offsets_sec": metadata.get("source_frame_time_offsets_sec"),
+                "received_at": received_at,
+                "reused": False,
+                "processing_disposition": "queued_for_reanalysis",
+                "processed": False,
+                "processing_failed": False,
+                "repaired": True,
+                "repair_request_id": request_id,
+                "generation": 1,
+            }
+            gap = session.get("declared_gaps", {}).get(key)
+            if gap is not None:
+                # The declaration stays on record: a filled gap is still a gap that
+                # happened, and downstream reconciliation needs to see both facts.
+                gap["resolved_by"] = request_id
+                gap["resolved_at"] = received_at
+            grant["state"] = "fulfilled"
+            grant["fulfilled_by"] = {
+                "generation": 1,
+                "sha256": actual_sha256,
+                "idempotency_key": metadata["idempotency_key"],
+                "at": received_at,
+            }
+            self._settle_repair_windows(session)
+            session["repair_reanalysis"][key] = {
+                "segment_index": path_index,
+                "repair_request_id": request_id,
+                "kind": grant["kind"],
+                "generation": 1,
+                "queued_at": received_at,
+            }
+            # Evidence is about to be inserted below a cursor the business side may have
+            # already consumed, so the log is watermarked before the first row lands.
+            events_revision = self._bump_events_revision(session)
+            session["status"] = self._derive_status(session)
+            self._append_state_history(session, session["status"], "segment_repaired")
+            self._append_event(
+                session,
+                "session_status",
+                float(metadata["source_start_time_sec"]),
+                path_index,
+                1.0,
+                "derived",
+                {
+                    "status": session["status"],
+                    "event": "segment_repaired",
+                    "segment_index": path_index,
+                    "generation": 1,
+                    "kind": grant["kind"],
+                    "repair_request_id": request_id,
+                    "replay_before_source_time_sec": True,
+                    "events_revision": events_revision,
+                },
+            )
+            self._save(session)
+            trace = self._load_trace(session_id)
+            if trace is not None:
+                trace["segments"].setdefault(key, {}).update(
+                    {
+                        "segment_index": path_index,
+                        "received_at": received_at,
+                        "content_length_bytes": actual_length,
+                        "source_start_time_sec": metadata["source_start_time_sec"],
+                        "duration_sec": metadata["duration_sec"],
+                        "repaired": True,
+                        "repair_request_id": request_id,
+                    }
+                )
+                self._save_trace(session_id, trace)
+            self._notify()
+            return 200, segment_receipt_response(session, path_index, {
+                "accepted": True,
+                "repaired": True,
+                "reused": False,
+                "generation": 1,
+                "superseded_sha256": None,
+                "received_at": received_at,
+                "sha256": actual_sha256,
+                "content_length_bytes": actual_length,
+                "processing_disposition": "queued_for_reanalysis",
+                "repair_request_id": request_id,
+                "requeued": True,
+            })
 
     def declare_gap(self, session_id, segment_index, body):
         """Durably record lost source media; the worker starts a new evidence epoch."""
@@ -1791,20 +2032,33 @@ class StreamSessionManager:
             latest_entry["processing_failed"] = True
             latest_entry["processed"] = False
             latest_entry["failure"] = failure
-            latest["continuity_epoch"] = self._allocate_epoch(latest)
+            is_repair = bool(active.get("repair"))
+            if is_repair:
+                # A hang inside a repaired fragment's throwaway engine must not push the
+                # forward timeline into a new epoch; only that one fragment is settled.
+                latest["repair_reanalysis"].pop(str(index), None)
+            else:
+                latest["continuity_epoch"] = self._allocate_epoch(latest)
             latest["processing_errors"] = list(latest.get("processing_errors") or ()) + [failure]
             latest["status"] = self._derive_status(latest)
-            self._append_state_history(latest, latest["status"], "segment_timeout_restart")
+            timeout_event = (
+                "repaired_segment_timeout_restart" if is_repair else "segment_timeout_restart"
+            )
+            self._append_state_history(latest, latest["status"], timeout_event)
+            timeout_extra = {
+                "segment_failure": failure,
+                "recovery_action": "supervised_gpu_api_restart",
+            }
+            if is_repair:
+                timeout_extra["repaired"] = True
+            else:
+                timeout_extra["continuity_epoch"] = latest["continuity_epoch"]
             self._emit_status_event(
                 latest,
-                "segment_timeout_restart",
+                timeout_event,
                 source_time_sec=float(entry.get("source_start_time_sec", 0.0)),
                 segment_index=index,
-                extra={
-                    "segment_failure": failure,
-                    "continuity_epoch": latest["continuity_epoch"],
-                    "recovery_action": "supervised_gpu_api_restart",
-                },
+                extra=timeout_extra,
             )
             self._save(latest)
         trace = self._load_trace(session_id)
@@ -1832,20 +2086,46 @@ class StreamSessionManager:
     def _process_ready_work(self):
         while True:
             target = self._next_ready_segment()
-            if target is None:
+            if target is not None:
+                session_id, index = target
+                before = self._load(session_id)
+                if before.get("declared_gaps", {}).get(str(index)) is not None:
+                    self._process_declared_gap(session_id, index)
+                else:
+                    self._process_segment(session_id, index)
+                after = self._load(session_id)
+                # A decoder/engine failure must either advance or terminate the
+                # session.  If neither happened, stop rather than spin forever on
+                # the same ready segment and consume a CPU core.
+                if before == after:
+                    break
+                continue
+            # A live recording always outranks a repair: a repaired fragment waits for
+            # its one-off reanalysis until nothing is pending on the forward timeline.
+            repair = self._next_ready_repair()
+            if repair is None:
                 break
-            session_id, index = target
+            session_id, index = repair
             before = self._load(session_id)
-            if before.get("declared_gaps", {}).get(str(index)) is not None:
-                self._process_declared_gap(session_id, index)
-            else:
-                self._process_segment(session_id, index)
-            after = self._load(session_id)
-            # A decoder/engine failure must either advance or terminate the
-            # session.  If neither happened, stop rather than spin forever on
-            # the same ready segment and consume a CPU core.
-            if before == after:
+            self._reanalyze_repaired_segment(session_id, index)
+            if before == self._load(session_id):
                 break
+
+    def _next_ready_repair(self):
+        """Return the oldest repaired fragment still awaiting its one-off reanalysis."""
+        for session in sorted(
+            self._list_sessions(), key=lambda item: item.get("created_at", "")
+        ):
+            if session.get("status") in TERMINAL_SESSION_STATES:
+                continue
+            pending = session.get("repair_reanalysis") or {}
+            if not pending:
+                continue
+            index = min(int(key) for key in pending)
+            if session.get("segments", {}).get(str(index)) is None:
+                continue
+            return session["analysis_session_id"], index
+        return None
 
     def _next_ready_segment(self):
         sessions = sorted(self._list_sessions(), key=lambda item: item.get("created_at", ""))
@@ -1920,6 +2200,170 @@ class StreamSessionManager:
             self._save_checkpoint(session_id, checkpoint)
             self._save(latest)
             self._engines[session_id] = replacement
+        self._finalize_if_ready(session_id)
+
+    def _reanalyze_repaired_segment(self, session_id, index):
+        """Analyze one repaired fragment in an isolated epoch (decision D7).
+
+        The session's head engine is deliberately untouched: it already streamed past
+        this index, and feeding it out-of-order frames would stitch tracks across a
+        break that really happened.  A throwaway engine sees only this fragment, and
+        its events are rewritten with fresh session-owned ids so the ``event_id``
+        dedupe in ``_write_events`` cannot silently drop repaired evidence.
+        """
+        # Claim the epoch before any long-running work and persist it with the queue
+        # item: a repaired fragment must never reach the session's head engine, and a
+        # crash mid-reanalysis reuses the claimed number instead of burning another one.
+        with self._lock:
+            session = self._load(session_id)
+            if (
+                session is None
+                or session.get("status") in TERMINAL_SESSION_STATES
+                or self._is_cancelled(session_id)
+            ):
+                return
+            pending = (session.get("repair_reanalysis") or {}).get(str(index))
+            entry = session.get("segments", {}).get(str(index))
+            if pending is None or entry is None:
+                return
+            epoch = int(pending.get("reanalysis_epoch") or 0)
+            if epoch <= 0:
+                epoch = self._allocate_epoch(session)
+                pending["reanalysis_epoch"] = epoch
+                pending["started_at"] = utc_now()
+                self._save(session)
+        segment_path = self._segment_path(session_id, index)
+        if not segment_path.is_file():
+            self._fail_reanalysis(
+                session_id,
+                index,
+                f"repaired segment {index} bytes are missing from durable storage",
+                phase="segment_storage",
+            )
+            return
+        self._set_active_segment(session_id, index, repair=True)
+        try:
+            # A throwaway engine starts at this index, as if everything before it were
+            # unseen source media.  Ordering and timing cursors move; no track is
+            # bridged across the repair boundary (decisions D2 and D7).
+            engine = self._create_engine(session)
+            begin_after_gap = getattr(engine, "begin_after_gap", None)
+            if not callable(begin_after_gap):
+                raise RuntimeError(
+                    "engine does not support isolated reanalysis of a repaired fragment"
+                )
+            begin_after_gap(
+                next_segment_index=int(index),
+                source_time_sec=float(entry["source_start_time_sec"]),
+                continuity_epoch=epoch,
+                gap_segment_indexes=list(range(0, int(index))),
+            )
+            segment = self.decoder.decode(segment_path, self._descriptor_from_entry(entry))
+            result = engine.process_segment(segment)
+        except Exception as exc:
+            self._clear_active_segment(session_id, index)
+            self._fail_reanalysis(
+                session_id,
+                index,
+                f"repaired segment {index} could not be reanalyzed: {exc}",
+                phase="reanalysis",
+            )
+            return
+        self._clear_active_segment(session_id, index)
+        with self._lock:
+            latest = self._load(session_id)
+            if latest is None or latest.get("status") in TERMINAL_SESSION_STATES:
+                return
+            latest_pending = (latest.get("repair_reanalysis") or {}).get(str(index))
+            latest_entry = latest.get("segments", {}).get(str(index))
+            if latest_pending is None or latest_entry is None:
+                return
+            # The epoch number is an identity namespace, not a sort key: it was claimed
+            # before this run, so the head timeline stays exactly where it was.
+            epoch = int(latest_pending.get("reanalysis_epoch") or epoch)
+            latest["max_epoch_issued"] = max(
+                int(latest.get("max_epoch_issued", 0) or 0), epoch
+            )
+            stamped = []
+            for event in self._tag_epoch_events(result.events, epoch):
+                latest["event_seq"] = int(latest.get("event_seq", 0)) + 1
+                event["event_id"] = (
+                    f"evt_{latest['analysis_session_id']}_{latest['event_seq']:06d}"
+                )
+                data = event.setdefault("data", {})
+                data["continuity_epoch"] = int(epoch)
+                data.update(
+                    {
+                        "repaired": True,
+                        "generation": int(latest_pending.get("generation", 1)),
+                        "repair_kind": latest_pending["kind"],
+                        "repair_request_id": latest_pending["repair_request_id"],
+                    }
+                )
+                stamped.append(event)
+            self._write_events(session_id, stamped)
+            latest_entry["processed"] = True
+            latest_entry["processing_failed"] = False
+            latest_entry["reanalysis_continuity_epoch"] = int(epoch)
+            latest["repair_reanalysis"].pop(str(index), None)
+            latest["status"] = self._derive_status(latest)
+            self._append_state_history(
+                latest, latest["status"], "repaired_segment_reanalyzed"
+            )
+            self._emit_status_event(
+                latest,
+                "repaired_segment_reanalyzed",
+                source_time_sec=float(latest_entry.get("source_start_time_sec", 0.0)),
+                segment_index=int(index),
+                extra={
+                    "continuity_epoch": int(epoch),
+                    "repaired": True,
+                    "generation": int(latest_pending.get("generation", 1)),
+                    "repair_request_id": latest_pending["repair_request_id"],
+                    "events_revision": int(latest.get("events_revision", 1)),
+                    "events_written": len(stamped),
+                },
+            )
+            self._save(latest)
+        self._finalize_if_ready(session_id)
+
+    def _fail_reanalysis(self, session_id, index, message, *, phase):
+        """Settle a repaired fragment whose one-off analysis could not run.
+
+        The bytes stay durably accepted: only the evidence failed.  The head timeline
+        is untouched, so a repair failure can never move the live continuity epoch.
+        """
+        failure = {
+            "segment_index": int(index),
+            "phase": str(phase),
+            "type": "RepairReanalysisError",
+            "message": str(message),
+            "at": utc_now(),
+            "repaired": True,
+        }
+        with self._lock:
+            session = self._load(session_id)
+            if session is None or session.get("status") in TERMINAL_SESSION_STATES:
+                return
+            entry = session.get("segments", {}).get(str(index))
+            pending = (session.get("repair_reanalysis") or {}).get(str(index))
+            if entry is None or pending is None:
+                return
+            entry["processing_failed"] = True
+            entry["processed"] = False
+            entry["failure"] = failure
+            session["processing_errors"] = list(session.get("processing_errors") or []) + [failure]
+            session["repair_reanalysis"].pop(str(index), None)
+            session["status"] = self._derive_status(session)
+            self._append_state_history(session, session["status"], "repaired_segment_failed")
+            self._emit_status_event(
+                session,
+                "repaired_segment_failed",
+                source_time_sec=float(entry.get("source_start_time_sec", 0.0)),
+                segment_index=int(index),
+                extra={"segment_failure": failure},
+            )
+            self._save(session)
         self._finalize_if_ready(session_id)
 
     def _process_segment(self, session_id, index):
@@ -2047,12 +2491,15 @@ class StreamSessionManager:
         self._clear_active_segment(session_id, index)
         self._finalize_if_ready(session_id)
 
-    def _set_active_segment(self, session_id, index):
+    def _set_active_segment(self, session_id, index, *, repair=False):
         with self._lock:
             self._active_segment = {
                 "session_id": str(session_id),
                 "index": int(index),
                 "started_monotonic": time.monotonic(),
+                # A repaired fragment runs on a throwaway engine off the head timeline,
+                # so the watchdog has to escalate it differently.
+                "repair": bool(repair),
             }
 
     def _clear_active_segment(self, session_id, index):
@@ -2439,6 +2886,11 @@ def create_session_handler(manager, body, idempotency_key=None):
 def submit_segment_handler(manager, session_id, segment_index, metadata_body, data_bytes):
     """POST /api/v1/stream-sessions/{id}/segments/{index}"""
     return manager.receive_segment(session_id, segment_index, metadata_body, data_bytes)
+
+
+def repair_segment_handler(manager, session_id, segment_index, metadata_body, data_bytes, grant_token):
+    """POST /api/v1/stream-sessions/{id}/segments/{index}/repair"""
+    return manager.repair_segment(session_id, segment_index, metadata_body, data_bytes, grant_token)
 
 
 def get_session_status_handler(manager, session_id):

@@ -23,6 +23,7 @@ from .stream_sessions import (
     create_session_handler,
     get_session_status_handler,
     read_events_handler,
+    repair_segment_handler,
     submit_segment_handler,
 )
 
@@ -100,6 +101,35 @@ def register_stream_routes(
             segment_index,
             metadata_body,
             data_bytes,
+        )
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.post(
+        "/api/v1/stream-sessions/{session_id}/segments/{segment_index}/repair",
+        dependencies=[Depends(require_upload_access)],
+    )
+    async def repair_stream_segment(
+        session_id: str,
+        segment_index: int,
+        segment: UploadFile = File(...),
+        metadata: str = Form(...),
+        x_grant_token: Optional[str] = Header(default=None),
+    ):
+        try:
+            metadata_body = json.loads(metadata)
+        except json.JSONDecodeError as exc:
+            raise validation_error(
+                "metadata must be a JSON object",
+                analysis_session_id=session_id,
+            ) from exc
+        data_bytes = await segment.read(MAX_SEGMENT_BYTES + 1)
+        response_status, payload = repair_segment_handler(
+            stream_manager,
+            session_id,
+            segment_index,
+            metadata_body,
+            data_bytes,
+            x_grant_token,
         )
         return JSONResponse(status_code=response_status, content=payload)
 
