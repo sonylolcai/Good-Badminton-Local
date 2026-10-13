@@ -1027,7 +1027,7 @@ class StreamSessionManager:
             raise validation_error("metadata content_length_bytes does not match the segment bytes", analysis_session_id=session_id)
         if actual_length > MAX_SEGMENT_BYTES:
             raise validation_error(f"segment exceeds the {MAX_SEGMENT_BYTES} byte limit", analysis_session_id=session_id)
-        if metadata["court_corners"] != session.get("court_corners"):
+        if metadata["court_corners"] is not None and metadata["court_corners"] != session.get("court_corners"):
             raise validation_error(
                 "segment court_corners must exactly match the session court_corners",
                 analysis_session_id=session_id,
@@ -1132,7 +1132,8 @@ class StreamSessionManager:
                 "idempotency_key": metadata["idempotency_key"],
                 "content_type": metadata["content_type"],
                 "content_length_bytes": metadata["content_length_bytes"],
-                "court_corners": metadata["court_corners"],
+                # A segment may omit the corner copy; the session value is authoritative.
+                "court_corners": metadata["court_corners"] or session.get("court_corners"),
                 "source_frame_start_index": metadata.get("source_frame_start_index"),
                 "source_frame_count": metadata.get("source_frame_count"),
                 "source_frame_time_offsets_sec": metadata.get("source_frame_time_offsets_sec"),

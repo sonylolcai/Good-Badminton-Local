@@ -266,7 +266,7 @@ class StreamSessionManagerTests(unittest.TestCase):
             self.manager.receive_segment(session_id, 0, changed_time, self.segment_bytes)
         self.assertEqual(context.exception.code, "invalid_state")
 
-    def test_each_segment_must_repeat_the_business_owned_court_corners(self):
+    def test_session_corners_win_and_a_stale_segment_copy_is_refused(self):
         _, created = self._create()
         session_id = created["analysis_session_id"]
         metadata = segment_metadata(0, self.segment_bytes)
@@ -276,6 +276,14 @@ class StreamSessionManagerTests(unittest.TestCase):
             self.manager.receive_segment(session_id, 0, metadata, self.segment_bytes)
 
         self.assertEqual(context.exception.code, "validation_error")
+
+        # A venue no longer repeats the corners on every segment. The session's calibrated
+        # value stays authoritative and still lands in the manifest for later assembly.
+        omitted = segment_metadata(0, self.segment_bytes)
+        del omitted["court_corners"]
+        self.manager.receive_segment(session_id, 0, omitted, self.segment_bytes)
+        session = self.manager.get_session(session_id)
+        self.assertEqual(session["segments"]["0"]["court_corners"], session["court_corners"])
 
     def test_same_index_different_hash_conflicts(self):
         _, created = self._create()

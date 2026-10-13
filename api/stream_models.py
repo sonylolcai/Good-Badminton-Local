@@ -341,7 +341,10 @@ def validate_segment_metadata(body):
     content_length_bytes = _int(
         body.get("content_length_bytes"), "content_length_bytes", minimum=1
     )
-    court_corners = _court_corners(body.get("court_corners"))
+    raw_corners = body.get("court_corners")
+    # The session already owns the calibrated corners. A per-segment copy stays optional
+    # so a stale venue value cannot permanently reject every later segment of a match.
+    court_corners = None if raw_corners is None else _court_corners(raw_corners)
     source_frame_start_index = body.get("source_frame_start_index")
     source_frame_count = body.get("source_frame_count")
     if (source_frame_start_index is None) != (source_frame_count is None):
