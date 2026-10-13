@@ -120,6 +120,36 @@ def register_stream_routes(
         return JSONResponse(status_code=response_status, content=payload)
 
     @app.post(
+        "/api/v1/stream-sessions/{session_id}/repairs",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def request_stream_repairs(
+        session_id: str,
+        body: dict,
+        x_idempotency_key: Optional[str] = Header(default=None),
+    ):
+        response_status, payload = stream_manager.request_repairs(
+            session_id, body, x_idempotency_key
+        )
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.get(
+        "/api/v1/stream-sessions/{session_id}/repairs",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def list_stream_repairs(session_id: str):
+        response_status, payload = stream_manager.list_repairs(session_id)
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.post(
+        "/api/v1/stream-sessions/{session_id}/repairs/{request_id}/abandon",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def abandon_stream_repair(session_id: str, request_id: str):
+        response_status, payload = stream_manager.abandon_repair(session_id, request_id)
+        return JSONResponse(status_code=response_status, content=payload)
+
+    @app.post(
         "/api/v1/stream-sessions/{session_id}/upload-authorization",
         dependencies=[Depends(require_api_key)],
     )

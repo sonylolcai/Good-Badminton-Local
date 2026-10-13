@@ -55,6 +55,20 @@ ANALYSIS_MODE = "person_only"
 MAX_SEGMENT_DURATION_SEC = 10.0
 MAX_SEGMENT_BYTES = 256 * 1024 * 1024
 
+# -- segment repair window -------------------------------------------------
+# A repair grants the venue a bounded chance to deliver bytes for one segment
+# index.  Every limit below is sized from the venue-side archive, not from the
+# GPU: a window longer than the local rolling retention can only ever come back
+# reporting the bytes are gone, and a request with too many indexes would let a
+# single caller pin two generations of media for a large part of a session.
+REPAIR_KINDS = {"missing", "corrupt"}
+REPAIR_REASONS = {"business_gap_inventory", "gpu_integrity"}
+REPAIR_TTL_DEFAULT_SECONDS = 21600
+REPAIR_TTL_MIN_SECONDS = 60
+REPAIR_TTL_MAX_SECONDS = 86400
+REPAIR_MAX_INDEXES_PER_REQUEST = 64
+REPAIR_GRANT_STATES = {"open", "fulfilled", "expired", "released"}
+
 
 def utc_now() -> str:
     """Return an RFC 3339 UTC timestamp with the Z suffix used by examples."""
@@ -416,6 +430,143 @@ def validate_complete_request(body):
         "schema_version": SCHEMA_VERSION,
         "expected_last_segment_index": expected_last_segment_index,
         "allow_partial": allow_partial,
+    }
+
+
+def validate_repair_request(body):
+    """Validate a repair window request (raises ValueError).
+
+    ``kind`` is per index because a lost fragment and a corrupt fragment are
+    authorized differently: only the GPU's own integrity verdict may order a
+    replacement of media that was already accepted.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("request body must be a JSON object")
+    _reject_extra_keys(
+        body,
+        {"schema_version", "reason", "ttl_seconds", "ranges"},
+        "repair request",
+    )
+    if body.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("schema_version must be stream-session.v1")
+    reason = body.get("reason")
+    if reason not in REPAIR_REASONS:
+        raise ValueError("reason must be business_gap_inventory or gpu_integrity")
+    ttl_seconds = _int(
+        body.get("ttl_seconds", REPAIR_TTL_DEFAULT_SECONDS),
+        "ttl_seconds",
+        minimum=REPAIR_TTL_MIN_SECONDS,
+    )
+    if ttl_seconds > REPAIR_TTL_MAX_SECONDS:
+        raise ValueError(
+            "ttl_seconds must not exceed "
+            f"{REPAIR_TTL_MAX_SECONDS} because it cannot outlast venue local archive retention"
+        )
+    ranges = body.get("ranges")
+    if not isinstance(ranges, list) or not ranges:
+        raise ValueError("ranges must be a non-empty list")
+    if len(ranges) > REPAIR_MAX_INDEXES_PER_REQUEST:
+        raise ValueError(f"ranges must not exceed {REPAIR_MAX_INDEXES_PER_REQUEST} segment indexes")
+    normalized = []
+    seen = set()
+    for item in ranges:
+        if not isinstance(item, dict):
+            raise ValueError("each repair range must be a JSON object")
+        _reject_extra_keys(item, {"segment_index", "kind"}, "repair range")
+        segment_index = _int(item.get("segment_index"), "segment_index", minimum=0)
+        kind = item.get("kind")
+        if kind not in REPAIR_KINDS:
+            raise ValueError("kind must be missing or corrupt")
+        if segment_index in seen:
+            raise ValueError(f"segment_index {segment_index} is listed more than once")
+        seen.add(segment_index)
+        normalized.append({"segment_index": segment_index, "kind": kind})
+    normalized.sort(key=lambda item: item["segment_index"])
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "reason": reason,
+        "ttl_seconds": ttl_seconds,
+        "ranges": normalized,
+    }
+
+
+def repair_ranges_view(request, *, reveal_tokens=False):
+    """Return the granted indexes of one repair request, ordered and safe to log."""
+    view = []
+    for grant in sorted(
+        (request.get("grants") or {}).values(),
+        key=lambda item: int(item["segment_index"]),
+    ):
+        entry = {
+            "segment_index": int(grant["segment_index"]),
+            "kind": grant["kind"],
+            "state": grant["state"],
+            "expected": dict(grant.get("expected") or {}),
+            "grant_expires_at": grant["grant_expires_at"],
+        }
+        if grant.get("supersede_sha256"):
+            entry["supersede_sha256"] = grant["supersede_sha256"]
+        if grant.get("generation") is not None:
+            entry["generation"] = int(grant["generation"])
+        if grant.get("resolved_at"):
+            entry["resolved_at"] = grant["resolved_at"]
+        if reveal_tokens and grant["state"] == "open":
+            entry["grant_token"] = grant.get("grant_token")
+        else:
+            entry["grant_token_issued"] = bool(grant.get("token_sha256"))
+        view.append(entry)
+    return view
+
+
+def repair_window_response(session_id, request, *, reused=False):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "analysis_session_id": session_id,
+        "request_id": request["request_id"],
+        "status": request["status"],
+        "reason": request["reason"],
+        "ttl_seconds": int(request["ttl_seconds"]),
+        "granted_at": request["granted_at"],
+        "window_expires_at": request["expires_at"],
+        "reused": bool(reused),
+        "ranges": repair_ranges_view(request, reveal_tokens=True),
+    }
+
+
+def repair_inventory_response(session_id, requests, *, window_open, window_expires_at):
+    views = []
+    for request in sorted(
+        requests.values(), key=lambda item: (item.get("granted_at") or "", item["request_id"])
+    ):
+        summary = {}
+        for grant in (request.get("grants") or {}).values():
+            summary[grant["state"]] = summary.get(grant["state"], 0) + 1
+        views.append({
+            "request_id": request["request_id"],
+            "status": request["status"],
+            "reason": request["reason"],
+            "granted_at": request["granted_at"],
+            "window_expires_at": request["expires_at"],
+            "summary": dict(sorted(summary.items())),
+            "ranges": repair_ranges_view(request),
+        })
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "analysis_session_id": session_id,
+        "window_open": bool(window_open),
+        "window_expires_at": window_expires_at,
+        "requests": views,
+    }
+
+
+def repair_abandon_response(session_id, request, released_indexes):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "analysis_session_id": session_id,
+        "request_id": request["request_id"],
+        "status": request["status"],
+        "released_segment_indexes": sorted(int(index) for index in released_indexes),
+        "window_expires_at": request["expires_at"],
     }
 
 

@@ -50,12 +50,16 @@ from .stream_models import (
     complete_session_response,
     create_session_response,
     events_response,
+    repair_abandon_response,
+    repair_inventory_response,
+    repair_window_response,
     segment_receipt_response,
     session_status_response,
     utc_now,
     validate_complete_request,
     validate_create_request,
     validate_gap_declaration,
+    validate_repair_request,
     validate_segment_metadata,
     new_session_id,
 )
@@ -189,11 +193,22 @@ class StreamSessionManager:
         return path
 
     # -- persistence ----------------------------------------------------
+    @staticmethod
+    def _ensure_repair_state(session):
+        """Backfill repair fields for manifests written before the repair contract."""
+        session.setdefault("max_epoch_issued", int(session.get("continuity_epoch", 0) or 0))
+        session.setdefault("events_revision", 1)
+        session.setdefault(
+            "repair", {"window_open": False, "window_expires_at": None, "requests": {}}
+        )
+        session["repair"].setdefault("requests", {})
+        return session
+
     def _load(self, session_id):
         path = self._manifest_path(session_id)
         if not path.is_file():
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        return self._ensure_repair_state(json.loads(path.read_text(encoding="utf-8")))
 
     def _save(self, session):
         session["updated_at"] = utc_now()
@@ -1250,6 +1265,251 @@ class StreamSessionManager:
             return 202, {"schema_version": SCHEMA_VERSION, "analysis_session_id": session_id,
                          "segment_index": index, "status": "declared_missing", "reused": False}
 
+    # -- segment repair window -------------------------------------------
+    @staticmethod
+    def _repair_requests(session):
+        return session.setdefault("repair", {}).setdefault("requests", {})
+
+    @staticmethod
+    def _parse_repair_instant(value):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    def _open_repair_grants(self, session):
+        """Map every still-valid grant to its index, keyed by segment index."""
+        grants = {}
+        for request in self._repair_requests(session).values():
+            if request.get("status") != "open":
+                continue
+            for grant in (request.get("grants") or {}).values():
+                if grant.get("state") == "open":
+                    grants[int(grant["segment_index"])] = grant
+        return grants
+
+    def _settle_repair_windows(self, session):
+        """Age out lapsed grants and recompute the derived window state.
+
+        Expiry is evaluated from wall-clock time instead of a scheduled sweeper so
+        that a grant can never be redeemed after its window, even if the GPU was
+        restarted or idle for the whole TTL.
+        """
+        now = datetime.now(timezone.utc)
+        changed = False
+        for request in self._repair_requests(session).values():
+            if request.get("status") != "open":
+                continue
+            states = []
+            for grant in (request.get("grants") or {}).values():
+                if grant.get("state") != "open":
+                    states.append(grant["state"])
+                    continue
+                expires_at = self._parse_repair_instant(grant.get("grant_expires_at"))
+                if expires_at is not None and now >= expires_at:
+                    grant["state"] = "expired"
+                    grant["expired_at"] = utc_now()
+                    changed = True
+                states.append(grant["state"])
+            if states and all(state != "open" for state in states):
+                request["status"] = (
+                    "fulfilled" if all(state == "fulfilled" for state in states) else "closed"
+                )
+                request["closed_at"] = utc_now()
+                changed = True
+        open_grants = self._open_repair_grants(session)
+        session["repair"]["window_open"] = bool(open_grants)
+        session["repair"]["window_expires_at"] = (
+            max(grant["grant_expires_at"] for grant in open_grants.values())
+            if open_grants
+            else None
+        )
+        return changed
+
+    def request_repairs(self, session_id, body, idempotency_key=None):
+        """Open a bounded repair window and issue one grant token per index."""
+        session = self._load(session_id)
+        if session is None:
+            raise session_not_found(session_id)
+        if idempotency_key is not None and not IDEMPOTENCY_KEY_PATTERN.fullmatch(
+            idempotency_key
+        ):
+            raise validation_error(
+                "X-Idempotency-Key must be 16-128 safe characters",
+                analysis_session_id=session_id,
+            )
+        try:
+            request_body = validate_repair_request(body)
+        except ValueError as exc:
+            raise validation_error(str(exc), analysis_session_id=session_id)
+        with self._lock:
+            session = self._load(session_id)
+            if session is None:
+                raise session_not_found(session_id)
+            if session.get("sealed") or session.get("status") in TERMINAL_SESSION_STATES:
+                raise invalid_state(
+                    "cannot open a repair window after session input is sealed", session_id
+                )
+            self._settle_repair_windows(session)
+            requests = self._repair_requests(session)
+            ranges = [dict(item) for item in request_body["ranges"]]
+            if idempotency_key is not None:
+                prior = next(
+                    (
+                        item
+                        for item in requests.values()
+                        if item.get("idempotency_key") == idempotency_key
+                    ),
+                    None,
+                )
+                if prior is not None:
+                    if (
+                        prior.get("reason") != request_body["reason"]
+                        or prior.get("ranges") != ranges
+                    ):
+                        raise StreamSessionError(
+                            "repair_idempotency_conflict",
+                            "the idempotency key was already used for a different repair request",
+                            409,
+                            analysis_session_id=session_id,
+                        )
+                    # The same intent retried: hand back the original window instead of
+                    # opening a second one that would double-pin the same indexes.
+                    return 200, repair_window_response(session_id, prior, reused=True)
+            open_grants = self._open_repair_grants(session)
+            granted_at = utc_now()
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=request_body["ttl_seconds"])
+            ).isoformat().replace("+00:00", "Z")
+            request_id = f"rp_{secrets.token_hex(10)}"
+            grants = {}
+            for item in ranges:
+                index = int(item["segment_index"])
+                kind = str(item["kind"])
+                key = str(index)
+                if index in open_grants:
+                    raise StreamSessionError(
+                        "repair_already_granted",
+                        f"segment_index {index} already has an open repair grant",
+                        409,
+                        details={
+                            "segment_index": index,
+                            "open_request_id": open_grants[index].get("request_id"),
+                        },
+                        analysis_session_id=session_id,
+                    )
+                if kind == "corrupt":
+                    # Replacing media the GPU already accepted may only be ordered by
+                    # the GPU's own integrity verdict (decision D6), which does not
+                    # exist yet; declaring a gap and filling it stays available.
+                    raise StreamSessionError(
+                        "repair_not_granted",
+                        "a corrupt replacement requires a GPU integrity determination",
+                        403,
+                        details={"segment_index": index, "kind": kind},
+                        analysis_session_id=session_id,
+                    )
+                entry = session.get("segments", {}).get(key)
+                if entry is not None:
+                    raise invalid_state(
+                        f"segment_index {index} already has accepted media",
+                        session_id,
+                        details={"segment_index": index, "accepted_sha256": entry.get("sha256")},
+                    )
+                gap = session.get("declared_gaps", {}).get(key)
+                if gap is None:
+                    raise invalid_state(
+                        f"segment_index {index} has no declared gap to repair",
+                        session_id,
+                        details={
+                            "segment_index": index,
+                            "hint": "declare the gap first so its source interval is authoritative",
+                        },
+                    )
+                grant_token = secrets.token_urlsafe(32)
+                grants[key] = {
+                    "segment_index": index,
+                    "kind": kind,
+                    "state": "open",
+                    "request_id": request_id,
+                    # The declared gap is the authoritative source interval: the venue
+                    # must cut exactly this window or the upload is refused.
+                    "expected": {
+                        "source_start_time_sec": float(gap["source_start_time_sec"]),
+                        "duration_sec": float(gap["duration_sec"]),
+                    },
+                    "token_sha256": hashlib.sha256(grant_token.encode("utf-8")).hexdigest(),
+                    "grant_token": grant_token,
+                    "granted_at": granted_at,
+                    "grant_expires_at": expires_at,
+                }
+            request = {
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "reason": request_body["reason"],
+                "ttl_seconds": int(request_body["ttl_seconds"]),
+                "ranges": ranges,
+                "grants": grants,
+                "status": "open",
+                "granted_at": granted_at,
+                "expires_at": expires_at,
+            }
+            requests[request_id] = request
+            session["repair"]["window_open"] = True
+            session["repair"]["window_expires_at"] = expires_at
+            self._append_state_history(session, session["status"], "repair_window_opened")
+            self._save(session)
+            return 202, repair_window_response(session_id, request)
+
+    def list_repairs(self, session_id):
+        """Reconcile the repair ledger: the window plus every request's grants.
+
+        Grant tokens are never re-served here; this endpoint is for polling state,
+        and a caller that lost its tokens must abandon and open a new window.
+        """
+        session = self._load(session_id)
+        if session is None:
+            raise session_not_found(session_id)
+        with self._lock:
+            if self._settle_repair_windows(session):
+                self._save(session)
+            return 200, repair_inventory_response(
+                session_id,
+                self._repair_requests(session),
+                window_open=session["repair"]["window_open"],
+                window_expires_at=session["repair"]["window_expires_at"],
+            )
+
+    def abandon_repair(self, session_id, request_id):
+        """Close one repair request and invalidate the grants it still holds."""
+        session = self._load(session_id)
+        if session is None:
+            raise session_not_found(session_id)
+        with self._lock:
+            self._settle_repair_windows(session)
+            request = self._repair_requests(session).get(str(request_id))
+            if request is None:
+                raise StreamSessionError(
+                    "repair_request_not_found",
+                    f"repair request {request_id} was not found",
+                    404,
+                    analysis_session_id=session_id,
+                )
+            released = []
+            if request.get("status") == "open":
+                for grant in (request.get("grants") or {}).values():
+                    if grant.get("state") == "open":
+                        grant["state"] = "released"
+                        grant["released_at"] = utc_now()
+                        released.append(int(grant["segment_index"]))
+                request["status"] = "abandoned"
+                request["abandoned_at"] = utc_now()
+                self._settle_repair_windows(session)
+                self._append_state_history(session, session["status"], "repair_window_abandoned")
+                self._save(session)
+            # Abandoning is idempotent: a repeat call reports the same terminal state.
+            return 200, repair_abandon_response(session_id, request, released)
+
     def get_status(self, session_id):
         session = self._load(session_id)
         if session is None:
@@ -1331,6 +1591,24 @@ class StreamSessionManager:
                     session["sealed_at"],
                     self._missing_indexes(session),
                     self._failed_indexes(session),
+                )
+            # Decision D1: an open repair window means the venue still owes bytes for
+            # a gap the business side has already been told about.  Sealing now would
+            # freeze a session that is about to receive more evidence, and a seal is
+            # irreversible, so the caller must fill or abandon the window first.
+            self._settle_repair_windows(session)
+            open_grants = self._open_repair_grants(session)
+            if open_grants:
+                raise StreamSessionError(
+                    "repair_in_progress",
+                    "a repair window is open; deliver the granted segments or abandon it before sealing",
+                    409,
+                    retryable=True,
+                    details={
+                        "repairing_segment_indexes": sorted(open_grants),
+                        "window_expires_at": session["repair"].get("window_expires_at"),
+                    },
+                    analysis_session_id=session_id,
                 )
             expected_last = request["expected_last_segment_index"]
             allow_partial = request["allow_partial"]
