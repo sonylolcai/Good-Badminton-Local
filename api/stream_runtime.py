@@ -483,8 +483,12 @@ class StreamProcessorFactory:
         byte_tracker_factory=None,
         vision_profile: SportVisionProfile = BADMINTON_PROFILE,
         mode_synchronizer: Optional[VisionModeSynchronizer] = None,
+        processing_mode: Optional[str] = None,
     ):
         self.data_dir = Path(data_dir).resolve()
+        self.processing_mode = processing_mode or os.environ.get("GOOD_BADMINTON_STREAM_PROCESSING_MODE", "analysis")
+        if self.processing_mode not in {"analysis", "decode_smoke"}:
+            raise ValueError("stream processing mode must be analysis or decode_smoke")
         # Ultralytics creates a settings directory while importing ``YOLO``.
         # A service process may run under a restricted system account, where the
         # normal roaming-profile location is unavailable.  Keep this harmless
@@ -518,6 +522,8 @@ class StreamProcessorFactory:
             raise ValueError(
                 "streaming annotated-video export is not implemented; keep generate_annotated_video=false"
             )
+        if self.processing_mode == "decode_smoke":
+            return
         if configuration.get("shuttle_detector") == "tracknet_v3" and self.tracknet_processor_factory is None:
             self._tracknet_model_path()
             self._tracknet_max_frame_interval_ratio()
@@ -568,7 +574,12 @@ class StreamProcessorFactory:
         return resolve_tennis_ball_model_spec()
 
     def __call__(self, session):
+        if session.get("processing_mode", "analysis") != self.processing_mode:
+            raise ValueError("cannot restore a session with a different processing mode")
         self.validate_session_request(session)
+        if self.processing_mode == "decode_smoke":
+            from .decode_smoke import DecodeSmokeProcessor
+            return DecodeSmokeProcessor(), None
         configuration = session["configuration"]
         calibration = {
             "calibration_id": session["calibration_id"],

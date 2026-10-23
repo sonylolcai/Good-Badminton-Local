@@ -98,6 +98,16 @@ The caller MUST provide `X-Idempotency-Key`. Repeating the same key and equivale
 request returns the original session (`200 OK`); reusing the key with different
 content returns `409 invalid_state` and never creates a second session.
 
+Optional `media_identity` (`media-identity.v1`) carries only opaque business
+storage references: tenant, venue, court, camera, gateway, calibration, edge
+session, optional match/recording attempt, media UUID, fixed venue slug,
+environment, local capture date and camera/day sequence. It requires a matching
+`client_reference`, camera and calibration. The business service issues it;
+venue terminals cannot select object keys. It is frozen in the GPU session and
+included in idempotency comparison and media manifests. It is never used to
+identify athletes or infer results. See [media storage](MEDIA_STORAGE_CONTRACT.md).
+Deploy accepting GPU code before a business version starts sending this field.
+
 Required configuration:
 
 - `analysis_mode`: v1 is fixed to `person_only`.

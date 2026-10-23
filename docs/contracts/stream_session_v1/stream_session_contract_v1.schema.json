@@ -164,6 +164,28 @@
         }
       }
     },
+    "mediaIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["media_id", "tenant_id", "venue_id", "court_id", "camera_id", "edge_device_id", "calibration_id", "edge_session_id", "match_id", "recording_session_id", "schema_version", "environment", "venue_slug", "capture_date", "daily_sequence"],
+      "properties": {
+        "media_id": {"type": "string", "format": "uuid"},
+        "tenant_id": {"type": "string", "format": "uuid"},
+        "venue_id": {"type": "string", "format": "uuid"},
+        "court_id": {"type": "string", "format": "uuid"},
+        "camera_id": {"type": "string", "format": "uuid"},
+        "edge_device_id": {"type": "string", "format": "uuid"},
+        "calibration_id": {"type": "string", "format": "uuid"},
+        "edge_session_id": {"type": "string", "format": "uuid"},
+        "match_id": {"type": ["string", "null"], "format": "uuid"},
+        "recording_session_id": {"type": ["string", "null"], "format": "uuid"},
+        "schema_version": {"const": "media-identity.v1"},
+        "environment": {"enum": ["test", "production"]},
+        "venue_slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$"},
+        "capture_date": {"type": "string", "format": "date"},
+        "daily_sequence": {"type": "integer", "minimum": 1, "maximum": 999999}
+      }
+    },
     "createSessionRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -189,6 +211,7 @@
           "minLength": 1,
           "maxLength": 160
         },
+        "media_identity": { "$ref": "#/$defs/mediaIdentity" },
         "configuration": { "$ref": "#/$defs/analysisConfiguration" }
       }
     },

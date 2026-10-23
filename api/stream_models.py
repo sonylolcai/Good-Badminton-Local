@@ -158,6 +158,7 @@ def validate_create_request(body):
             "court_corners",
             "analysis_mode",
             "client_reference",
+            "media_identity",
             "configuration",
         },
         "request body",
@@ -173,7 +174,7 @@ def validate_create_request(body):
     if client_reference is not None:
         client_reference = _opaque_id(client_reference, "client_reference")
     configuration = validate_configuration(body.get("configuration"))
-    return {
+    normalized = {
         "schema_version": SCHEMA_VERSION,
         "camera_id": camera_id,
         "calibration_id": calibration_id,
@@ -182,6 +183,15 @@ def validate_create_request(body):
         "client_reference": client_reference,
         "configuration": configuration,
     }
+
+    if "media_identity" in body:
+        from .media_identity import validate_media_identity
+        normalized["media_identity"] = validate_media_identity(
+            body["media_identity"], camera_id=camera_id, client_reference=client_reference,
+            calibration_id=calibration_id)
+        if client_reference is None:
+            raise ValueError("media identity requires its business session reference")
+    return normalized
 
 
 def validate_configuration(configuration):

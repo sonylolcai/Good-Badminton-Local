@@ -399,6 +399,8 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 
 def _write_env_file(path: Path, values: dict[str, str]) -> None:
+    # Local compatibility links must keep pointing at the private config store.
+    path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "# 由运营后台维护；不要提交此文件。",
@@ -407,6 +409,7 @@ def _write_env_file(path: Path, values: dict[str, str]) -> None:
     ]
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
     os.replace(temporary, path)
 
 

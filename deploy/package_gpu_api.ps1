@@ -60,7 +60,16 @@ $requiredExtraFiles = @(
     'webui/pipeline.py',
     # The performance gate is intentionally dependency-free and is run after
     # a relevant GPU deployment against the completed job trace.
-    'requirements.txt'
+    'requirements.txt',
+    'requirements-media.txt',
+    'api/media_storage.py',
+    'api/media_identity.py',
+    'api/media_limits.py',
+    'api/media_upload_guard.py',
+    'api/dogecloud_storage.py',
+    'api/media_archive.py',
+    'api/oss_replay.py',
+    'api/decode_smoke.py'
 )
 
 $trackNetABFiles = @(
@@ -101,6 +110,11 @@ function Test-DeployableSourcePath {
     param([Parameter(Mandatory = $true)][string]$RelativePath)
 
     $path = $RelativePath.Replace('\\', '/')
+    # Secrets are delivered separately, never through a source upload archive.
+    if ($path -match '(^|/)\.secrets(/|$)' -or
+        ($path -notmatch '\.example$' -and $path -match '(^|/)(\.env[^/]*|[^/]*\.env(?:\.[^/]*)?|[^/]*\.(pem|key|p12|pfx))$')) {
+        return $false
+    }
     if ($path -match '^(business_gateway|operator_api|webui-next|tests|docs|evaluation|weights|api_data|outputs|videos|\.venv|venv|__pycache__)/' -or $path -match '^deploy/(venue-gateway|venue-gateway-windows|business-server)/') {
         return $false
     }

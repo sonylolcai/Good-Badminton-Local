@@ -26,3 +26,10 @@
 
 - 总索引：`S:\Software Tool\Obsidian\AI羽毛球赛后复盘与训练助手\总索引.md`
 - 记录本仓的验证结论和迁移判断；不要把实验结果表述为主仓或生产能力。Mac 路由待补充。
+
+## Local configuration and credentials
+
+- Keep real configuration and credentials under this project's ignored `.secrets/` directory. Follow `docs/LOCAL_CONFIGURATION.md` and `config/local-secrets.json`; edit canonical private files, not duplicate copies.
+- Public examples contain placeholders only. Never put permanent secrets in source, frontend/public environment variables, logs, Git, Docker contexts or source release archives. Do not print credential values while inspecting or verifying configuration.
+- Run `python3 tools/local_secrets.py check` before delivery. The local pre-commit hook checks actual Git index blobs. Preserve existing user changes.
+- Server credentials are deployed separately after the user authorizes the target connection. Preserve stable master/hash keys, back up remote configuration, validate after reload, and retain rollback. Local templates alone do not mean a service consumes their variables.

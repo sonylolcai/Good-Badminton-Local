@@ -120,6 +120,8 @@ class StreamSessionManager:
         hard_timeout_handler=None,
         start_worker=True,
     ):
+        from .media_limits import MediaLimits
+        MediaLimits.from_environment()  # Refuse malformed safety settings at startup.
         self.data_dir = Path(data_dir).resolve()
         self.sessions_dir = self.data_dir / "stream_sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +368,18 @@ class StreamSessionManager:
                 continue
             if session.get("retention", {}).get("policy") == "persistent_media":
                 continue
+            media_directory = self._session_dir(session["analysis_session_id"]) / "media"
+            if (getattr(self, "media_archive_enabled", False)
+                    or media_directory.exists()
+                    or os.environ.get("GOOD_BADMINTON_MEDIA_ARCHIVE_ENABLED", "0").lower() in {"1", "true"}):
+                # A restart with archiving disabled must not remove pending
+                # evidence left by an earlier archive worker.
+                media_state = media_directory / "status.json"
+                try:
+                    if json.loads(media_state.read_text()).get("status") != "ready":
+                        continue
+                except (OSError, ValueError):
+                    continue
             try:
                 updated = datetime.fromisoformat(
                     str(session.get("updated_at") or "").replace("Z", "+00:00")
@@ -897,6 +911,8 @@ class StreamSessionManager:
                     "idempotency key was reused with different request content",
                     existing["analysis_session_id"],
                 )
+            from .media_limits import ensure_capacity
+            ensure_capacity(self, 16384)
             now = utc_now()
             session = {
                 "schema_version": SCHEMA_VERSION,
@@ -914,7 +930,9 @@ class StreamSessionManager:
                 # per-session input copy, not a GPU-side calibration registry.
                 "court_corners": request["court_corners"],
                 "client_reference": request.get("client_reference"),
+                "media_identity": request.get("media_identity"),
                 "configuration": request["configuration"],
+                "processing_mode": getattr(self.processor_factory, "processing_mode", "analysis"),
                 "request": {"idempotency_key": idempotency_key, "accepted_at": now},
                 "retention": {
                     "policy": "terminal_session_ttl",
@@ -949,6 +967,10 @@ class StreamSessionManager:
 
     def get_session(self, session_id):
         return self._load(session_id)
+
+    def _ensure_media_write(self, session, metadata):
+        from .media_limits import ensure_segment_write
+        ensure_segment_write(self, session, metadata)
 
     def issue_upload_token(self, session_id, *, ttl_seconds=None):
         configured_ttl = ttl_seconds if ttl_seconds is not None else os.environ.get("GOOD_BADMINTON_UPLOAD_TOKEN_TTL_SECONDS")
@@ -1017,23 +1039,6 @@ class StreamSessionManager:
         return (datetime.now(timezone.utc) < expires_at
                 and secrets.compare_digest(actual_hash, authorization.get("token_sha256", "")))
 
-    def _ensure_direct_media_capacity(self, session_id, size):
-        configured = os.environ.get("GOOD_BADMINTON_STREAM_MIN_FREE_BYTES")
-        try:
-            reserve = int(configured) if configured is not None else 0
-        except ValueError:
-            reserve = 0
-        if reserve <= 0:
-            raise StreamSessionError(
-                "gpu_media_storage_unconfigured", "GPU media storage reserve is not configured", 503,
-                analysis_session_id=session_id,
-            )
-        if shutil.disk_usage(self.data_dir).free - size < reserve:
-            raise StreamSessionError(
-                "gpu_media_storage_full", "GPU media storage has insufficient free space", 507,
-                analysis_session_id=session_id,
-            )
-
     def get_segment_receipt(self, session_id, segment_index):
         session = self._load(session_id)
         if session is None:
@@ -1044,9 +1049,12 @@ class StreamSessionManager:
         path = self._segment_path(session_id, segment_index)
         present = (path.is_file() and path.stat().st_size == segment["content_length_bytes"]
                    and _sha256_file(path) == segment["sha256"])
+        from .media_limits import archived_segment_location
+        archived = archived_segment_location(self, session, segment_index) if not present else None
         return {"analysis_session_id": session_id, "segment_index": segment_index,
                 "sha256": segment["sha256"], "content_length_bytes": segment["content_length_bytes"],
-                "gpu_accepted": present, "received_at": segment["received_at"],
+                "durable_location": archived or ({"storage": "gpu_local"} if present else None),
+                "gpu_accepted": present or archived is not None, "received_at": segment["received_at"],
                 "idempotency_key": segment["idempotency_key"],
                 "source_start_time_sec": segment["source_start_time_sec"],
                 "duration_sec": segment["duration_sec"],
@@ -1128,8 +1136,7 @@ class StreamSessionManager:
                     if (not segment_path.is_file()
                             or segment_path.stat().st_size != actual_length
                             or _sha256_file(segment_path) != metadata["sha256"]):
-                        if session.get("retention", {}).get("policy") == "persistent_media":
-                            self._ensure_direct_media_capacity(session_id, actual_length)
+                        self._ensure_media_write(session, metadata)
                         _durable_replace(segment_path, data_bytes)
                     session["status"] = self._derive_status(session)
                     self._save(session)
@@ -1164,8 +1171,7 @@ class StreamSessionManager:
                     analysis_session_id=session_id,
                 )
             segment_path = self._segment_path(session_id, path_index)
-            if session.get("retention", {}).get("policy") == "persistent_media":
-                self._ensure_direct_media_capacity(session_id, actual_length)
+            self._ensure_media_write(session, metadata)
             _durable_replace(segment_path, data_bytes)
             received_at = utc_now()
             disposition = (
@@ -1361,8 +1367,7 @@ class StreamSessionManager:
                     },
                     analysis_session_id=session_id,
                 )
-            if session.get("retention", {}).get("policy") == "persistent_media":
-                self._ensure_direct_media_capacity(session_id, actual_length)
+            self._ensure_media_write(session, metadata)
             key = str(path_index)
             received_at = utc_now()
             _durable_replace(self._segment_path(session_id, path_index), data_bytes)
@@ -1884,6 +1889,10 @@ class StreamSessionManager:
             session["sealed_at"] = utc_now()
             session["expected_last_segment_index"] = expected_last
             session["allow_partial"] = allow_partial
+            # Finalizers reload the durable session before committing results.
+            # Persist the input boundary first, including on immediate partial
+            # completion, or that reload loses both the seal and final index.
+            self._save(session)
             failures = self._failed_indexes(session)
             declared_gap_work = bool(session.get("declared_gaps")) and (
                 any(not gap.get("settled") for gap in session["declared_gaps"].values())
@@ -2872,6 +2881,7 @@ def _requests_equivalent(existing, request):
         and existing.get("calibration_id") == request["calibration_id"]
         and existing.get("court_corners") == request["court_corners"]
         and existing.get("client_reference") == request.get("client_reference")
+        and existing.get("media_identity") == request.get("media_identity")
         and existing.get("configuration") == request["configuration"]
     )
 

@@ -48,3 +48,25 @@ datasets/
 Thumbs.db
 .idea/
 .vscode/
+
+# Private configuration and compatibility links.
+.env
+.env.*
+*.env
+*.env.*
+!.env*.example
+!*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+project.private.config.json
+venue-gateway-cameras.json
+.webui-remote-gpu.env
+.webui-operator.env
+# Public maintenance files, including the research repo allowlist.
+!config/local-secrets.json
+!config/*.example
+!.githooks/pre-commit
+# Keep last: never unignore private files.
+.secrets/

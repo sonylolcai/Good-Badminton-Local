@@ -35,8 +35,19 @@ def register_stream_routes(
     require_api_key: Callable,
     require_upload_access: Callable,
     health_payload: Callable[[], Mapping],
+    media_archive=None,
 ) -> None:
     """Attach the versioned stream API to an application composition root."""
+
+    from .media_archive import archive_from_environment
+    from .media_upload_guard import MediaUploadGuard
+    app.add_middleware(MediaUploadGuard, manager=stream_manager)
+    media_archive = media_archive or archive_from_environment(stream_manager)
+    app.state.media_archive = media_archive
+    if media_archive is not None:
+        if stream_manager.worker_running:
+            media_archive.start()
+        app.router.add_event_handler("shutdown", media_archive.stop)
 
     @app.exception_handler(StreamSessionError)
     async def handle_stream_session_error(_request, exc):
@@ -44,7 +55,41 @@ def register_stream_routes(
 
     @app.get("/api/v1/health")
     def health():
-        return dict(health_payload())
+        from .media_limits import health_limits
+        return {
+            **dict(health_payload()),
+            "stream_processing_mode": getattr(stream_manager.processor_factory, "processing_mode", "analysis"),
+            "media_limits": health_limits(stream_manager),
+            "media_archive_enabled": media_archive is not None,
+            "media_archive_running": media_archive is not None and media_archive.running,
+        }
+
+    def require_media_archive(session_id):
+        if stream_manager.get_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if media_archive is None:
+            raise HTTPException(status_code=503, detail="media archive is not configured")
+        return media_archive
+
+    @app.get("/api/v1/stream-sessions/{session_id}/media", dependencies=[Depends(require_api_key)])
+    def get_media_archive(session_id: str):
+        return require_media_archive(session_id).status(session_id)
+
+    @app.post("/api/v1/stream-sessions/{session_id}/media/prepare", dependencies=[Depends(require_api_key)])
+    def prepare_media_archive(session_id: str):
+        archive = require_media_archive(session_id)
+        if not stream_manager.get_session(session_id).get("sealed"):
+            raise HTTPException(status_code=409, detail="seal input before preparing media")
+        archive.request_retry(session_id)
+        return JSONResponse(status_code=202, content=archive.status(session_id))
+
+    @app.get("/api/v1/stream-sessions/{session_id}/media/manifest", dependencies=[Depends(require_api_key)])
+    def get_media_manifest(session_id: str):
+        from .media_archive import MediaValidationError
+        try:
+            return require_media_archive(session_id).manifest(session_id)
+        except MediaValidationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
         "/api/v1/stream-sessions",

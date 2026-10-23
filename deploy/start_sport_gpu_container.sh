@@ -42,11 +42,11 @@ fi
 SPORT_ENV_PREFIX="GOOD_${SPORT_ID^^}_STREAM"
 POSE_MODEL_VAR="${SPORT_ENV_PREFIX}_POSE_MODEL"
 POSE_MODEL_PATH="${!POSE_MODEL_VAR:-}"
-if [[ -z "$POSE_MODEL_PATH" ]]; then
+if [[ "${GOOD_BADMINTON_STREAM_PROCESSING_MODE:-analysis}" != "decode_smoke" && -z "$POSE_MODEL_PATH" ]]; then
   echo "Missing ${POSE_MODEL_VAR}; each sport deployment must declare its own pose weights." >&2
   exit 64
 fi
-if [[ ! -f "$POSE_MODEL_PATH" ]]; then
+if [[ "${GOOD_BADMINTON_STREAM_PROCESSING_MODE:-analysis}" != "decode_smoke" && ! -f "$POSE_MODEL_PATH" ]]; then
   echo "Configured ${POSE_MODEL_VAR} does not exist: $POSE_MODEL_PATH" >&2
   exit 64
 fi

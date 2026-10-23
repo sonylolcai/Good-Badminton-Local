@@ -317,3 +317,5 @@ webui/
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=yo-WASSUP/Good-Badminton&type=Date)](https://www.star-history.com/#yo-WASSUP/Good-Badminton&Date)
+
+Local credentials and deployment inventory: [configuration guide](docs/LOCAL_CONFIGURATION.md).
