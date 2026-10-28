@@ -16,6 +16,7 @@ from fastapi import Depends, File, Form, Header, HTTPException, UploadFile, stat
 from fastapi.responses import FileResponse, JSONResponse
 
 from .stream_errors import StreamSessionError, validation_error
+from badminton_analysis.inference_policy import execution_profile
 from .stream_models import MAX_SEGMENT_BYTES, validate_create_request
 from .stream_sessions import (
     cancel_session_handler,
@@ -44,6 +45,8 @@ def register_stream_routes(
     app.add_middleware(MediaUploadGuard, manager=stream_manager)
     media_archive = media_archive or archive_from_environment(stream_manager)
     app.state.media_archive = media_archive
+    from .runtime_control import register_runtime_control
+    register_runtime_control(app, stream_manager, media_archive, require_api_key)
     if media_archive is not None:
         if stream_manager.worker_running:
             media_archive.start()
@@ -99,6 +102,7 @@ def register_stream_routes(
     async def create_stream_session(
         body: dict,
         x_idempotency_key: Optional[str] = Header(default=None),
+        x_expected_inference_profile: Optional[str] = Header(default=None),
     ):
         # Reject unsupported payload fields before a manager creates state;
         # profile/mode synchronization happens immediately afterwards, before
@@ -107,6 +111,11 @@ def register_stream_routes(
             normalized = validate_create_request(body)
         except ValueError as exc:
             raise validation_error(str(exc))
+        if x_expected_inference_profile:
+            config = normalized['configuration']
+            profile = execution_profile(config.get('sport_id', 'badminton'), config['shuttle_detector'], 'stream')
+            if profile['sha256'] != x_expected_inference_profile:
+                raise HTTPException(status_code=409, detail='GPU stream inference profile does not match the caller')
         validator = getattr(stream_manager.processor_factory, "validate_session_request", None)
         if callable(validator):
             try:

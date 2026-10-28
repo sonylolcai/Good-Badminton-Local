@@ -85,7 +85,7 @@ class BadmintonAnalysisSystem:
                  match_mode='singles', tracker_backend='bytetrack',
                  enable_bytetrack=True, lock_match_roster=True,
                  roster_stable_frames=2, roster_discovery_seconds=3.0,
-                 shuttle_detector='yolo',
+                 shuttle_detector=None,
                  tracknet_measurements_path=None, huji_action_model=None,
                  huji_sample_hz=6.0, enable_huji_play_state=True,
                  movement_rally_settle_seconds=0.7, generate_annotated_video=False,
@@ -125,6 +125,8 @@ class BadmintonAnalysisSystem:
             str(inference_device or os.environ.get("GOOD_BADMINTON_STREAM_DEVICE") or "auto")
             .strip()
         )
+        from .inference_policy import default_ball_detector
+        shuttle_detector = shuttle_detector or default_ball_detector(self.sport_id)
         if shuttle_detector not in {'none', 'yolo', 'tracknet_v3'}:
             raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
         self.shuttle_detector = shuttle_detector
@@ -460,6 +462,7 @@ class BadmintonAnalysisSystem:
         )
         self.fixed_camera_match = FixedCameraMatchPipeline(
             corners,
+            sport_id=self.sport_id,
             fps=fps,
             net_image_line=self.net_image_line,
             match_mode=self.match_mode,

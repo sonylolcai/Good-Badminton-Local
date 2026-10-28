@@ -48,6 +48,13 @@ class MediaArchiveTests(unittest.TestCase):
         self.storage = DirectoryObjectStore(self.root / "objects")
         self.archive = StreamMediaArchive(self.manager, self.storage, retry_seconds=0)
 
+    def test_unsealed_terminal_failure_has_terminal_media_status(self):
+        for terminal in ('failed', 'cancelled', 'interrupted_needs_rebuild'):
+            session = self.manager.get_session(self.session_id)
+            session['status'] = terminal
+            self.manager._save(session)
+            self.assertEqual(self.archive.status(self.session_id)['status'], 'failed')
+
     def ingest(self, indexes=(0, 1, 2), metadata_change=None):
         start, frame_start = 0.0, 0
         for index, (raw, evidence) in enumerate(self.fixtures):
@@ -120,7 +127,7 @@ class MediaArchiveTests(unittest.TestCase):
             upload(key, source)
         with patch.object(self.storage, "upload", side_effect=flaky):
             result = self.archive.process_session(self.session_id)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "retrying")
         self.assertFalse(list(self.storage.root.rglob("manifest.json")))
         master = self.archive._directory(self.session_id) / result["revision"] / "master.mp4"
         original_mtime = master.stat().st_mtime_ns
@@ -135,7 +142,7 @@ class MediaArchiveTests(unittest.TestCase):
         with patch("api.media_archive.shutil.disk_usage") as disk:
             disk.return_value.free = 0
             result = self.archive.process_session(self.session_id)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "retrying")
         self.assertFalse(list(self.storage.root.rglob("manifest.json")))
         self.assertTrue(all(self.manager._segment_path(self.session_id, i).is_file() for i in range(3)))
 

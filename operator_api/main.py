@@ -117,6 +117,18 @@ app = FastAPI(
     version="1.1.0",
     description="场馆、场地、设备接入与 GPU 管理 API。终端视频流请使用独立的 edge-ingest.v1 协议。",
 )
+@app.middleware('http')
+async def legacy_operator_access(request, call_next):
+    import hmac
+    from fastapi.responses import JSONResponse
+    expected = os.environ.get('GOOD_BADMINTON_LEGACY_OPERATOR_API_KEY', '')
+    if len(expected) < 32:
+        return JSONResponse({'detail': 'Legacy operator API is retired; use bdteach-business-api/operator_api.'}, status_code=410)
+    supplied = request.headers.get('authorization', '')
+    if not hmac.compare_digest(supplied.encode(), ('Bearer ' + expected).encode()):
+        return JSONResponse({'detail': 'Legacy operator service authentication required'}, status_code=401)
+    return await call_next(request)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins(),

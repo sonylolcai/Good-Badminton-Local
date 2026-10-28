@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.responses import FileResponse
 
 from .jobs import AnalysisJobManager
+from badminton_analysis.inference_policy import default_ball_detector, inference_contract, execution_profile
 from .release_identity import release_identity
 from .stream_runtime import StreamProcessorFactory
 from .stream_routes import register_stream_routes
@@ -48,6 +49,7 @@ def create_app(
             start_worker=start_worker,
         )
     app = FastAPI(title=f"{vision_profile.service_name} GPU API", version="1.0.0")
+    stream_manager.job_manager = manager
     app.state.job_manager = manager
     app.state.stream_manager = stream_manager
     app.state.vision_profile = vision_profile
@@ -57,7 +59,9 @@ def create_app(
         # to extract a court template, not for health checks or queue handling.
         from webui.pipeline import prepare_court_from_video
 
-        return prepare_court_from_video(path)
+        from .inference_lock import GPU_EXECUTION_LOCK
+        with GPU_EXECUTION_LOCK:
+            return prepare_court_from_video(path)
 
     app.state.court_detector = default_court_detector
 
@@ -92,6 +96,7 @@ def create_app(
             "stream_worker_running": stream_manager.worker_running,
             "api_auth_configured": bool(os.environ.get("GOOD_BADMINTON_API_KEY")),
             **release_identity(),
+            "inference_contract": inference_contract(vision_profile.sport_id),
         }
 
     register_stream_routes(
@@ -140,9 +145,14 @@ def create_app(
         court_corners: str = Form(...),
         options_json: str = Form("{}"),
         x_idempotency_key: Optional[str] = Header(default=None),
+        x_expected_inference_profile: Optional[str] = Header(default=None),
     ):
         corners = _parse_corners(court_corners)
         options = _parse_options(options_json, sport_id=vision_profile.sport_id)
+        if x_expected_inference_profile is not None:
+            actual = execution_profile(vision_profile.sport_id, options['shuttle_detector'])
+            if x_expected_inference_profile != actual['sha256']:
+                raise HTTPException(status_code=409, detail='GPU inference profile changed or does not match the caller')
         if options["sport_id"] != vision_profile.sport_id:
             raise HTTPException(
                 status_code=422,
@@ -279,6 +289,7 @@ def _job_response(job, receipt_reused=None):
         "progress": job.get("progress"),
         "error": job.get("error"),
         "execution": job.get("execution"),
+        "execution_profile": job.get("execution_profile"),
         "timing": job.get("timing"),
         "performance_trace": job.get("performance_trace"),
         "tracking": job.get("tracking"),
@@ -375,10 +386,7 @@ def _parse_options(value, *, sport_id="badminton"):
         # it never turns a 10/15/30 Hz task back into full-frame tracking.
         "tracker_backend": "bytetrack",
         "enable_bytetrack": True,
-        # YOLO remains the low-latency default.  TrackNetV3 is an explicit,
-        # slower accuracy experiment and must never start from an omitted API
-        # option.
-        "shuttle_detector": "yolo",
+        "shuttle_detector": default_ball_detector(sport_id),
         # When the caller opts out of ball detection, a cautious all-player
         # stability window can still provide review-only rally boundaries.
         "movement_rally_settle_seconds": 0.7,
@@ -505,7 +513,15 @@ def _configured_vision_profile():
     return get_vision_profile(os.environ.get("GOOD_SPORT_VISION_PROFILE", "badminton"))
 
 
-app = create_app(vision_profile=_configured_vision_profile())
+def __getattr__(name):
+    # Importing create_app from a fixed sport launcher must not start a second
+    # hidden worker against the same data directory. uvicorn api.app:app stays
+    # supported through lazy module attribute lookup.
+    if name != 'app':
+        raise AttributeError(name)
+    app = create_app(vision_profile=_configured_vision_profile())
+    globals()['app'] = app
+    return app
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from badminton_analysis.inference_policy import default_ball_detector, tracknet_checkpoint, tracknet_device, tracknet_runtime, pose_checkpoint
 
 from api.stream_runtime import resolve_tennis_ball_model_spec
 from api.vision_profiles import get_vision_profile
@@ -46,7 +47,7 @@ def resolve_full_video_models(sport_id, options):
     scope = mode.calibration_scope(
         options.get("calibration_scope") or mode.default_calibration_scope
     )
-    detector = options.get("shuttle_detector", "yolo")
+    detector = options.get("shuttle_detector", default_ball_detector(sport_id))
     if detector not in profile.allowed_ball_detectors:
         raise ValueError(
             f"shuttle_detector={detector} is not allowed for sport_id={sport_id}"
@@ -92,12 +93,12 @@ def resolve_full_video_models(sport_id, options):
 
     return {
         **match_policy,
-        "pose_model_path": options.get("yolo_pose_model") or "weights/yolo11n-pose.pt",
+        "pose_model_path": options.get("yolo_pose_model") or str(pose_checkpoint('badminton')),
         "ball_model_path": options.get("ball_model") or "weights/yolo11s-ball.pt",
         "ball_tracker_class": None,
         "ball_observation_identity": {
             "ball_kind": "shuttlecock",
-            "detector_mode": "badminton_yolo",
+            "detector_mode": "badminton_tracknet_v3" if detector == "tracknet_v3" else "badminton_yolo",
             "experimental": False,
         },
     }
@@ -141,7 +142,7 @@ def _forward_tracknet_output(raw_line, state_cb):
     )
 
 
-def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=None):
+def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=None, court_corners=None):
     """Run the configured GPU TrackNet runtime and return its immutable CSV.
 
     Good-Badminton intentionally does not package TrackNetV3 source code or
@@ -149,8 +150,28 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
     locations through environment variables.  This fails loudly on a CPU-only
     workstation instead of silently substituting the legacy YOLO ball model.
     """
+    project_root = Path(__file__).resolve().parents[1]
+    runtime = tracknet_runtime()
+    if runtime not in {"official", "lightweight"}:
+        raise RuntimeError("GOOD_BADMINTON_TRACKNET_RUNTIME must be official or lightweight")
+    if runtime == "lightweight":
+        checkpoint = str(tracknet_checkpoint())
+        if not checkpoint or not Path(checkpoint).is_file():
+            raise RuntimeError("优化版 TrackNet 缺少有效的 GOOD_BADMINTON_TRACKNET_CHECKPOINT；不回退 YOLO。")
+        target_dir = Path(output_dir) / "tracknet_v3"
+        command = [
+            os.sys.executable, str(project_root / "tools/run_lightweight_tracknet_raw.py"),
+            "--video", str(Path(video_path).resolve()),
+            "--checkpoint", str(Path(checkpoint).resolve()),
+            "--output-dir", str(target_dir.resolve()),
+            "--device", tracknet_device(),
+        ]
+        _emit_analysis_stage(state_cb, "tracknet_preprocessing", "tracknet.launch",
+                             {"runtime": "lightweight", "interpolation": False})
+        return _run_tracknet_command(command, project_root, target_dir, video_path, cancel_cb, state_cb)
+
     tracknet_root = os.environ.get("GOOD_BADMINTON_TRACKNET_ROOT")
-    checkpoint = os.environ.get("GOOD_BADMINTON_TRACKNET_CHECKPOINT")
+    checkpoint = str(tracknet_checkpoint())
     runtime_python = os.environ.get("GOOD_BADMINTON_TRACKNET_PYTHON", os.sys.executable)
     if not tracknet_root or not checkpoint:
         raise RuntimeError(
@@ -199,6 +220,11 @@ def _prepare_tracknet_v3_raw(video_path, output_dir, cancel_cb=None, state_cb=No
             "chunk_frames": chunk_frames,
         },
     )
+    return _run_tracknet_command(command, project_root, target_dir, video_path, cancel_cb, state_cb)
+
+
+def _run_tracknet_command(command, project_root, target_dir, video_path, cancel_cb, state_cb):
+    """Keep the same cancellation and diagnostic boundary for both runtimes."""
     runtime_env = os.environ.copy()
     runtime_env["PYTHONUNBUFFERED"] = "1"
     process = subprocess.Popen(
@@ -771,7 +797,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     enable_bytetrack = bool(options.get("enable_bytetrack", True))
     roster_stable_frames = int(options.get("roster_stable_frames", 2))
     roster_discovery_seconds = float(options.get("roster_discovery_seconds", 3.0))
-    shuttle_detector = options.get("shuttle_detector", "yolo")
+    shuttle_detector = options.get("shuttle_detector", default_ball_detector(sport_id))
     if shuttle_detector not in {"none", "yolo", "tracknet_v3"}:
         raise ValueError("shuttle_detector must be 'none', 'yolo', or 'tracknet_v3'.")
     # Rendering follows the selected detector and the explicit layer switches.
@@ -792,6 +818,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
             output_dir,
             cancel_cb=cancel_cb,
             state_cb=state_cb,
+            court_corners=corners,
         )
         record_pipeline_component("tracknet_v3_full_temporal", tracknet_t0)
     _emit_analysis_stage(state_cb, "human_tracking", "human_tracking_setup")

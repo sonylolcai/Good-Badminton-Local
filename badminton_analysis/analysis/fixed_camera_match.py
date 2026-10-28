@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 from ..court.mapper import CourtMapper
 from ..court.reference import BADMINTON_COURT_LENGTH, BADMINTON_COURT_WIDTH
 from ..tracking.bytetrack_adapter import ByteTrackAdapter
+from ..tracking.association_policy import association_policy
 
 
 SCHEMA_VERSION = "2.3"
@@ -189,9 +190,11 @@ class CourtMultiObjectTracker:
         athlete_observation_margin_m=0.35,
         athlete_observation_lateral_margin_m=None,
         athlete_observation_baseline_margin_m=None,
+        sport_id="badminton",
     ):
         if match_mode not in {"auto", "singles", "doubles", "person_only"}:
             raise ValueError("match_mode must be 'auto', 'singles', 'doubles', or 'person_only'")
+        self.person_association_policy = association_policy(sport_id)
         self.court_space = court_space
         self.fps = float(fps)
         self.max_missed_frames = int(max_missed_frames)
@@ -524,6 +527,17 @@ class CourtMultiObjectTracker:
             track_id = self._association_keys.get(association_key)
             if track_id not in unmatched_track_ids or index not in unmatched_observations:
                 continue
+            # A confirmed image-box ID can still switch people when boxes
+            # overlap across the net. Do not let it teleport a court identity.
+            if self.require_association_keys and self.person_association_policy["direct_key_motion_guard"]:
+                track = self.tracks[track_id]
+                elapsed = max(1, int(frame_index) - track.last_observation_frame) / self.fps
+                gate = max(self.person_association_policy["direct_key_min_gate_m"],
+                           self.max_speed_mps * elapsed
+                           + self.person_association_policy["direct_key_motion_tolerance_m"])
+                measured_xy = track.court_history[-1] if track.court_history else track.court_xy
+                if self._distance(measured_xy, observation["court_xy"]) > gate:
+                    continue
             assignments.append((track_id, index))
             assignment_sources[(track_id, index)] = "bytetrack"
             unmatched_track_ids.remove(track_id)
@@ -597,6 +611,7 @@ class CourtMultiObjectTracker:
             unmatched_observations,
             observations,
             assignments,
+            frame_index,
         ):
             assignments.append((track_id, index))
             assignment_sources[(track_id, index)] = "doubles_team_side_complement"
@@ -783,6 +798,7 @@ class CourtMultiObjectTracker:
     def roster_summary(self):
         """Expose roster state without turning a transient zone into identity."""
         return {
+            "association_policy": dict(self.person_association_policy),
             "enabled": self.lock_match_roster,
             "status": self.roster_status,
             "expected_player_count": self.expected_roster_count if self.lock_match_roster else None,
@@ -816,6 +832,7 @@ class CourtMultiObjectTracker:
         """
         return {
             "state_version": TRACKER_STATE_VERSION,
+            "person_association_policy": dict(self.person_association_policy),
             "match_mode": self.match_mode,
             "fps": self.fps,
             "max_missed_frames": self.max_missed_frames,
@@ -892,6 +909,7 @@ class CourtMultiObjectTracker:
         ):
             self.expected_roster_count = int(persisted_roster_count)
         expected_configuration = {
+            "person_association_policy": self.person_association_policy,
             "max_missed_frames": self.max_missed_frames,
             "max_retained_missing_frames": self.max_retained_missing_frames,
             "max_speed_mps": self.max_speed_mps,
@@ -901,6 +919,7 @@ class CourtMultiObjectTracker:
             "roster_discovery_seconds": self.roster_discovery_seconds,
         }
         restored_configuration = {
+            "person_association_policy": state.get("person_association_policy"),
             "max_missed_frames": int(state.get("max_missed_frames", -1)),
             "max_retained_missing_frames": int(
                 state.get("max_retained_missing_frames", -1)
@@ -1066,7 +1085,11 @@ class CourtMultiObjectTracker:
         association_key = observation.get("association_key")
         if association_key:
             if track.association_key and track.association_key != association_key:
-                self._association_keys.pop(track.association_key, None)
+                if self._association_keys.get(track.association_key) == track.track_id:
+                    self._association_keys.pop(track.association_key, None)
+            previous_owner = self._association_keys.get(association_key)
+            if previous_owner in self.tracks and previous_owner != track.track_id:
+                self.tracks[previous_owner].association_key = None
             track.association_key = association_key
             self._association_keys[association_key] = track.track_id
         metrics = self.track_metrics[track.track_id]
@@ -1256,6 +1279,7 @@ class CourtMultiObjectTracker:
         unmatched_observations,
         observations,
         assignments,
+        frame_index,
     ):
         """Recover the unique missing teammate in one visible court half.
 
@@ -1291,9 +1315,9 @@ class CourtMultiObjectTracker:
             if court_end is None:
                 continue
             if (
-                track.association_identity_confidence < 0.80
-                or float(observation.get("confidence") or 0.0) < 0.70
-                or float(observation.get("location_confidence") or 0.0) < 0.70
+                track.association_identity_confidence < self.person_association_policy["anchor_identity_min"]
+                or float(observation.get("confidence") or 0.0) < self.person_association_policy["anchor_body_min"]
+                or float(observation.get("location_confidence") or 0.0) < self.person_association_policy["anchor_location_min"]
             ):
                 continue
             anchors_by_end.setdefault(court_end, []).append(track_id)
@@ -1304,6 +1328,14 @@ class CourtMultiObjectTracker:
             candidates = candidates_by_end[court_end]
             anchors = anchors_by_end[court_end]
             if len(missing) == len(candidates) == len(anchors) == 1:
+                candidate = observations[candidates[0]]
+                anchor = observations[dict(assignments)[anchors[0]]]
+                weak = (self._weak_recovery_observation(candidate)
+                        or float(anchor.get("confidence") or 0) < .70
+                        or float(anchor.get("location_confidence") or 0) < .70)
+                if (self.person_association_policy["version"] == "person_association.v2"
+                        and weak and not self._weak_recovery_allowed(missing[0], candidate, frame_index)):
+                    continue
                 recoveries.append((missing[0], candidates[0]))
         return recoveries
 
@@ -1340,8 +1372,8 @@ class CourtMultiObjectTracker:
         for index in unmatched_observations:
             observation = observations[index]
             if (
-                float(observation.get("confidence") or 0.0) < 0.65
-                or float(observation.get("location_confidence") or 0.0) < 0.65
+                float(observation.get("confidence") or 0.0) < self.person_association_policy["recovery_body_min"]
+                or float(observation.get("location_confidence") or 0.0) < self.person_association_policy["recovery_location_min"]
             ):
                 continue
             court_end = self._court_end(observation.get("court_xy"))
@@ -1362,6 +1394,13 @@ class CourtMultiObjectTracker:
                     observations[index]["court_xy"],
                 ),
             )
+            if self._weak_recovery_observation(observations[index]):
+                if not self._weak_recovery_allowed(track_id, observations[index], frame_index):
+                    continue
+                costs = sorted(self._distance(self._predict_position(self.tracks[item], frame_index),
+                                               observations[index]["court_xy"]) for item in track_ids)
+                if len(costs) == 2 and costs[1] - costs[0] < self.person_association_policy["weak_recovery_slot_margin_m"]:
+                    continue
             recoveries.append((track_id, index))
         return recoveries
 
@@ -1404,8 +1443,8 @@ class CourtMultiObjectTracker:
             if court_end is None:
                 return []
             if (
-                float(observation.get("confidence") or 0.0) < 0.65
-                or float(observation.get("location_confidence") or 0.0) < 0.65
+                float(observation.get("confidence") or 0.0) < self.person_association_policy["recovery_body_min"]
+                or float(observation.get("location_confidence") or 0.0) < self.person_association_policy["recovery_location_min"]
             ):
                 return []
             observations_by_end.setdefault(court_end, []).append(index)
@@ -1430,11 +1469,29 @@ class CourtMultiObjectTracker:
                 self._distance(first_predicted, observations[second_index]["court_xy"])
                 + self._distance(second_predicted, observations[first_index]["court_xy"])
             )
-            if crossed_cost < direct_cost:
-                recoveries.extend([(first_track, second_index), (second_track, first_index)])
-            else:
-                recoveries.extend([(first_track, first_index), (second_track, second_index)])
+            pairs = ([(first_track, second_index), (second_track, first_index)]
+                     if crossed_cost < direct_cost else
+                     [(first_track, first_index), (second_track, second_index)])
+            if any(self._weak_recovery_observation(observations[index]) for index in indices):
+                if abs(direct_cost - crossed_cost) < self.person_association_policy["weak_pair_cost_margin_m"]:
+                    continue
+                if not all(self._weak_recovery_allowed(track_id, observations[index], frame_index)
+                           for track_id, index in pairs):
+                    continue
+            recoveries.extend(pairs)
         return recoveries
+
+    @staticmethod
+    def _weak_recovery_observation(observation):
+        return (float(observation.get("confidence") or 0) < .65
+                or float(observation.get("location_confidence") or 0) < .65)
+
+    def _weak_recovery_allowed(self, track_id, observation, frame_index):
+        policy = self.person_association_policy
+        return (float(observation.get("confidence") or 0) >= policy["recovery_body_min"]
+                and float(observation.get("location_confidence") or 0) >= policy["recovery_location_min"]
+                and self._distance(self._predict_position(self.tracks[track_id], frame_index),
+                                   observation["court_xy"]) <= policy["weak_recovery_max_distance_m"])
 
     @staticmethod
     def _identity_confidence_for_source(association_source):
@@ -1935,6 +1992,7 @@ class FixedCameraMatchPipeline:
         athlete_observation_margin_m=0.35,
         athlete_observation_lateral_margin_m=None,
         athlete_observation_baseline_margin_m=None,
+        sport_id="badminton",
     ):
         if match_mode not in {"auto", "singles", "doubles"}:
             raise ValueError(
@@ -1968,13 +2026,14 @@ class FixedCameraMatchPipeline:
         self.match_mode = match_mode
         self.tracker_backend = tracker_backend
         self.byte_tracker = (
-            ByteTrackAdapter(fps=fps, tracker_factory=byte_tracker_factory)
+            ByteTrackAdapter(fps=fps, tracker_factory=byte_tracker_factory, sport_id=sport_id)
             if tracker_backend == "bytetrack"
             else None
         )
         self.tracker = CourtMultiObjectTracker(
             self.court_space,
             fps=fps,
+            sport_id=sport_id,
             match_mode=match_mode,
             lock_match_roster=lock_match_roster,
             expected_roster_count=self.expected_player_count,

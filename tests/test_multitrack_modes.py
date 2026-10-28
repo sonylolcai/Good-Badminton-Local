@@ -42,9 +42,104 @@ class MultiTrackModeTests(unittest.TestCase):
     CORNERS = [(0, 0), (610, 0), (610, 1340), (0, 1340)]
 
     def test_bytetrack_uses_far_court_continuity_match_threshold(self):
-        """Fixed-camera far players need a less brittle IoU association gate."""
+        """The score-fused cost upper limit increases to relax matching."""
         adapter = ByteTrackAdapter(fps=10, tracker_factory=_FakeByteTracker)
-        self.assertEqual(0.50, adapter.config["match_thresh"])
+        self.assertEqual(0.70, adapter.config["match_thresh"])
+
+    def test_score_fused_cost_limit_retains_visible_moderate_confidence_player(self):
+        if not ByteTrackAdapter.availability()[0]:
+            self.skipTest("official ByteTrack dependencies unavailable")
+        old = ByteTrackAdapter(fps=10, match_thresh=.50)
+        relaxed = ByteTrackAdapter(fps=10)
+        observation = {"bbox_xyxy": [100, 100, 150, 250], "confidence": .60}
+        first_old = old.update([observation])
+        first_relaxed = relaxed.update([observation])
+        moved = {**observation, "bbox_xyxy": [105, 100, 155, 250]}
+        self.assertTrue(first_old)
+        self.assertEqual({}, old.update([moved]))
+        self.assertEqual(first_relaxed, relaxed.update([moved]))
+        tennis = ByteTrackAdapter(fps=10, sport_id="tennis", tracker_factory=_FakeByteTracker)
+        self.assertEqual(.50, tennis.config["match_thresh"])
+
+    def _locked_doubles_for_threshold_test(self):
+        tracker = CourtMultiObjectTracker(
+            CourtSpace(self.CORNERS), fps=10, match_mode="doubles",
+            lock_match_roster=True, expected_roster_count=4,
+            roster_stable_frames=1, roster_discovery_seconds=0,
+            require_association_keys=True)
+        initial = [self._observation(xy, key) for xy, key in [
+            ((1., 2.), "a"), ((5., 2.4), "b"),
+            ((1.2, 11.), "c"), ((4.8, 10.6), "d")]]
+        tracker.update(1, initial)
+        tracker.update(2, initial)
+        return tracker, initial
+
+    def test_moderate_confidence_far_teammate_recovery(self):
+        tracker, initial = self._locked_doubles_for_threshold_test()
+        live = [dict(item) for item in initial]
+        live[0].update(association_key=None, confidence=.60, location_confidence=.55)
+        live[1].update(confidence=.65, location_confidence=.60)
+        result = tracker.update(3, live)
+        self.assertEqual(4, sum(item["status"] == "detected" for item in result))
+        self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
+
+    def test_weak_distant_or_ambiguous_recovery_stays_unassigned(self):
+        for position in [(3., 2.2), (3., 5.0)]:
+            with self.subTest(position=position):
+                tracker, initial = self._locked_doubles_for_threshold_test()
+                candidate = self._observation(position, None)
+                candidate.update(confidence=.60, location_confidence=.55)
+                tracker.update(3, [candidate, *initial[2:]])
+                self.assertEqual(1, tracker.roster_summary()["unassigned_observation_count"])
+
+    def test_confirmed_key_cannot_teleport_identity_across_net(self):
+        tracker, initial = self._locked_doubles_for_threshold_test()
+        live = [dict(item) for item in initial]
+        live[0] = self._observation((1., 9.), "a")
+        result = tracker.update(3, live)
+        first = next(t for t in result if t["track_id"] == "track_001")
+        self.assertNotEqual("detected", first["status"])
+        self.assertEqual("end_a", first["court_end"])
+        self.assertEqual(1, tracker.roster_summary()["unassigned_observation_count"])
+
+    def test_reassigned_key_has_exactly_one_roster_owner(self):
+        tracker, initial = self._locked_doubles_for_threshold_test()
+        first = tracker.tracks["track_001"]
+        second = tracker.tracks["track_002"]
+        tracker._apply_observation(second, 3, self._observation((5., 2.4), "a"))
+        self.assertIsNone(first.association_key)
+        self.assertEqual("track_002", tracker._association_keys["a"])
+        tracker._apply_observation(first, 4, self._observation((1., 2.), "new_a"))
+        self.assertEqual("track_002", tracker._association_keys["a"])
+        state = tracker.snapshot_state()
+        state["person_association_policy"]["recovery_body_min"] = .65
+        with self.assertRaisesRegex(ValueError, "configuration"):
+            tracker.restore_state(state)
+
+    def test_moderate_confidence_pair_requires_distinct_nearby_slots(self):
+        tracker, initial = self._locked_doubles_for_threshold_test()
+        live = [dict(item) for item in initial]
+        for item in live[:2]:
+            item.update(association_key=None, confidence=.60, location_confidence=.55)
+        result = tracker.update(3, live)
+        self.assertEqual(4, sum(item["status"] == "detected" for item in result))
+        self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
+        tracker, initial = self._locked_doubles_for_threshold_test()
+        # Two weak poses cannot resolve two same-end slots with equal motion cost.
+        live = [self._observation((3., 2.2), None),
+                self._observation((3., 2.2), None), *initial[2:]]
+        for item in live[:2]:
+            item.update(confidence=.60, location_confidence=.55)
+        tracker.update(3, live)
+        self.assertEqual(2, tracker.roster_summary()["unassigned_observation_count"])
+
+    def test_very_low_confidence_candidate_is_not_forced_into_roster(self):
+        tracker, initial = self._locked_doubles_for_threshold_test()
+        live = [dict(item) for item in initial]
+        live[0].update(association_key=None, confidence=.20, location_confidence=.20)
+        live[1].update(confidence=.65, location_confidence=.60)
+        tracker.update(3, live)
+        self.assertEqual(1, tracker.roster_summary()["unassigned_observation_count"])
 
     def test_doubles_keeps_four_independent_tracks_and_team_is_not_court_side(self):
         pipeline = FixedCameraMatchPipeline(self.CORNERS, fps=10, match_mode="doubles")

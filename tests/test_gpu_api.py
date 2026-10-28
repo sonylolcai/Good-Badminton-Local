@@ -270,7 +270,7 @@ class GpuApiTests(unittest.TestCase):
         self.assertEqual(stored["options"]["shuttle_sample_hz"], 10.0)
         self.assertEqual(stored["options"]["tracker_backend"], "bytetrack")
         self.assertTrue(stored["options"]["enable_bytetrack"])
-        self.assertEqual(stored["options"]["shuttle_detector"], "yolo")
+        self.assertEqual(stored["options"]["shuttle_detector"], "tracknet_v3")
         self.assertEqual(stored["options"]["match_mode"], "auto")
         self.assertTrue(stored["options"]["generate_annotated_video"])
         self.assertTrue(stored["options"]["browser_video_reencode"])

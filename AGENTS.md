@@ -4,6 +4,14 @@
 
 这是共享多运动 GPU 与网球适配的重构实验仓。它与主仓结构相近，但任何修复或功能都必须单独验证、评审并明确迁移，不能默认回流 `Good-Badminton`。
 
+## 羽毛球解析默认与一致性
+
+- 新建羽毛球解析默认使用优化版 `tracknet_v3`；只有明确关闭球检测或做模型对照时才选择 `none` / `yolo`。不要从旧成功任务继承 YOLO 后当作当前默认。
+- 模型路径与默认值以 `badminton_analysis/inference_policy.py` 为准。平台调用标准 GPU API；版本、权重、执行流程或回执不符时失败，禁止静默回退。
+- `feat/shuttle-accuracy-iteration` 分支中的球体实验采用沿四角左右边线外扩的空中走廊：本机当前每侧为近端场宽的 20%，上方保留高球区域，实际比例以私密 GPU 配置为准。不要只裁地面梯形，也不要恢复成按近端宽度向上覆盖的大矩形。参数 `GOOD_BADMINTON_SHUTTLE_LATERAL_MARGIN_RATIO` 由私密 GPU 配置管理，须在执行流程签名和产物中保留。
+- 球体准确率实验已停放在上述专属分支；当前工作区保持优化 TrackNet 基线，不启动准确率迭代。
+- 整段与流式有独立执行流程签名，不能把两者的窗口策略和覆盖率混作同一口径。运行与核验见 `docs/GPU_INFERENCE_PARITY.md`。
+
 ## 代码地图
 
 - `api/`：多运动 FastAPI、流式运行时和会话边界；`apps/badminton_gpu/`、`apps/tennis_gpu/`：运动专属 GPU 启动入口。

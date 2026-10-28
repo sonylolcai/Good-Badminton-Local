@@ -32,6 +32,7 @@ from badminton_analysis.streaming.models import FinalizationContext, FrameContex
 from badminton_analysis.tracking.person_only import PersonOnlyFrameProcessor, PersonOnlyTracker
 
 from .mode_sync import VisionModeSynchronizer
+from badminton_analysis.inference_policy import tracknet_checkpoint, tracknet_device
 from .vision_profiles import BADMINTON_PROFILE, SportVisionProfile
 
 from .candidate_photos import CandidatePhotoCollector
@@ -539,9 +540,7 @@ class StreamProcessorFactory:
 
     @staticmethod
     def _tracknet_model_path() -> Path:
-        project_root = Path(__file__).resolve().parents[1]
-        configured = os.environ.get("GOOD_BADMINTON_STREAM_TRACKNET_MODEL")
-        path = Path(configured) if configured else project_root / "weights" / "tracknetv3" / "ckpts" / "TrackNet_best.pt"
+        path = tracknet_checkpoint()
         if not path.is_file():
             raise ValueError(
                 "TrackNetV3 streaming requires a configured bounded-state temporal model checkpoint: "
@@ -761,7 +760,7 @@ class StreamProcessorFactory:
                 _load_tracknet_detector(
                     str(model_path.resolve()),
                     model_sha256,
-                    str(os.environ.get("GOOD_BADMINTON_STREAM_TRACKNET_DEVICE") or "auto"),
+                    tracknet_device(),
                 ),
                 model_sha256=model_sha256,
                 model_checkpoint=model_path.name,

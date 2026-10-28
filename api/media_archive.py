@@ -181,11 +181,14 @@ class StreamMediaArchive:
         return self.manager._session_dir(session_id) / "media"
 
     def status(self, session_id):
-        if self.manager.get_session(session_id) is None:
+        session = self.manager.get_session(session_id)
+        if session is None:
             raise ValueError("session not found")
+        if not session.get('sealed') and session.get('status') in {'failed', 'cancelled', 'interrupted_needs_rebuild'}:
+            return {'status': 'failed', 'error': 'analysis_ended_before_seal'}
         path = self._directory(session_id) / "status.json"
         return json.loads(path.read_text()) if path.is_file() else {
-            "status": "pending" if self.manager.get_session(session_id).get("sealed") else "awaiting_seal",
+            "status": "pending" if session.get("sealed") else "awaiting_seal",
         }
 
     def manifest(self, session_id):
@@ -210,7 +213,7 @@ class StreamMediaArchive:
             root = self._directory(session_id)
             root.mkdir(parents=True, exist_ok=True)
             state = {"status": "checking", "revision": revision, "attempted_at": time.time(),
-                     "analysis_quality_verified": False}
+                     "analysis_quality_verified": False, "attempts": int(old.get("attempts", 0)) + 1}
             write_json(root / "status.json", state)
             try:
                 if getattr(self.storage, "allowed_root", None):
@@ -222,7 +225,7 @@ class StreamMediaArchive:
                         raise MediaValidationError("media identity belongs to a different storage environment")
                 result = self._prepare(snapshot, revision, root, state)
             except Exception as error:
-                state["status"] = "invalid" if isinstance(error, MediaValidationError) else "failed"
+                state["status"] = "invalid" if isinstance(error, MediaValidationError) else ("failed" if state["attempts"] >= 5 else "retrying")
                 # SDK exception messages can contain request URLs/credential IDs.
                 state["error"] = str(error)[:1000] if isinstance(error, MediaValidationError) else type(error).__name__
                 write_json(root / "status.json", state)
@@ -411,7 +414,7 @@ class StreamMediaArchive:
                 if state["status"] == "ready":
                     self.release_verified_media(session_id)
                     continue
-                if state["status"] == "invalid":
+                if state["status"] in {"invalid", "failed"}:
                     continue
                 if time.time() - state.get("attempted_at", 0) < self.retry_seconds:
                     continue

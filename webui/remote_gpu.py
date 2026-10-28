@@ -12,6 +12,7 @@ import mimetypes
 import os
 import re
 import ssl
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -32,6 +33,10 @@ SUPPORTED_SPORT_IDS = {"badminton", "tennis"}
 
 class RemoteAnalysisError(RuntimeError):
     """The remote service cannot be used safely for this WebUI run."""
+
+
+def _mac_local_only():
+    return sys.platform == "darwin"
 
 
 def _normalize_sport_id(sport_id):
@@ -91,6 +96,8 @@ def remote_gpu_config(base_url_override=None, *, sport_id="badminton", local_cpu
         or parsed.fragment
     ):
         raise RemoteAnalysisError("GPU 服务地址必须是无账号、无查询参数的 http(s) 基础地址")
+    if _mac_local_only() and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise RemoteAnalysisError("Mac 本地解析只允许本机 GPU；禁止远程地址或自动回退")
     return {
         "base_url": configured_base_url.rstrip("/"),
         # Separate service credentials are preferred. The old badminton key is

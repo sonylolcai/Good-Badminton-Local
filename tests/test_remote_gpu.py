@@ -21,6 +21,18 @@ from business_gateway.dev_api import LocalReplayManager
 
 
 class RemoteGpuTests(unittest.TestCase):
+    def setUp(self):
+        # Remote transport contracts still apply to the Linux server deployment.
+        policy = patch('webui.remote_gpu._mac_local_only', return_value=False)
+        policy.start()
+        self.addCleanup(policy.stop)
+
+    def test_mac_rejects_remote_override_before_upload(self):
+        with patch('webui.remote_gpu._mac_local_only', return_value=True):
+            with self.assertRaisesRegex(RemoteAnalysisError, 'Mac 本地解析'):
+                remote_gpu_config('https://remote.example.test')
+            self.assertEqual(remote_gpu_config('http://127.0.0.1:8082')['base_url'], 'http://127.0.0.1:8082')
+
     def test_stream_photo_metadata_is_restored_from_events_when_terminal_is_compact(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             event_path = Path(temp_dir) / "stream_events.jsonl"

@@ -58,3 +58,11 @@ sudo journalctl -u good-badminton-edge-gateway -u good-badminton-operator-api -u
 ```
 
 公开入口只应开放 443。端口 `18080`、`8000`、`3000` 均监听在 `127.0.0.1`，不要直接在安全组或防火墙中放行。
+
+## Legacy operator retirement
+
+The GPU repository operator API rejects anonymous requests and returns 410 by default. Use the authenticated `bdteach-business-api/operator_api` service for production. Controlled migration clients may configure a private `GOOD_BADMINTON_LEGACY_OPERATOR_API_KEY` of at least 32 characters and send it as a Bearer token; never place it in browser configuration.
+
+Batch uploads now share GPU media admission (default 1 GiB request limit, configurable with `GOOD_BADMINTON_JOB_MAX_REQUEST_BYTES`); batch inputs/results expire after 168 hours by default (`GOOD_BADMINTON_JOB_RETENTION_HOURS`). Archive required outputs before expiry. Permanent or exhausted result-callback failures are retained and block shutdown; correct delivery configuration and call authenticated `POST /api/v1/runtime/retry-notifications` to resume delivery.
+
+Callback delivery that reaches the retry limit remains visible and retains its evidence. It probes again at most once per 15 minutes after configuration/network repair; the authenticated retry-notifications endpoint resumes immediately. Drain continues to hold while business durability has not been acknowledged.

@@ -5,6 +5,10 @@ result artifacts.  Authentication, users, billing, and business records belong
 to the separate application service described in the deployment design.
 """
 
+from .inference_lock import serialized_inference
+from .release_identity import release_identity
+from badminton_analysis.inference_policy import execution_profile, default_ball_detector, file_digest
+
 import hashlib
 import json
 import os
@@ -53,6 +57,7 @@ class AnalysisJobManager:
         self._cancel_events = {}
         self._worker = None
         self._recover_interrupted_jobs()
+        self.prune_expired_jobs()
         if start_worker:
             self.start()
 
@@ -70,7 +75,23 @@ class AnalysisJobManager:
     def worker_running(self):
         return self._worker is not None and self._worker.is_alive()
 
+    def prune_expired_jobs(self):
+        import shutil
+        cutoff = time.time() - max(1, int(os.environ.get('GOOD_BADMINTON_JOB_RETENTION_HOURS', '168'))) * 3600
+        for directory in self.jobs_dir.iterdir():
+            if not directory.is_dir() or directory.is_symlink(): continue
+            try:
+                job = self.get_job(directory.name)
+                if not job or job.get('status') not in TERMINAL_JOB_STATUSES or not isinstance(job.get('finished_at'), str):
+                    continue
+                stamp = datetime.fromisoformat(job['finished_at'].replace('Z', '+00:00')).timestamp()
+                if job.get('status') in TERMINAL_JOB_STATUSES and stamp < cutoff:
+                    shutil.rmtree(directory)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+
     def create_job(self, video_path, template_path, corners, options, idempotency_key=None):
+        self.prune_expired_jobs()
         job_id = uuid.uuid4().hex
         job_dir = self.jobs_dir / job_id
         output_dir = job_dir / "output"
@@ -111,6 +132,8 @@ class AnalysisJobManager:
                 "match_session_ref": options.get("match_session_ref"),
             },
             "options": options,
+            "execution_profile": execution_profile(options.get('sport_id', 'badminton'),
+                                                    options.get('shuttle_detector', default_ball_detector(options.get('sport_id', 'badminton')))),
             "request": {"idempotency_key": idempotency_key, "accepted_at": accepted_at},
             "state_history": [
                 {"at": accepted_at, "status": "accepted", "event": "durably_stored"},
@@ -222,6 +245,7 @@ class AnalysisJobManager:
             finally:
                 self._queue.task_done()
 
+    @serialized_inference
     def _run_job(self, job_id, video_path, template_path, corners, options, output_dir):
         job = self.get_job(job_id)
         if job is None:
@@ -284,6 +308,11 @@ class AnalysisJobManager:
             # before the worker actually receives a GPU task.
             from webui.pipeline import run_analysis
 
+            current_profile = execution_profile(options.get('sport_id', 'badminton'),
+                                                options.get('shuttle_detector', default_ball_detector(options.get('sport_id', 'badminton'))))
+            if job.get('execution_profile') != current_profile:
+                raise RuntimeError('GPU inference profile changed after acceptance; resubmit the task')
+
             result = run_analysis(
                 video_path,
                 template_path,
@@ -297,6 +326,22 @@ class AnalysisJobManager:
             )
             if cancel_event.is_set():
                 raise AnalysisCancelled("任务已由操作员中断。")
+            if current_profile != execution_profile(current_profile['sport_id'], current_profile['detector']):
+                raise RuntimeError('GPU inference profile changed during analysis')
+            if current_profile['detector'] == 'tracknet_v3' and current_profile['runtime'] == 'lightweight':
+                provenance = json.loads((Path(output_dir) / 'tracknet_v3/runtime_provenance.json').read_text())
+                if (provenance.get('checkpoint_sha256') != current_profile['checkpoint_sha256']
+                        or provenance.get('runtime') != 'LightweightTrackNetDetector'
+                        or provenance.get('interpolation_in_raw_csv') is not False
+):
+                    raise RuntimeError('Actual TrackNet engine/weights do not match the accepted GPU profile')
+            receipt = {'schema_version': 'gpu-execution-receipt.v1', 'profile': current_profile,
+                       'release': release_identity(), 'options': options,
+                       'input_sha256': file_digest(video_path), 'template_sha256': file_digest(template_path),
+                       'court_corners': corners, 'fallback_used': False}
+            receipt_path = Path(output_dir) / 'execution_receipt.json'
+            receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
+            result['execution_receipt'] = str(receipt_path)
             job = self.get_job(job_id)
             self._set_status(
                 job,
@@ -459,6 +504,7 @@ class AnalysisJobManager:
         output_path = Path(output_dir).resolve()
         artifacts = {}
         candidates = {
+            "execution_receipt": result.get('execution_receipt'),
             "annotated_video": result.get("video"),
             "metadata": result.get("metadata"),
             "detections": result.get("detections"),
@@ -472,6 +518,9 @@ class AnalysisJobManager:
         trace_path = output_path / "performance_trace.json"
         if trace_path.is_file():
             candidates["performance_trace"] = str(trace_path)
+        tracknet_provenance = output_path / "tracknet_v3" / "runtime_provenance.json"
+        if tracknet_provenance.is_file():
+            candidates["tracknet_runtime_provenance"] = str(tracknet_provenance)
         spatial_summary = output_path / "spatial_match_summary.json"
         if spatial_summary.is_file():
             candidates["spatial_match_summary"] = str(spatial_summary)

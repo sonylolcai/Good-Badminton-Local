@@ -75,6 +75,7 @@ def generate_movement_metrics(
     }
     fps = float(((metadata.get("video") or {}).get("fps")) or 0.0)
     evidence = collect_track_position_evidence(detections_path)
+    duration_sec = _match_duration_sec(metadata.get("video") or {}, evidence, fps=fps)
     style_by_track = {
         str(item.get("track_id")): item
         for item in spatial_summary.get("player_style_inputs") or []
@@ -86,7 +87,8 @@ def generate_movement_metrics(
             track_id,
             entry,
             fps=fps,
-            source_frames=int(evidence.get("source_frames") or 0),
+            sampled_frames=int(evidence.get("sampled_frames") or 0),
+            duration_sec=duration_sec,
             style=style_by_track.get(track_id) or {},
             profile=profile_by_track.get(track_id),
         )
@@ -176,7 +178,33 @@ def write_body_profiles(output_dir, rows, *, consent=False):
     return str(destination)
 
 
-def _build_player_metrics(track_id, entry, *, fps, source_frames, style, profile):
+def _match_duration_sec(video, evidence, *, fps):
+    """Use source time, never the number of sampled detection rows."""
+    def positive_finite(value):
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return number if math.isfinite(number) and number > 0 else 0.0
+
+    duration = positive_finite(video.get("duration_sec"))
+    if duration:
+        return duration
+    rate = positive_finite(fps)
+    total_frames = positive_finite(video.get("total_frames"))
+    if total_frames and rate:
+        return total_frames / rate
+    # Without metadata this is the observed source endpoint; an unsampled tail
+    # cannot be recovered from a row count or an assumed analysis frequency.
+    return max(
+        positive_finite(evidence.get("max_time_sec")),
+        positive_finite(evidence.get("max_source_frame")) / rate if rate else 0.0,
+    )
+
+
+def _build_player_metrics(track_id, entry, *, fps, sampled_frames, duration_sec, style, profile):
     points = sorted(
         entry.get("usable_points") or [],
         key=lambda item: (item.get("frame") is None, item.get("frame") or 0),
@@ -197,7 +225,7 @@ def _build_player_metrics(track_id, entry, *, fps, source_frames, style, profile
         window_seconds=DIRECTION_CHANGE_PEAK_WINDOW_SECONDS,
     )
     track_rows = int(entry.get("track_rows") or 0)
-    coverage_ratio = len(points) / source_frames if source_frames else 0.0
+    coverage_ratio = len(points) / sampled_frames if sampled_frames else 0.0
     energy = _energy_estimate(
         profile,
         active_seconds=active_seconds,
@@ -206,7 +234,6 @@ def _build_player_metrics(track_id, entry, *, fps, source_frames, style, profile
         mean_speed_mps=mean_speed_mps,
         direction_change_count=direction_change_count,
     )
-    duration_sec = float(source_frames) / float(fps) if fps else 0.0
     ability_scores = _ability_scores(
         points=points,
         statistic_segments=statistic_segments,

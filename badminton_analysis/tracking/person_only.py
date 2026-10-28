@@ -144,13 +144,14 @@ class PersonOnlyTracker:
         self.min_confirmed_detections = int(min_confirmed_detections)
         self.reliable_coverage_threshold = float(reliable_coverage_threshold)
         self._byte_tracker = (
-            ByteTrackAdapter(fps=fps, tracker_factory=byte_tracker_factory)
+            ByteTrackAdapter(fps=fps, tracker_factory=byte_tracker_factory, sport_id=sport_id)
             if tracker_backend == "bytetrack"
             else None
         )
         self._tracker = CourtMultiObjectTracker(
             self.court_space,
             fps=fps,
+            sport_id=sport_id,
             max_missed_frames=max_missed_frames,
             max_retained_missing_frames=max_retained_missing_frames,
             max_speed_mps=max_speed_mps,

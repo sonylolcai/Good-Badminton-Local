@@ -335,7 +335,8 @@ class LightweightTrackNetDetector:
             chunk_cat = torch.cat([self.bg_tensor.cpu()] + raw_frames_buffer, dim=0)
             chunk_tensors.append(chunk_cat)
             chunk_indexes.append(list(frame_idx_buffer))
-            flush_batch()
+        # A complete final chunk may still be smaller than batch_chunks.
+        flush_batch()
 
         # Sort detections by frame index
         detections.sort(key=lambda d: d["frame_index"])

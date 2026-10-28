@@ -1,6 +1,9 @@
 """Bound multipart spooling before FastAPI parses files into system temp storage."""
 from __future__ import annotations
 
+import os
+import secrets
+from dataclasses import replace
 import re
 import shutil
 import tempfile
@@ -29,11 +32,21 @@ class MediaUploadGuard:
     async def __call__(self, scope, receive, send):
         path = scope.get('path','')
         if (scope['type']!='http' or scope.get('method')!='POST'
-                or not re.fullmatch(r'/api/v1/stream-sessions/[^/]+/segments/[0-9]+(?:/repair)?/?',path)):
+                or not (path in {'/api/v1/jobs', '/api/v1/court/detect'} or re.fullmatch(r'/api/v1/stream-sessions/[^/]+/segments/[0-9]+(?:/repair)?/?',path))):
             return await self.app(scope,receive,send)
+        if path in {'/api/v1/jobs', '/api/v1/court/detect'}:
+            headers = dict(scope.get('headers', []))
+            expected = os.environ.get('GOOD_BADMINTON_API_KEY', '')
+            if not expected or not secrets.compare_digest(headers.get(b'x-api-key', b''), expected.encode()):
+                return await JSONResponse({'detail':'Invalid API key'}, status_code=401)(scope,receive,send)
+        jobs = getattr(self.manager, 'job_manager', None)
+        if jobs is not None: jobs.prune_expired_jobs()
         limits=MediaLimits.from_environment()
+        if path in {'/api/v1/jobs', '/api/v1/court/detect'}:
+            limits = replace(limits, max_request_bytes=int(os.environ.get('GOOD_BADMINTON_JOB_MAX_REQUEST_BYTES', str(1024**3))))
         async def reject(status,code,message,retryable=False):
-            session_id=path.split('/')[4]
+            parts=path.split('/')
+            session_id=parts[4] if len(parts)>4 else ''
             if not SESSION_ID_PATTERN.fullmatch(session_id):
                 session_id=None
             payload=error_response(code,message,retryable,analysis_session_id=session_id)
@@ -47,23 +60,28 @@ class MediaUploadGuard:
                 return await reject(400,'invalid_content_length','Invalid Content-Length')
             if length>limits.max_request_bytes:
                 return await reject(413,'gpu_media_request_limit','Upload request exceeds the bounded segment envelope')
-        try:
-            with self.manager._lock:
-                ensure_capacity(self.manager,0)
-        except StreamSessionError as exc:
-            return await reject(exc.status_code,exc.code,exc.message,exc.retryable)
         temporary=Path(tempfile.gettempdir())
         same_volume=temporary.stat().st_dev==self.manager.data_dir.stat().st_dev
         reserve=limits.min_free_bytes if same_volume else min(limits.min_free_bytes,64*1024**2)
+        request_reserve = length if lengths else limits.max_request_bytes
         with self._lock:
-            if self._inflight>=limits.max_upload_requests:
+            try:
+                with self.manager._lock:
+                    ensure_capacity(self.manager, self._reserved + request_reserve * 2)
+            except StreamSessionError as exc:
+                capacity_error = exc
+            else:
+                capacity_error = None
+            if capacity_error is not None:
+                rejected = (capacity_error.status_code, capacity_error.code, capacity_error.message, capacity_error.retryable)
+            elif self._inflight>=limits.max_upload_requests:
                 rejected=(429,'gpu_media_upload_busy','Concurrent upload limit reached',True)
-            elif shutil.disk_usage(temporary).free-self._reserved-limits.max_request_bytes<reserve:
+            elif shutil.disk_usage(temporary).free-self._reserved-request_reserve<reserve:
                 rejected=(507,'gpu_media_temp_storage_full','Temporary upload storage has insufficient free space',True)
             else:
                 rejected=None
                 self._inflight+=1
-                self._reserved+=limits.max_request_bytes
+                self._reserved+=request_reserve
         if rejected:
             return await reject(*rejected)
         received=0
@@ -92,4 +110,4 @@ class MediaUploadGuard:
         finally:
             with self._lock:
                 self._inflight-=1
-                self._reserved-=limits.max_request_bytes
+                self._reserved-=request_reserve

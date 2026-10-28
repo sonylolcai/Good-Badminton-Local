@@ -13,6 +13,9 @@ lifecycle, decode, checkpoint atomicity, restore flow and event persistence.
 
 from __future__ import annotations
 
+from .inference_lock import serialized_inference
+from badminton_analysis.inference_policy import execution_profile
+
 import hashlib
 import inspect
 import json
@@ -932,6 +935,8 @@ class StreamSessionManager:
                 "client_reference": request.get("client_reference"),
                 "media_identity": request.get("media_identity"),
                 "configuration": request["configuration"],
+                "execution_profile": execution_profile(request['configuration'].get('sport_id', 'badminton'),
+                                                        request['configuration']['shuttle_detector'], 'stream'),
                 "processing_mode": getattr(self.processor_factory, "processing_mode", "analysis"),
                 "request": {"idempotency_key": idempotency_key, "accepted_at": now},
                 "retention": {
@@ -1010,7 +1015,7 @@ class StreamSessionManager:
             # The scheduled short-lived session cleanup must never erase it.
             session["retention"] = {"policy": "persistent_media"}
             self._save(session)
-            return {"analysis_session_id": session_id, "upload_token": token,
+            return {"analysis_session_id": session_id, "upload_token": token, "ttl_seconds": ttl,
                     "expires_at": session["upload_authorization"]["expires_at"]}
 
     def revoke_upload_token(self, session_id):
@@ -2211,6 +2216,7 @@ class StreamSessionManager:
             self._engines[session_id] = replacement
         self._finalize_if_ready(session_id)
 
+    @serialized_inference
     def _reanalyze_repaired_segment(self, session_id, index):
         """Analyze one repaired fragment in an isolated epoch (decision D7).
 
@@ -2375,6 +2381,7 @@ class StreamSessionManager:
             self._save(session)
         self._finalize_if_ready(session_id)
 
+    @serialized_inference
     def _process_segment(self, session_id, index):
         session = self._load(session_id)
         if (
@@ -2646,6 +2653,7 @@ class StreamSessionManager:
             return True
         return False
 
+    @serialized_inference
     def _finalize_if_ready(self, session_id):
         session = self._load(session_id)
         if session is None or session.get("status") in TERMINAL_SESSION_STATES:

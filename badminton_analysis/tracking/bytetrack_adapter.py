@@ -18,6 +18,8 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
+from .association_policy import association_policy
+
 
 @dataclass
 class _DetectionBatch:
@@ -66,14 +68,15 @@ class ByteTrackAdapter:
         track_high_thresh: float = 0.25,
         track_low_thresh: float = 0.10,
         new_track_thresh: float = 0.30,
-        # Far-court badminton poses change scale and overlap quickly between
-        # 10 Hz samples. The generic 0.80 IoU gate fragments a player even
-        # when the pose detector keeps seeing them; 0.50 retains that temporal
-        # continuity while the fixed-court roster remains the second guard.
-        match_thresh: float = 0.50,
+        # Ultralytics uses cost = 1 - IoU * detection score: a larger
+        # maximum cost is more permissive, not a stricter minimum IoU.
+        match_thresh: Optional[float] = None,
         tracker_factory: Optional[Callable[[Any], Any]] = None,
+        sport_id: str = "badminton",
     ):
         self.fps = float(fps)
+        if match_thresh is None:
+            match_thresh = association_policy(sport_id)["bytetrack_match_cost_limit"]
         self.config = {
             "track_buffer": int(track_buffer_frames),
             "track_high_thresh": float(track_high_thresh),

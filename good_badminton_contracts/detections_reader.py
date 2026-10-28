@@ -34,6 +34,10 @@ def collect_track_position_evidence(
     result = {
         "has_spatial_tracks": False,
         "source_frames": 0,
+        # source_frames is the legacy row-count alias, not the video frame count.
+        "sampled_frames": 0,
+        "max_source_frame": None,
+        "max_time_sec": None,
         "match_mode": None,
         "thresholds": {
             "min_detection_confidence": float(min_detection_confidence),
@@ -54,7 +58,15 @@ def collect_track_position_evidence(
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            result["source_frames"] += 1
+            result["sampled_frames"] += 1
+            result["source_frames"] = result["sampled_frames"]
+            # Keep the full source timeline, including rows without usable tracks.
+            frame = _integer_or_none(record.get("frame"))
+            time_sec = _float_or_none(record.get("time_sec"))
+            if frame is not None and frame >= 0:
+                result["max_source_frame"] = max(result["max_source_frame"] or 0, frame)
+            if time_sec is not None and time_sec >= 0:
+                result["max_time_sec"] = max(result["max_time_sec"] or 0.0, time_sec)
             spatial = record.get("spatial") or {}
             tracks = spatial.get("tracks")
             if not isinstance(tracks, list):
@@ -62,8 +74,6 @@ def collect_track_position_evidence(
             result["has_spatial_tracks"] = True
             if result["match_mode"] is None:
                 result["match_mode"] = (spatial.get("match") or {}).get("mode")
-            frame = _integer_or_none(record.get("frame"))
-            time_sec = _float_or_none(record.get("time_sec"))
             for track in tracks:
                 if not isinstance(track, dict) or not track.get("track_id"):
                     continue
@@ -164,7 +174,7 @@ def _float_or_none(value):
 def _integer_or_none(value):
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

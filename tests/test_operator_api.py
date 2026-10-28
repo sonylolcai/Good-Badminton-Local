@@ -68,11 +68,13 @@ class FakeDatabase:
 
 class OperatorApiTests(unittest.TestCase):
     def setUp(self):
+        auth = patch.dict("os.environ", {"GOOD_BADMINTON_LEGACY_OPERATOR_API_KEY": "test-legacy-operator-service-key-32chars"})
+        auth.start(); self.addCleanup(auth.stop)
         self.database = FakeDatabase()
         self.patch = patch("operator_api.main.get_db", return_value=self.database)
         self.patch.start()
         self.addCleanup(self.patch.stop)
-        self.client = TestClient(app)
+        self.client = TestClient(app, headers={"Authorization":"Bearer test-legacy-operator-service-key-32chars"})
 
     def test_venue_list_is_named_json_not_positional_rows(self):
         response = self.client.get("/api/v1/venues")
