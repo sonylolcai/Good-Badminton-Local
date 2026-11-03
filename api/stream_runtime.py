@@ -627,6 +627,7 @@ class StreamProcessorFactory:
             lock_match_roster=bool(configuration.get("lock_match_roster", False)),
             match_mode=str(configuration.get("match_mode", "person_only")),
             expected_roster_count=configuration.get("expected_player_count"),
+            roster_identity_policy=configuration.get("roster_identity_policy", "individual_tracks.v1"),
             roster_stable_frames=int(configuration.get("roster_stable_frames", 3)),
             max_roster_count=int(configuration.get("max_roster_count", 4)),
             roster_discovery_seconds=float(

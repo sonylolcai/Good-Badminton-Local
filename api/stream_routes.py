@@ -40,6 +40,8 @@ def register_stream_routes(
 ) -> None:
     """Attach the versioned stream API to an application composition root."""
 
+    from .direct_preview import register_preview_routes
+    register_preview_routes(app,stream_manager,require_api_key)
     from .media_archive import archive_from_environment
     from .media_upload_guard import MediaUploadGuard
     app.add_middleware(MediaUploadGuard, manager=stream_manager)
@@ -59,10 +61,14 @@ def register_stream_routes(
     @app.get("/api/v1/health")
     def health():
         from .media_limits import health_limits
+        payload = dict(health_payload())
         return {
-            **dict(health_payload()),
+            **payload,
             "stream_processing_mode": getattr(stream_manager.processor_factory, "processing_mode", "analysis"),
             "media_limits": health_limits(stream_manager),
+            "direct_preview_version": "direct-preview.v1",
+            "roster_identity_policies": (["individual_tracks.v1", "half_court_slots.v1"]
+                                         if payload.get('sport_id') == 'badminton' else ["individual_tracks.v1"]),
             "media_archive_enabled": media_archive is not None,
             "media_archive_running": media_archive is not None and media_archive.running,
         }

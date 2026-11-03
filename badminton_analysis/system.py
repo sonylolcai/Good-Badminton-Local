@@ -85,6 +85,7 @@ class BadmintonAnalysisSystem:
                  match_mode='singles', tracker_backend='bytetrack',
                  enable_bytetrack=True, lock_match_roster=True,
                  roster_stable_frames=2, roster_discovery_seconds=3.0,
+                 roster_identity_policy='individual_tracks.v1',
                  shuttle_detector=None,
                  tracknet_measurements_path=None, huji_action_model=None,
                  huji_sample_hz=6.0, enable_huji_play_state=True,
@@ -185,6 +186,7 @@ class BadmintonAnalysisSystem:
         self.lock_match_roster = bool(lock_match_roster)
         self.roster_stable_frames = max(1, int(roster_stable_frames))
         self.roster_discovery_seconds = float(roster_discovery_seconds)
+        self.roster_identity_policy = roster_identity_policy
         if self.roster_discovery_seconds < 0.0:
             raise ValueError("roster_discovery_seconds must be non-negative")
         if output_video_style not in {'annotated', 'skeleton'}:
@@ -471,6 +473,7 @@ class BadmintonAnalysisSystem:
             lock_match_roster=self.lock_match_roster,
             roster_stable_frames=self.roster_stable_frames,
             roster_discovery_seconds=self.roster_discovery_seconds,
+            roster_identity_policy=self.roster_identity_policy,
             shuttle_enabled=self.shuttle_detector != 'none',
             movement_rally_settle_seconds=self.movement_rally_settle_seconds,
             court_dimensions=self.court_dimensions,
@@ -520,6 +523,21 @@ class BadmintonAnalysisSystem:
                 progress_callback(frame_count, total_frames)
             raise_if_cancelled(cancel_callback)
 
+        # Finalize against decoded source frames, not an optimistic container
+        # count. Keep the original count as evidence of edit-list differences.
+        if frame_count > 0:
+            declared_total_frames = total_frames
+            total_frames = frame_count
+            video_duration = frame_count / fps
+            with open(self.metadata_path, 'r', encoding='utf-8') as source:
+                finalized_metadata = json.load(source)
+            finalized_metadata['video'].update(
+                container_declared_frames=declared_total_frames,
+                total_frames=frame_count, duration_sec=video_duration,
+            )
+            write_json(self.metadata_path, finalized_metadata)
+            if progress_callback is not None:
+                progress_callback(frame_count, frame_count)
         cleanup_t0 = time.perf_counter()
         self._cleanup(cap, state_callback=state_callback)
         self._record_execution_metric("cleanup", time.perf_counter() - cleanup_t0)

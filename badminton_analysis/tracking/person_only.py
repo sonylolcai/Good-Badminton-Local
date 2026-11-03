@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 from ..analysis.fixed_camera_match import CourtMultiObjectTracker, CourtSpace
 from ..streaming.models import FinalizationContext, FrameContext, ProcessorEvent
 from .bytetrack_adapter import ByteTrackAdapter
+from .half_court_slots import HALF_COURT_SLOTS, INDIVIDUAL_TRACKS, HalfCourtSlotTracker
 
 
 # v3 adds independent sideline and baseline observation margins.  A resumed
@@ -60,6 +61,7 @@ class PersonOnlyTracker:
         max_roster_count: int = 4,
         roster_discovery_seconds: float = 8.0,
         roster_reacquire_seconds: float = 1.0,
+        roster_identity_policy: str = INDIVIDUAL_TRACKS,
         court_dimensions_m=None,
         calibration_world_points_m=None,
         athlete_observation_region: str = "full_court_athletes",
@@ -148,7 +150,11 @@ class PersonOnlyTracker:
             if tracker_backend == "bytetrack"
             else None
         )
-        self._tracker = CourtMultiObjectTracker(
+        if roster_identity_policy not in {INDIVIDUAL_TRACKS, HALF_COURT_SLOTS}:
+            raise ValueError("Unsupported roster identity policy")
+        self.roster_identity_policy = roster_identity_policy
+        tracker_class = HalfCourtSlotTracker if roster_identity_policy == HALF_COURT_SLOTS else CourtMultiObjectTracker
+        self._tracker = tracker_class(
             self.court_space,
             fps=fps,
             sport_id=sport_id,
@@ -452,6 +458,7 @@ class PersonOnlyTracker:
             "max_roster_count": self.max_roster_count,
             "roster_discovery_seconds": self.roster_discovery_seconds,
             "roster_reacquire_seconds": self.roster_reacquire_seconds,
+            "roster_identity_policy": self.roster_identity_policy,
             "association_runtime_checkpointable": self._byte_tracker is None,
             "min_confirmed_detections": self.min_confirmed_detections,
             "reliable_coverage_threshold": self.reliable_coverage_threshold,
@@ -470,6 +477,8 @@ class PersonOnlyTracker:
             raise ValueError("unsupported person_only checkpoint")
         if state.get("tracker_backend") != self.tracker_backend:
             raise ValueError("person_only checkpoint tracker backend does not match")
+        if state.get("roster_identity_policy", INDIVIDUAL_TRACKS) != self.roster_identity_policy:
+            raise ValueError("person_only checkpoint identity policy does not match")
         expected_geometry = {
             "sport_id": self.sport_id,
             "session_mode": self.session_mode,
@@ -605,7 +614,7 @@ class PersonOnlyTracker:
                 "roster": self._tracker.roster_summary(),
                 "measurement_statuses": ["detected", "predicted", "missing"],
                 "lifecycle_states": sorted(PERSON_ONLY_STATES),
-                "identity_policy": "no forced user, team, side, singles, or doubles identity",
+                "identity_policy": self.roster_identity_policy,
             },
             "tracks": public_tracks,
             "track_candidates": self.track_candidates(),
@@ -646,7 +655,7 @@ class PersonOnlyTracker:
             association_source = str((track.get("association") or {}).get("source") or "")
             if previous_status in {"predicted", "missing"}:
                 record["interruption_count"] += 1
-                if association_source != "bytetrack":
+                if association_source != "bytetrack" and self.roster_identity_policy != HALF_COURT_SLOTS:
                     record["reassociation_uncertain_count"] += 1
                     lifecycle = "reassociation_uncertain"
                 else:

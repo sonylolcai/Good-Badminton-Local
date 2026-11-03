@@ -15,6 +15,30 @@ from webui.pipeline import _prepare_tracknet_v3_raw, resolve_full_video_models
 
 
 class LightweightExportTests(unittest.TestCase):
+    def test_partial_tail_has_no_padded_or_duplicate_frames_even_with_wrong_container_count(self):
+        class Capture:
+            def __init__(self, declared): self.declared=declared; self.index=0
+            def isOpened(self): return True
+            def get(self, key):
+                return {cv2.CAP_PROP_FRAME_COUNT:self.declared,cv2.CAP_PROP_FRAME_WIDTH:32,cv2.CAP_PROP_FRAME_HEIGHT:32}.get(key, 0)
+            def read(self):
+                if self.index==10:return False,None
+                self.index+=1
+                return True,np.zeros((32,32,3),dtype=np.uint8)
+            def release(self): pass
+        for declared in (7,15):
+            with self.subTest(declared=declared):
+                engine=object.__new__(LightweightTrackNetDetector)
+                engine.bg_tensor=torch.zeros((3,288,512));engine.device=torch.device('cpu')
+                engine.seq_len=8;engine.heatmap_threshold=.5;engine.subpixel_centroid=True
+                engine.model=lambda batch:torch.zeros((len(batch),8,288,512))
+                with patch('cv2.VideoCapture',return_value=Capture(declared)):
+                    rows=engine.predict_video('whole.mp4',batch_chunks=2,interpolate_isolated_missing=False)
+                self.assertEqual([r['frame_index'] for r in rows],list(range(10)))
+                self.assertEqual(engine.last_decoded_frame_count,10)
+                with tempfile.TemporaryDirectory() as root:
+                    export_raw(rows,10,Path(root)/'raw.csv')
+
     def test_complete_short_batch_is_not_lost(self):
         with tempfile.TemporaryDirectory() as root:
             video = Path(root) / 'eight_frames.mp4'

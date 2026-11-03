@@ -30,6 +30,8 @@ class VisionModeSynchronizer:
         """Validate and return the profile-derived visual configuration."""
         normalized = dict(configuration)
         profile = self.vision_profile
+        if normalized.get("roster_identity_policy") == "half_court_slots.v1" and profile.sport_id != "badminton":
+            raise ValueError("Half-court slots are supported only by the badminton match profile")
         requested_sport = normalized.get("sport_id")
         if requested_sport is not None and requested_sport != profile.sport_id:
             raise ValueError(

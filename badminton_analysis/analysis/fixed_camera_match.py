@@ -94,6 +94,7 @@ class CourtSpace:
         row = "rear" if y < self.length_m / 3 else "front" if y > self.length_m * 2 / 3 else "mid"
         return f"{row}_{column}"
 
+
     def contains(self, court_xy, margin_m=0.0):
         if court_xy is None:
             return False
@@ -1993,6 +1994,7 @@ class FixedCameraMatchPipeline:
         athlete_observation_lateral_margin_m=None,
         athlete_observation_baseline_margin_m=None,
         sport_id="badminton",
+        roster_identity_policy="individual_tracks.v1",
     ):
         if match_mode not in {"auto", "singles", "doubles"}:
             raise ValueError(
@@ -2030,7 +2032,15 @@ class FixedCameraMatchPipeline:
             if tracker_backend == "bytetrack"
             else None
         )
-        self.tracker = CourtMultiObjectTracker(
+        if roster_identity_policy == "half_court_slots.v1":
+            # Import lazily: the slot implementation shares this base tracker.
+            from ..tracking.half_court_slots import HalfCourtSlotTracker
+            tracker_class = HalfCourtSlotTracker
+        elif roster_identity_policy == "individual_tracks.v1":
+            tracker_class = CourtMultiObjectTracker
+        else:
+            raise ValueError("Unsupported roster_identity_policy")
+        self.tracker = tracker_class(
             self.court_space,
             fps=fps,
             sport_id=sport_id,

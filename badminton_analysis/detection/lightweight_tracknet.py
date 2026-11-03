@@ -278,7 +278,7 @@ class LightweightTrackNetDetector:
                 f_indices = chunk_indexes[b_idx]
                 for s_idx in range(self.seq_len):
                     f_num = f_indices[s_idx]
-                    if f_num >= total_frames:
+                    if f_num < 0:
                         continue  # Skip padded frames
                     h_map = pred_heatmaps[b_idx, s_idx]
                     vis, x, y, conf = self._extract_coordinate_from_heatmap(h_map, img_scaler)
@@ -324,6 +324,9 @@ class LightweightTrackNetDetector:
             cur_frame_num += 1
 
         cap.release()
+        # Container frame counts are estimates (edit lists can disagree with
+        # decoded frames). The decoder clock owns the actual input sequence.
+        self.last_decoded_frame_count = cur_frame_num
 
         # Handle tail incomplete sequence by repeating the last frame
         if raw_frames_buffer:
@@ -331,7 +334,7 @@ class LightweightTrackNetDetector:
             last_idx = frame_idx_buffer[-1]
             while len(raw_frames_buffer) < self.seq_len:
                 raw_frames_buffer.append(last_t)
-                frame_idx_buffer.append(last_idx + 1)
+                frame_idx_buffer.append(-1)
             chunk_cat = torch.cat([self.bg_tensor.cpu()] + raw_frames_buffer, dim=0)
             chunk_tensors.append(chunk_cat)
             chunk_indexes.append(list(frame_idx_buffer))
