@@ -18,7 +18,10 @@ def register_runtime_control(app, manager, archive, require_api_key):
             raise ValueError('result callbacks require media archiving')
         from .result_notifications import ResultNotifications
         notifications = ResultNotifications(manager, archive, url=callback_url,
-            secret=os.environ.get('GPU_RESULT_CALLBACK_SECRET', ''))
+            secret=os.environ.get('GPU_RESULT_CALLBACK_SECRET', ''),
+            environment_urls={name: os.environ['GPU_RESULT_CALLBACK_' + name.upper() + '_URL']
+                              for name in ('test', 'production')
+                              if os.environ.get('GPU_RESULT_CALLBACK_' + name.upper() + '_URL')})
         if manager.worker_running:
             notifications.start()
         app.router.add_event_handler('shutdown', notifications.stop)
