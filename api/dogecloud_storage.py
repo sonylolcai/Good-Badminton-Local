@@ -56,12 +56,12 @@ class DogeCloudObjectStore:
         self._lock = threading.Lock()
 
     @classmethod
-    def from_environment(cls):
+    def from_environment(cls, *, environment=None):
         load_dogecloud_environment()
         app_env = os.environ.get("GOOD_BADMINTON_APP_ENV", "development")
         if app_env not in {"development", "test", "production"}:
             raise ValueError("invalid application environment")
-        environment = os.environ.get("DOGECLOUD_MEDIA_ENVIRONMENT") or ("production" if app_env == "production" else "test")
+        environment = environment or os.environ.get("DOGECLOUD_MEDIA_ENVIRONMENT") or ("production" if app_env == "production" else "test")
         if environment not in {"test", "production"}:
             raise ValueError("invalid media environment")
         return cls(access_key=os.environ.get("DOGECLOUD_ACCESS_KEY", ""),

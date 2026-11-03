@@ -216,7 +216,8 @@ class StreamMediaArchive:
                      "analysis_quality_verified": False, "attempts": int(old.get("attempts", 0)) + 1}
             write_json(root / "status.json", state)
             try:
-                if getattr(self.storage, "allowed_root", None):
+                if (getattr(self.storage, "allowed_root", None)
+                        or getattr(self.storage, "requires_media_identity", False)):
                     if not snapshot.get("media_identity"):
                         raise MediaValidationError("DogeCloud archive requires a business-issued media identity")
                     try:
@@ -465,6 +466,6 @@ def archive_from_environment(manager):
     if os.environ.get("GOOD_BADMINTON_MEDIA_ARCHIVE_ENABLED", "0").lower() not in {"1", "true"}:
         return None
     return StreamMediaArchive(
-        manager, oss_from_environment(manager.data_dir / "oss-checkpoints"),
+        manager, oss_from_environment(manager.data_dir / "oss-checkpoints", allow_environment_routing=True),
         prefix=os.environ.get("GOOD_BADMINTON_OSS_PREFIX", "match-media"),
     )

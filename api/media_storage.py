@@ -103,11 +103,58 @@ class OSSObjectStore:
         return {"size_bytes": head.content_length, "sha256": head.headers.get("x-oss-meta-sha256")}
 
 
-def oss_from_environment(checkpoint_dir):
+class EnvironmentObjectStore:
+    """Route business-issued media keys through separately constrained stores.
+
+    The shared GPU may serve both environments. Each child still enforces its
+    own immutable root; replay clients keep their single-environment store.
+    """
+    requires_media_identity = True
+
+    def __init__(self, stores):
+        if not stores or not set(stores) <= {"testVideo", "productionVideo"}:
+            raise ValueError("invalid media environment stores")
+        self.stores = dict(stores)
+        if any(store.allowed_root != root for root, store in self.stores.items()):
+            raise ValueError("media store root differs from route")
+
+    def _store(self, key):
+        key = safe_key(key)
+        store = self.stores.get(key.split("/", 1)[0])
+        if store is None:
+            raise ValueError("object key is outside enabled media environments")
+        store._key(key)
+        return store
+
+    def _key(self, key):
+        return self._store(key)._key(key)
+
+    def upload(self, key, source):
+        return self._store(key).upload(key, source)
+
+    def download(self, key, destination):
+        return self._store(key).download(key, destination)
+
+    def head(self, key):
+        return self._store(key).head(key)
+
+
+def oss_from_environment(checkpoint_dir, *, allow_environment_routing=False):
     from .dogecloud_storage import DogeCloudObjectStore, load_dogecloud_environment
     load_dogecloud_environment()
     provider = os.environ.get("GOOD_BADMINTON_MEDIA_STORAGE_PROVIDER", "aliyun")
     if provider == "dogecloud":
+        enabled = os.environ.get("GOOD_BADMINTON_MEDIA_ARCHIVE_ENVIRONMENTS")
+        if allow_environment_routing and enabled is not None:
+            environments = enabled.split(",")
+            if (not environments or len(set(environments)) != len(environments)
+                    or not set(environments) <= {"test", "production"}):
+                raise ValueError("invalid enabled media archive environments")
+            return EnvironmentObjectStore({
+                "productionVideo" if name == "production" else "testVideo":
+                    DogeCloudObjectStore.from_environment(environment=name)
+                for name in environments
+            })
         return DogeCloudObjectStore.from_environment()
     if provider != "aliyun":
         raise ValueError("unknown media storage provider")
