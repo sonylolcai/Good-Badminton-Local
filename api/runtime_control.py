@@ -18,11 +18,29 @@ def register_runtime_control(app, manager, archive, require_api_key):
             raise ValueError('result callbacks require media archiving')
         from .result_notifications import ResultNotifications
         notifications = ResultNotifications(manager, archive, url=callback_url,
-            secret=os.environ.get('GPU_RESULT_CALLBACK_SECRET', ''))
+            secret=os.environ.get('GPU_RESULT_CALLBACK_SECRET', ''),
+            environment_urls={name: os.environ['GPU_RESULT_CALLBACK_' + name.upper() + '_URL']
+                              for name in ('test', 'production')
+                              if os.environ.get('GPU_RESULT_CALLBACK_' + name.upper() + '_URL')})
         if manager.worker_running:
             notifications.start()
         app.router.add_event_handler('shutdown', notifications.stop)
     app.state.result_notifications = notifications
+    from .capture_notifications import CaptureNotifications, lifecycle_url
+    lifecycle_target = os.environ.get('GPU_CAPTURE_LIFECYCLE_CALLBACK_URL', '')
+    if not lifecycle_target and callback_url:
+        lifecycle_target = lifecycle_url(callback_url)
+    capture_notifications = None
+    if lifecycle_target:
+        capture_notifications = CaptureNotifications(manager, url=lifecycle_target,
+            secret=os.environ.get('GPU_RESULT_CALLBACK_SECRET', ''),
+            environment_urls={name: lifecycle_url(os.environ['GPU_RESULT_CALLBACK_' + name.upper() + '_URL'])
+                              for name in ('test', 'production')
+                              if os.environ.get('GPU_RESULT_CALLBACK_' + name.upper() + '_URL')})
+        if manager.worker_running:
+            capture_notifications.start()
+        app.router.add_event_handler('shutdown', capture_notifications.stop)
+    app.state.capture_notifications = capture_notifications
 
     @app.middleware('http')
     async def guard_new_sessions(request, call_next):
@@ -70,13 +88,19 @@ def register_runtime_control(app, manager, archive, require_api_key):
                 except Exception:
                     unknown += 1
         callbacks = notifications.pending_count() if notifications else 0
+        callbacks += capture_notifications.pending_count() if capture_notifications else sum(
+            bool(session.get('capture_lifecycle_event')) for session in sessions)
+        visual_results = getattr(manager, 'visual_result_service', None)
+        pending_visual_results = visual_results.outstanding_count(sessions) if visual_results else 0
         output = {'accepting_sessions': app.state.accepting_sessions, 'active_stream_sessions': active,
                   'active_jobs': running, 'pending_jobs': pending, 'pending_archives': archival,
-                  'pending_callbacks': callbacks, 'blocked_callbacks': notifications.blocked_count() if notifications else 0, 'unknown_workloads': unknown,
+                  'pending_callbacks': callbacks, 'blocked_callbacks': (notifications.blocked_count() if notifications else 0) + (capture_notifications.blocked_count() if capture_notifications else 0), 'unknown_workloads': unknown,
+                  'pending_visual_results': pending_visual_results,
                   'inflight_admissions': app.state.inflight_admissions,
-                  'busy': bool(active + archival + pending + running + callbacks + unknown + app.state.inflight_admissions),
+                  'busy': bool(active + archival + pending + running + callbacks + unknown + pending_visual_results + app.state.inflight_admissions),
                   'upload_token_ttl_seconds': int(os.environ.get('GOOD_BADMINTON_UPLOAD_TOKEN_TTL_SECONDS', '0')),
                   'callback_configured': notifications is not None,
+                  'capture_lifecycle_callback_configured': capture_notifications is not None,
                   'analysis_archive_enabled': bool(notifications and notifications.archive_results), 'gpu': None}
         if telemetry:
             try:
@@ -96,6 +120,7 @@ def register_runtime_control(app, manager, archive, require_api_key):
     @app.post('/api/v1/runtime/retry-notifications', dependencies=[Depends(require_api_key)])
     def retry_notifications():
         if notifications: notifications.retry_blocked()
+        if capture_notifications: capture_notifications.retry_blocked()
         return snapshot(telemetry=False)
 
     @app.post('/api/v1/runtime/drain', dependencies=[Depends(require_api_key)])

@@ -10,11 +10,13 @@ single adapter so their stream contract cannot drift.
 from __future__ import annotations
 
 import json
+import gzip
 from typing import Callable, Mapping, Optional
 
 from fastapi import Depends, File, Form, Header, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
+from .gpu_stage_timing import stage, summary as timing_summary, UploadTimingMiddleware
 from .stream_errors import StreamSessionError, validation_error
 from badminton_analysis.inference_policy import execution_profile
 from .stream_models import MAX_SEGMENT_BYTES, validate_create_request
@@ -40,9 +42,14 @@ def register_stream_routes(
 ) -> None:
     """Attach the versioned stream API to an application composition root."""
 
+    from .direct_preview import register_preview_routes
+    register_preview_routes(app,stream_manager,require_api_key)
+    from .visual_result import register_visual_result_routes, implementation as visual_implementation
+    register_visual_result_routes(app, stream_manager, require_api_key)
     from .media_archive import archive_from_environment
     from .media_upload_guard import MediaUploadGuard
     app.add_middleware(MediaUploadGuard, manager=stream_manager)
+    app.add_middleware(UploadTimingMiddleware,manager=stream_manager)
     media_archive = media_archive or archive_from_environment(stream_manager)
     app.state.media_archive = media_archive
     from .runtime_control import register_runtime_control
@@ -59,13 +66,51 @@ def register_stream_routes(
     @app.get("/api/v1/health")
     def health():
         from .media_limits import health_limits
+        payload = dict(health_payload())
         return {
-            **dict(health_payload()),
+            **payload,
             "stream_processing_mode": getattr(stream_manager.processor_factory, "processing_mode", "analysis"),
             "media_limits": health_limits(stream_manager),
+            "direct_preview_version": "direct-preview.v1",
+            "gpu_stage_timing_version":"gpu-stage-timing.v1",
+            "segment_receipts_version": "segment-receipts.v1",
+            "capture_lease_version": "capture-lease.v1",
+            "capture_lifecycle_callback_configured": app.state.capture_notifications is not None,
+            "candidate_photo_policies": ["same_frame_roster.v1"],
+            "visual_result_version": ("stream-visual-result.v1"
+                if app.state.visual_result_service.enabled else None),
+            "visual_metrics_implementation_sha256": (visual_implementation()
+                if app.state.visual_result_service.enabled else None),
+            "visual_result_identity_policies": (["individual_tracks.v1", "half_court_slots.v1"]
+                if app.state.visual_result_service.enabled else []),
+            "roster_identity_policies": (["individual_tracks.v1", "half_court_slots.v1", "anchored_roster.v1"]
+                                         if payload.get('sport_id') == 'badminton' else ["individual_tracks.v1"]),
             "media_archive_enabled": media_archive is not None,
             "media_archive_running": media_archive is not None and media_archive.running,
         }
+
+    @app.get('/api/v1/stream-sessions/{session_id}/photo-roster', dependencies=[Depends(require_api_key)])
+    def photo_roster(session_id: str):
+        from .same_frame_photos import SameFramePhotoCollector
+        session = stream_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(404, 'session not found')
+        config = session.get('configuration') or {}
+        if config.get('candidate_photo_policy') != 'same_frame_roster.v1':
+            raise HTTPException(409, 'same-frame photos were not requested')
+        if session.get('continuity_epoch', 0) != 0:
+            raise HTTPException(422, {'code': 'same_frame_photo_continuity_unverified'})
+        collector = SameFramePhotoCollector(stream_manager._session_dir(session_id)/'candidate_photos',
+                                           count=config.get('expected_player_count'), session_id=session_id)
+        try:
+            value = collector._read()
+        except ValueError:
+            raise HTTPException(422, {'code': 'same_frame_photo_evidence_invalid'}) from None
+        if value is None:
+            if session.get('status') in {'finalized', 'partial'}:
+                raise HTTPException(422, {'code': 'incomplete_same_frame_photos'})
+            raise HTTPException(409, 'same-frame photos are not ready')
+        return value
 
     def require_media_archive(session_id):
         if stream_manager.get_session(session_id) is None:
@@ -133,6 +178,7 @@ def register_stream_routes(
         "/api/v1/stream-sessions/{session_id}/segments/{segment_index}",
         dependencies=[Depends(require_upload_access)],
     )
+    @stage('http_segment_handler',manager=stream_manager)
     async def submit_stream_segment(
         session_id: str,
         segment_index: int,
@@ -233,6 +279,21 @@ def register_stream_routes(
         response_status, payload = stream_manager.abandon_repair(session_id, request_id)
         return JSONResponse(status_code=response_status, content=payload)
 
+    @app.post('/api/v1/stream-sessions/{session_id}/capture-lease', dependencies=[Depends(require_api_key)])
+    def register_capture_lease(session_id: str, body: dict):
+        if app.state.capture_notifications is None:
+            raise HTTPException(503, 'capture lifecycle callback is not configured')
+        return stream_manager.register_capture_lease(session_id, body)
+
+    @app.post('/api/v1/stream-sessions/{session_id}/capture-signals')
+    def capture_signal(session_id: str, body: dict, x_upload_token: Optional[str] = Header(default=None)):
+        # Management keys cannot impersonate a terminal's live recording signal.
+        return stream_manager.capture_signal(session_id, body, x_upload_token)
+
+    @app.post('/api/v1/stream-sessions/{session_id}/capture-interrupt', dependencies=[Depends(require_api_key)])
+    def interrupt_capture(session_id: str, body: dict):
+        return stream_manager.interrupt_capture(session_id, body)
+
     @app.post(
         "/api/v1/stream-sessions/{session_id}/upload-authorization",
         dependencies=[Depends(require_api_key)],
@@ -255,6 +316,18 @@ def register_stream_routes(
         return stream_manager.get_segment_receipt(session_id, segment_index)
 
     @app.get(
+        '/api/v1/stream-sessions/{session_id}/segment-receipts',
+        dependencies=[Depends(require_api_key)],
+    )
+    async def get_segment_receipts(session_id: str, indexes: str):
+        if len(indexes) > 128:
+            raise validation_error('bulk receipt indexes exceed limit', analysis_session_id=session_id)
+        parts = indexes.split(',')
+        if not 1 <= len(parts) <= 15 or any(not part.isascii() or not part.isdecimal() for part in parts):
+            raise validation_error('invalid bulk receipt indexes', analysis_session_id=session_id)
+        return stream_manager.get_segment_receipts(session_id, [int(part) for part in parts])
+
+    @app.get(
         "/api/v1/stream-sessions/{session_id}/events",
         dependencies=[Depends(require_api_key)],
     )
@@ -262,6 +335,7 @@ def register_stream_routes(
         session_id: str,
         cursor: Optional[str] = None,
         limit: int = 100,
+        accept_encoding: str = Header(default=''),
     ):
         response_status, payload = read_events_handler(
             stream_manager,
@@ -269,7 +343,21 @@ def register_stream_routes(
             cursor=cursor,
             limit=limit,
         )
-        return JSONResponse(status_code=response_status, content=payload)
+        response = JSONResponse(status_code=response_status, content=payload, headers={'Vary': 'Accept-Encoding'})
+        # Compress only anonymous event pages. Existing clients still receive
+        # plain JSON, and model execution/stream evidence remain unchanged.
+        for item in accept_encoding.lower().split(','):
+            parts = item.strip().split(';')
+            if parts[0] != 'gzip':
+                continue
+            try:
+                quality = next((float(p.strip()[2:]) for p in parts[1:] if p.strip().startswith('q=')), 1.0)
+            except ValueError:
+                quality = 0.0
+            if quality > 0 and len(response.body) >= 1024:
+                return Response(gzip.compress(response.body, compresslevel=1, mtime=0), status_code=response_status,
+                                media_type='application/json', headers={'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding'})
+        return response
 
     @app.get(
         "/api/v1/stream-sessions/{session_id}/trace",
@@ -281,7 +369,9 @@ def register_stream_routes(
         path = stream_manager.trace_path(session_id)
         if path is None:
             raise HTTPException(status_code=404, detail="Stream trace is not available")
-        return FileResponse(path, media_type="application/json", filename=path.name)
+        trace=json.loads(path.read_text(encoding='utf-8'))
+        trace['gpu_stage_timing']=timing_summary(path.parent)
+        return JSONResponse(trace)
 
     @app.get(
         "/api/v1/stream-sessions/{session_id}/candidate-photos/{track_id}",

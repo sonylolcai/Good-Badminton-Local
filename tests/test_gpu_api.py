@@ -28,6 +28,7 @@ class GpuApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
+        self.assertIn("badminton",response.json()["supported_sport_ids"])
 
     def test_job_submission_requires_api_key(self):
         response = self.client.post("/api/v1/jobs")

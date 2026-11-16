@@ -64,7 +64,9 @@ class ShuttlecockPredictionTests(unittest.TestCase):
             "status": "detected",
             "confidence": 0.9,
             "court_xy_m": [2.0, 2.0],
+            "image_xy": [150, 330],
             "location_evidence": {
+                "confidence": 0.9,
                 "is_current_measurement": True,
                 "bbox_xyxy": [80, 30, 200, 330],
                 "hands_image": {"left": None, "right": [150, 160]},

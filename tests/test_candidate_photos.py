@@ -68,6 +68,20 @@ def _event(*, frontal: bool | None, confidence: float = 0.9, event_type: str = "
 
 
 class CandidatePhotoCollectorTests(unittest.TestCase):
+    def test_unbeatable_selection_skips_sharpness_work_without_changing_photo(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            collector = CandidatePhotoCollector(Path(temporary))
+            frame = np.zeros((128, 100, 3), dtype=np.uint8)
+            collector.attach(frame, _context(1), [_event(frontal=True)])
+            before = (Path(temporary) / 'track_001.jpg').read_bytes()
+            state = collector.snapshot_state()
+            with patch.object(collector, '_sharpness', side_effect=AssertionError('unnecessary image work')):
+                result = collector.attach(frame, _context(2), [_event(frontal=False, confidence=1)])[0]
+            self.assertNotIn('candidate_photo', result.data)
+            self.assertEqual(collector.snapshot_state(), state)
+            self.assertEqual((Path(temporary) / 'track_001.jpg').read_bytes(), before)
+
     def test_frontal_pose_wins_over_a_higher_quality_side_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
             collector = CandidatePhotoCollector(Path(temporary))

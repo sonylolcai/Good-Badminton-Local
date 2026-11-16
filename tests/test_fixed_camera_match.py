@@ -39,6 +39,18 @@ class FixedCameraMatchTests(unittest.TestCase):
                 recovered = court.image_to_court(court.court_to_image(point))
                 self.assertEqual(court.zone_for(recovered), expected_zone)
 
+    def test_half_court_zone_folds_around_net_for_both_sides(self):
+        court = CourtSpace([(100, 80), (540, 80), (620, 620), (20, 620)])
+        # Far-court net player (y=5.2m, 1.5m from net) and near-court net player (y=8.2m, 1.5m from net)
+        self.assertEqual(court.half_court_zone_for((3.05, 5.2)), "front_center")
+        self.assertEqual(court.half_court_zone_for((3.05, 8.2)), "front_center")
+        # Far-court mid (y=3.5m, 3.2m from net) and near-court mid (y=9.9m, 3.2m from net)
+        self.assertEqual(court.half_court_zone_for((1.0, 3.5)), "mid_left")
+        self.assertEqual(court.half_court_zone_for((5.1, 9.9)), "mid_right")
+        # Far-court baseline (y=0.8m, 5.9m from net) and near-court baseline (y=12.6m, 5.9m from net)
+        self.assertEqual(court.half_court_zone_for((1.0, 0.8)), "rear_left")
+        self.assertEqual(court.half_court_zone_for((5.1, 12.6)), "rear_right")
+
     def test_track_id_persists_while_player_crosses_any_zone(self):
         pipeline = FixedCameraMatchPipeline(
             [(0, 0), (610, 0), (610, 1340), (0, 1340)], fps=10

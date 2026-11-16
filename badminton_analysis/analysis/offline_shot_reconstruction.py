@@ -16,6 +16,8 @@ import json
 import math
 from pathlib import Path
 from statistics import median
+from .court_contact_gate import scoped_rows, external_hand_is_nearest, valid_quad
+from .rally_activity import find_settle_terminals, derive_rally_activity
 from typing import Iterable
 
 from .huji_play_state import HUJI_PLAY_STATE_FILENAME, load_huji_play_state, terminal_play_context
@@ -28,7 +30,7 @@ RALLY_FILENAME = "rallies_v2.jsonl"
 TERMINAL_CANDIDATE_FILENAME = "terminal_candidates_v1.jsonl"
 PLAYER_CONTACT_SUMMARY_FILENAME = "player_contact_summary_v1.json"
 RALLY_BOUNDARY_REFERENCE_FILENAME = "rally_boundary_reference_user_review.jsonl"
-DERIVATION_VERSION = "2.4"
+DERIVATION_VERSION = "2.6"
 
 
 def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_state_path=None):
@@ -45,10 +47,14 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
     width, height = video_dimensions(detections_path.parent)
     px_scale = _pixel_scale(width, height)
     track_rows = reconstruct_shuttle_track(rows, fps=fps, width=width, height=height, px_scale=px_scale)
-    events = build_shot_events(rows, track_rows, fps=fps, px_scale=px_scale)
-    events = infer_missing_shuttle_events(rows, events)
-    events = refresh_event_evidence(events, track_rows)
     court_polygon = _court_polygon_from_metadata(detections_path.parent)
+    # Metadata with an invalid/missing quad fails closed. Pre-metadata legacy
+    # fixtures remain readable but are not a calibrated-contact claim.
+    contact_polygon = court_polygon if court_polygon is not None else ([] if (detections_path.parent / 'metadata.json').exists() else None)
+    hit_rows = scoped_rows(rows, contact_polygon) if contact_polygon is not None else rows
+    events = build_shot_events(rows, track_rows, fps=fps, px_scale=px_scale, court_polygon=contact_polygon)
+    events = infer_missing_shuttle_events(hit_rows, events)
+    events = refresh_event_evidence(events, track_rows)
     terminal_candidates = detect_rally_terminal_candidates(
         track_rows,
         raw_rows=rows,
@@ -56,18 +62,21 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
         px_scale=px_scale,
     )
     terminal_candidates = apply_huji_play_state_context(terminal_candidates, play_state_rows)
-    # A static visual false-positive is especially harmful here: it turns one
-    # rally into two.  Every accepted boundary retains its evidence source and
-    # confidence; manual references are never an input to this calculation.
-    rallies = build_rallies(
-        track_rows,
-        events,
-        court_polygon=court_polygon,
-        terminal_candidates=terminal_candidates,
-        rows=rows,
-        fps=fps,
-        px_scale=px_scale,
-    )
+    # Calibrated runs use one active-play state machine, not the legacy
+    # next-candidate-implies-start grouping. Raw candidates remain reviewable.
+    if valid_quad(court_polygon):
+        activity = derive_rally_activity(events, track_rows, terminal_candidates, pixel_scale=px_scale)
+        rallies = activity['rallies']
+        for event in events:
+            event['original_rally_id'] = event.get('rally_id')
+            event.pop('shot_index_in_rally', None)
+            event.update(activity['assignments'][event['event_id']])
+        write_json(output_dir / 'rally_activity_v1.json', activity)
+    else:
+        # Compatibility for old fixtures without calibrated court evidence.
+        rallies = build_rallies(track_rows, events, court_polygon=court_polygon,
+                                terminal_candidates=terminal_candidates, rows=rows,
+                                fps=fps, px_scale=px_scale)
     track_path = output_dir / SHUTTLE_TRACK_FILENAME
     event_path = output_dir / SHOT_EVENT_FILENAME
     rally_path = output_dir / RALLY_FILENAME
@@ -116,6 +125,8 @@ def build_player_contact_summary(events):
     """
     players = {}
     for event in events or []:
+        if event.get('rally_phase') not in (None, 'in_rally'):
+            continue
         hitter = event.get("hitter") or {}
         track_id = hitter.get("track_id")
         if not track_id:
@@ -252,8 +263,10 @@ def reconstruct_shuttle_track(rows, fps=30.0, width=None, height=None, max_gap_s
     return track_rows
 
 
-def build_shot_events(raw_rows, track_rows, fps=30.0, px_scale=1.0):
+def build_shot_events(raw_rows, track_rows, fps=30.0, px_scale=1.0, court_polygon=None):
     """Create conservative hit/receiver/shot-type candidates from future context."""
+    if court_polygon is not None:
+        raw_rows = scoped_rows(raw_rows, court_polygon)
     by_frame = {int(item["frame"]): item for item in track_rows}
     seeds = []
     for raw in raw_rows:
@@ -282,6 +295,9 @@ def build_shot_events(raw_rows, track_rows, fps=30.0, px_scale=1.0):
         raw = _row_at_frame(raw_rows, seed["frame"])
         track = by_frame.get(seed["frame"])
         hitter = _hitter_evidence(raw, track, seed.get("hitter_track_id"), px_scale=px_scale)
+        if court_polygon is not None and not hitter.get('track_id'):
+            # A shuttle-only turn is not an in-court person's hit action.
+            continue
         if seed.get("half_court_zone_id"):
             hitter["half_court_zone_id"] = seed["half_court_zone_id"]
         if seed.get("contact_distance_px") is not None:
@@ -695,6 +711,7 @@ def detect_rally_terminal_candidates(track_rows, raw_rows=None, court_polygon=No
                 gap_sec=gap_sec,
             )
         )
+    candidates.extend(find_settle_terminals(track_rows, raw_rows or [], court_polygon, px_scale))
     return _deduplicate_terminal_candidates(candidates)
 
 
@@ -1105,6 +1122,8 @@ def _deduplicate_seeds(seeds, min_gap_sec=0.35):
 
 def _hitter_evidence(raw, track_row, preferred_track_id, px_scale=1.0):
     tracks = ((raw or {}).get("spatial") or {}).get("tracks") or []
+    if external_hand_is_nearest(raw, (track_row or {}).get('image_xy')):
+        return {"track_id": None, "confidence": 0.0, "source": "nearest_hand_not_in_calibrated_court"}
     if preferred_track_id:
         matching = next((item for item in tracks if item.get("track_id") == preferred_track_id), None)
         if matching and matching.get("status") == "detected":
@@ -1116,6 +1135,8 @@ def _hitter_evidence(raw, track_row, preferred_track_id, px_scale=1.0):
                 "zone_id": matching.get("zone_id"),
                 "court_xy_m": matching.get("court_xy_m"),
             }
+    if preferred_track_id and (raw or {}).get('_court_hit_gate_active'):
+        return {"track_id": None, "confidence": 0.0, "source": "preferred_person_outside_calibrated_court"}
     shuttle_point = (track_row or {}).get("image_xy")
     if not shuttle_point:
         return {"track_id": None, "confidence": 0.0, "source": "no_shuttle_measurement"}

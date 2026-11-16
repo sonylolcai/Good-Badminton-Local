@@ -89,6 +89,7 @@ def create_app(
             "status": "ok",
             "service": vision_profile.service_name,
             "sport_id": vision_profile.sport_id,
+            "supported_sport_ids": [vision_profile.sport_id],
             "coordinate_system_id": vision_profile.coordinate_system_id,
             "supported_session_modes": list(vision_profile.supported_session_modes),
             "contract_versions": ["stream-session.v1"],
@@ -381,6 +382,7 @@ def _parse_options(value, *, sport_id="badminton"):
         # two from four people, then freezes the roster and Track IDs. This is
         # a timing policy only; it does not add any pose/GPU inference.
         "roster_discovery_seconds": 3.0,
+        "roster_identity_policy": "individual_tracks.v1",
         # ByteTrack is the production association source. It is invoked only
         # on the same timestamp buckets as pose/shuttle/JSONL measurement;
         # it never turns a 10/15/30 Hz task back into full-frame tracking.
@@ -393,6 +395,7 @@ def _parse_options(value, *, sport_id="badminton"):
         # A scene/action model is post-processing only.  It can run only with
         # a ball detector and a separately configured, reviewed checkpoint.
         "enable_huji_play_state": True,
+        "analysis_stage": "full",
         # Opaque business-session reference only. Participant check IDs remain
         # on the business service and never become visual identity evidence.
         "match_session_ref": None,
@@ -410,6 +413,10 @@ def _parse_options(value, *, sport_id="badminton"):
         options["analysis_sample_hz"] = options["pose_sample_hz"]
     if "shuttle_sample_hz" not in received:
         options["shuttle_sample_hz"] = options["analysis_sample_hz"]
+    if options["analysis_stage"] not in ("full", "rallies"):
+        raise HTTPException(status_code=422, detail="analysis_stage must be full or rallies")
+    if options["analysis_stage"] == "rallies" and sport_id != "badminton":
+        raise HTTPException(status_code=422, detail="rallies stage is currently available for badminton only")
     if options["pose_imgsz"] not in {640, 960, 1280}:
         raise HTTPException(status_code=422, detail="pose_imgsz must be 640, 960, or 1280")
     sample_hz = float(options["analysis_sample_hz"])
@@ -442,6 +449,13 @@ def _parse_options(value, *, sport_id="badminton"):
         options["browser_video_reencode"] = False
     if options["match_mode"] not in {"auto", "singles", "doubles"}:
         raise HTTPException(status_code=422, detail="match_mode must be auto, singles, or doubles")
+    if options["roster_identity_policy"] not in {"individual_tracks.v1", "half_court_slots.v1"}:
+        raise HTTPException(status_code=422, detail="Unsupported roster_identity_policy")
+    if options["roster_identity_policy"] == "half_court_slots.v1" and (
+        sport_id != "badminton" or options["match_mode"] not in {"singles", "doubles"}
+        or not options["lock_match_roster"]
+    ):
+        raise HTTPException(status_code=422, detail="Half-court slots require a locked singles/doubles badminton match")
     if options["tracker_backend"] not in {"court_association", "bytetrack"}:
         raise HTTPException(status_code=422, detail="tracker_backend must be court_association or bytetrack")
     if not isinstance(options["enable_bytetrack"], bool):

@@ -1,4 +1,5 @@
 """Commit terminal visual evidence under the business-allocated OSS directory."""
+from .gpu_stage_timing import summary as timing_summary
 import hashlib
 import json
 from pathlib import Path
@@ -24,6 +25,10 @@ def upload_analysis_archive(manager, storage, session):
             shutil.copyfile(source, target)
             if role == 'trace':
                 trace = json.loads(target.read_text())
+                timing=timing_summary(root)
+                if timing['anchor_count']:
+                    trace['gpu_stage_timing']=timing
+                    target.write_text(json.dumps(trace,separators=(',',':'))+'\n')
                 if trace.get('terminal_status') != session['status'] or not trace.get('finished_at'):
                     raise IOError('waiting for final trace commit')
             files.append({'role': role, 'name': name, 'sha256': sha256_file(target),

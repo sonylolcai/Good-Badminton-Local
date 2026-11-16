@@ -82,6 +82,11 @@
         "generate_annotated_video"
       ],
       "properties": {
+        "candidate_photo_policy": {
+          "type": "string",
+          "const": "same_frame_roster.v1",
+          "description": "Optional immutable same-source-frame two/four-person photo group; independent of tracking policy."
+        },
         "analysis_sample_hz": {
           "type": "integer",
           "enum": [10, 15, 30]
@@ -162,6 +167,95 @@
           "enum": ["full_court", "near_half_court"],
           "description": "The semantic world region represented by the four supplied image points."
         }
+      },
+      "allOf": [{"if": {"required": ["candidate_photo_policy"]}, "then": {"required": ["expected_player_count", "lock_match_roster"], "properties": {"expected_player_count": {"enum": [2, 4]}, "lock_match_roster": {"const": true}}}}]
+    },
+    "sameFramePhotoProof": {
+      "type": "object",
+      "required": [
+        "track_id",
+        "analysis_session_id",
+        "photo_set_id",
+        "source_segment_index",
+        "source_frame_index",
+        "source_time_sec",
+        "sha256",
+        "crop_xyxy",
+        "frozen",
+        "selection_policy"
+      ],
+      "properties": {
+        "track_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,80}$"
+        },
+        "analysis_session_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "photo_set_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_segment_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_frame_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_time_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "crop_xyxy": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "frozen": {
+          "const": true
+        },
+        "selection_policy": {
+          "const": "same_frame_roster_v1"
+        }
+      }
+    },
+    "sameFramePhotoRoster": {
+      "type": "object",
+      "required": [
+        "policy",
+        "photos"
+      ],
+      "properties": {
+        "policy": {
+          "const": "same_frame_roster.v1"
+        },
+        "photos": {
+          "type": "object",
+          "anyOf": [
+            {
+              "minProperties": 2,
+              "maxProperties": 2
+            },
+            {
+              "minProperties": 4,
+              "maxProperties": 4
+            }
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/sameFramePhotoProof"
+          }
+        }
       }
     },
     "mediaIdentity": {
@@ -198,6 +292,7 @@
         "configuration"
       ],
       "properties": {
+        "visual_result": {"type":"object","additionalProperties":false,"required":["schema_version","implementation_sha256"],"properties":{"schema_version":{"const":"stream-visual-result.v1"},"implementation_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "camera_id": { "$ref": "#/$defs/opaqueId" },
         "calibration_id": { "$ref": "#/$defs/opaqueId" },

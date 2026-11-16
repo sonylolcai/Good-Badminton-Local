@@ -13,6 +13,7 @@ lifecycle, decode, checkpoint atomicity, restore flow and event persistence.
 
 from __future__ import annotations
 
+from .gpu_stage_timing import stage, span, point
 from .inference_lock import serialized_inference
 from badminton_analysis.inference_policy import execution_profile
 
@@ -122,9 +123,11 @@ class StreamSessionManager:
         segment_timeout_seconds=None,
         hard_timeout_handler=None,
         start_worker=True,
+        capture_clock=time.time,
     ):
         from .media_limits import MediaLimits
         MediaLimits.from_environment()  # Refuse malformed safety settings at startup.
+        self.capture_clock = capture_clock
         self.data_dir = Path(data_dir).resolve()
         self.sessions_dir = self.data_dir / "stream_sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -150,6 +153,8 @@ class StreamSessionManager:
         self.hard_timeout_handler = hard_timeout_handler
         self._engines = {}
         self._event_ids = {}
+        from .event_pages import EventPageReader
+        self._event_pages = EventPageReader()
         # Cancellation cannot always interrupt a model call already executing
         # inside a third-party runtime.  It must, however, win the commit race:
         # no late result may resurrect a cancelled session or become evidence.
@@ -187,12 +192,26 @@ class StreamSessionManager:
 
     def candidate_photo_path(self, session_id, track_id):
         """Return one protected anonymous full-body crop, if it exists."""
-        if self._load(session_id) is None:
+        session = self._load(session_id)
+        if session is None:
             return None
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(track_id or "")):
             return None
-        path = (self._session_dir(session_id) / "candidate_photos" / f"{track_id}.jpg").resolve()
         parent = (self._session_dir(session_id) / "candidate_photos").resolve()
+        if (session.get("configuration") or {}).get("candidate_photo_policy") == "same_frame_roster.v1":
+            from .same_frame_photos import SameFramePhotoCollector
+            config = session["configuration"]
+            collector = SameFramePhotoCollector(parent, count=config["expected_player_count"], session_id=session_id)
+            manifest = collector._read()
+            if manifest is None or track_id not in manifest["photos"]:
+                return None
+            parent = parent / "same_frame_set"
+        elif (session.get("configuration") or {}).get("roster_identity_policy") == "anchored_roster.v1":
+            parent = parent / "anchor_set"
+            manifest = parent / "manifest.json"
+            if not manifest.is_file() or track_id not in json.loads(manifest.read_text()).get("photos", {}):
+                return None
+        path = (parent / f"{track_id}.jpg").resolve()
         if path.parent != parent or not path.is_file():
             return None
         return path
@@ -218,10 +237,16 @@ class StreamSessionManager:
 
     def _save(self, session):
         session["updated_at"] = utc_now()
+        visual_results = getattr(self, 'visual_result_service', None)
+        if (session.get('visual_result')
+                and session.get('status') in ('finalized', 'partial')):
+            session['visual_result_required'] = True
         path = self._manifest_path(session["analysis_session_id"])
         payload = (json.dumps(session, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         with self._lock:
             _durable_replace(path, payload)
+        if visual_results is not None and session.get('visual_result') and session.get('status') in ('finalized', 'partial'):
+            visual_results.notify(session['analysis_session_id'])
 
     def _load_checkpoint(self, session_id):
         path = self._checkpoint_path(session_id)
@@ -229,6 +254,7 @@ class StreamSessionManager:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    @stage('checkpoint_write')
     def _save_checkpoint(self, session_id, checkpoint):
         """Atomically persist the engine checkpoint after an accepted result."""
         path = self._checkpoint_path(session_id)
@@ -574,7 +600,7 @@ class StreamSessionManager:
         track_candidates, artifacts = self._project_status_evidence(
             session["analysis_session_id"]
         )
-        return session_status_response(
+        value = session_status_response(
             session,
             progress,
             track_candidates,
@@ -583,6 +609,13 @@ class StreamSessionManager:
             session.get("error"),
             session.get("processing_errors"),
         )
+        lease = session.get('capture_lease') or {}
+        if lease.get('state') == 'ended':
+            # Management readers need the durable input-end proof to retain
+            # partial results without mistaking them for a normal full seal.
+            value['capture_lease'] = {key: lease[key] for key in
+                ('lease_id', 'state', 'end_reason', 'expires_at', 'ended_at')}
+        return value
 
     def _project_status_evidence(self, session_id):
         """Build the frozen status projection from durable public events.
@@ -604,7 +637,10 @@ class StreamSessionManager:
             data = event.get("data") or {}
             for candidate in data.get("track_candidates") or []:
                 if candidate.get("track_id"):
-                    candidates[str(candidate["track_id"])] = dict(candidate)
+                    tid = str(candidate["track_id"])
+                    # Closing registry entries contain no photo metadata; do
+                    # not discard the committed frame/set proof at finalize.
+                    candidates[tid] = {**candidates.get(tid, {}), **dict(candidate)}
 
             if event.get("event_type") == "roster_candidate_observation":
                 track = data.get("track") or {}
@@ -640,6 +676,8 @@ class StreamSessionManager:
                                 f"/api/v1/stream-sessions/{session_id}/candidate-photos/{track_id}"
                             ),
                         }
+                        candidate["candidate_photo"].update({key: photo[key] for key in
+                            ("source_frame_index", "photo_set_id", "frozen", "sha256") if key in photo})
                     elif current.get("candidate_photo"):
                         candidate["candidate_photo"] = dict(current["candidate_photo"])
                     candidates[str(track_id)] = candidate
@@ -679,6 +717,8 @@ class StreamSessionManager:
                                 f"/api/v1/stream-sessions/{session_id}/candidate-photos/{track_id}"
                             ),
                         }
+                        candidate["candidate_photo"].update({key: photo[key] for key in
+                            ("source_frame_index", "photo_set_id", "frozen", "sha256") if key in photo})
                     elif current.get("candidate_photo"):
                         candidate["candidate_photo"] = dict(current["candidate_photo"])
                     candidates[str(track_id)] = candidate
@@ -765,6 +805,7 @@ class StreamSessionManager:
             return self.engine_factory(session, measurement, temporal, checkpoint)
         return AnalysisEngine.restore(checkpoint, measurement, temporal_processor=temporal)
 
+    @stage('engine_create_or_restore')
     def _get_engine(self, session):
         """Return the session's exclusive engine, creating it on first use."""
         session_id = session["analysis_session_id"]
@@ -856,6 +897,7 @@ class StreamSessionManager:
             tagged.append(event)
         return tagged
 
+    @stage('event_write')
     def _append_engine_events(self, session_id, events, *, continuity_epoch=0):
         """Write deterministic engine events with an explicit continuity epoch."""
         self._write_events(
@@ -914,6 +956,11 @@ class StreamSessionManager:
                     "idempotency key was reused with different request content",
                     existing["analysis_session_id"],
                 )
+            from .visual_result import validate_projection_request
+            try:
+                validate_projection_request(request)
+            except ValueError as error:
+                raise validation_error(str(error)) from None
             from .media_limits import ensure_capacity
             ensure_capacity(self, 16384)
             now = utc_now()
@@ -934,6 +981,7 @@ class StreamSessionManager:
                 "court_corners": request["court_corners"],
                 "client_reference": request.get("client_reference"),
                 "media_identity": request.get("media_identity"),
+                "visual_result": request.get("visual_result"),
                 "configuration": request["configuration"],
                 "execution_profile": execution_profile(request['configuration'].get('sport_id', 'badminton'),
                                                         request['configuration']['shuttle_detector'], 'stream'),
@@ -977,6 +1025,22 @@ class StreamSessionManager:
         from .media_limits import ensure_segment_write
         ensure_segment_write(self, session, metadata)
 
+    def register_capture_lease(self, session_id, body):
+        from .capture_leases import register
+        return register(self, session_id, body)
+
+    def capture_signal(self, session_id, body, token):
+        from .capture_leases import signal
+        return signal(self, session_id, body, token)
+
+    def interrupt_capture(self, session_id, body):
+        from .capture_leases import interrupt
+        return interrupt(self, session_id, body)
+
+    def check_capture_leases(self):
+        from .capture_leases import tick
+        return tick(self)
+
     def issue_upload_token(self, session_id, *, ttl_seconds=None):
         configured_ttl = ttl_seconds if ttl_seconds is not None else os.environ.get("GOOD_BADMINTON_UPLOAD_TOKEN_TTL_SECONDS")
         if configured_ttl is None:
@@ -1004,6 +1068,8 @@ class StreamSessionManager:
                 raise session_not_found(session_id)
             if session.get("sealed") or session.get("status") in TERMINAL_SESSION_STATES:
                 raise invalid_state("cannot issue an upload token for a closed session", session_id)
+            if session.get('capture_lease'):
+                raise invalid_state('fixed capture authorization cannot be renewed', session_id)
             token = secrets.token_urlsafe(32)
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
             session["upload_authorization"] = {
@@ -1030,6 +1096,19 @@ class StreamSessionManager:
             return {"analysis_session_id": session_id, "revoked": True}
 
     def verify_upload_token(self, session_id, token):
+        # Serialize authorization with lease closure so input cannot revive a
+        # timed-out session during a late request or watchdog race.
+        with self._lock:
+            session = self._load(session_id)
+            if session and session.get('capture_lease'):
+                from .capture_leases import enforce_open
+                try:
+                    enforce_open(self, session)
+                except StreamSessionError:
+                    return False
+            return self._verify_upload_token(session_id, token)
+
+    def _verify_upload_token(self, session_id, token):
         if not token:
             return False
         session = self._load(session_id)
@@ -1041,13 +1120,33 @@ class StreamSessionManager:
         except (KeyError, TypeError, ValueError):
             return False
         actual_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        return (datetime.now(timezone.utc) < expires_at
+        return (datetime.fromtimestamp(self.capture_clock(), timezone.utc) < expires_at
                 and secrets.compare_digest(actual_hash, authorization.get("token_sha256", "")))
 
     def get_segment_receipt(self, session_id, segment_index):
         session = self._load(session_id)
         if session is None:
             raise session_not_found(session_id)
+        return self._segment_receipt(session, segment_index)
+
+    def get_segment_receipts(self, session_id, indexes):
+        if (not isinstance(indexes, list) or not 1 <= len(indexes) <= 15
+                or any(type(index) is not int or not 0 <= index <= 1_000_000 for index in indexes)
+                or len(set(indexes)) != len(indexes)):
+            raise validation_error('bulk receipt indexes must be 1..15 unique segment indexes', analysis_session_id=session_id)
+        session = self._load(session_id)
+        if session is None:
+            raise session_not_found(session_id)
+        receipts, missing = [], []
+        for index in indexes:
+            if str(index) not in session.get('segments', {}):
+                missing.append(index)
+            else:
+                receipts.append(self._segment_receipt(session, index))
+        return {'analysis_session_id': session_id, 'receipts': receipts, 'missing_indexes': missing}
+
+    def _segment_receipt(self, session, segment_index):
+        session_id = session['analysis_session_id']
         segment = session.get("segments", {}).get(str(segment_index))
         if segment is None:
             raise session_not_found(session_id)
@@ -1067,6 +1166,7 @@ class StreamSessionManager:
                 "source_frame_count": segment.get("source_frame_count"),
                 "source_frame_time_offsets_sec": segment.get("source_frame_time_offsets_sec")}
 
+    @stage('gpu_receive_validate_persist')
     def receive_segment(self, session_id, path_index, metadata_body, data_bytes):
         session = self._load(session_id)
         if session is None:
@@ -1099,6 +1199,8 @@ class StreamSessionManager:
             session = self._load(session_id)
             if session is None:
                 raise session_not_found(session_id)
+            from .capture_leases import enforce_open
+            enforce_open(self, session)
             if session.get("sealed"):
                 raise StreamSessionError(
                     "segment_after_seal", "session input is already sealed", 409,
@@ -1204,8 +1306,12 @@ class StreamSessionManager:
                 "processing_failed": False,
             }
             session["status"] = self._derive_status(session)
+            if session.get('capture_lease'):
+                from .capture_leases import iso
+                session['capture_lease']['last_signal_at'] = iso(self.capture_clock())
             self._append_state_history(session, session["status"], "segment_received")
             self._save(session)
+            point(self,session_id,"segment_accepted",path_index)
             trace = self._load_trace(session_id)
             if trace is not None:
                 trace["segments"][key] = {
@@ -1775,23 +1881,9 @@ class StreamSessionManager:
         # whichever processor/thread happened to append first.  ``event_id`` is
         # the deterministic tie-breaker and therefore also makes cursor paging
         # stable across retries and process restarts.
-        events = sorted(
-            self._load_events(session_id),
-            key=lambda event: (
-                float(event.get("source_time_sec", 0.0)),
-                str(event.get("event_id") or ""),
-            ),
-        )
-        limit = max(1, min(int(limit), 1000))
-        start = 0
-        if cursor:
-            start = len(events)
-            for position, event in enumerate(events):
-                if event.get("event_id") == cursor:
-                    start = position + 1
-                    break
-        page = events[start:start + limit]
-        next_cursor = page[-1]["event_id"] if page else None
+        page, next_cursor = self._event_pages.page(
+            self._events_path(session_id), revision=session.get('events_revision'),
+            cursor=cursor, limit=limit)
         return 200, events_response(session, page, next_cursor)
 
     def _load_events(self, session_id):
@@ -1808,6 +1900,7 @@ class StreamSessionManager:
                 continue
         return events
 
+    @stage('input_seal_request')
     def complete(self, session_id, body):
         session = self._load(session_id)
         if session is None:
@@ -1822,6 +1915,9 @@ class StreamSessionManager:
                 raise session_not_found(session_id)
             if session.get("status") in TERMINAL_SESSION_STATES:
                 if session["status"] in {"finalized", "partial"}:
+                    if (session.get("expected_last_segment_index") != request["expected_last_segment_index"]
+                            or session.get("allow_partial") != request["allow_partial"]):
+                        raise invalid_state("session is already sealed with a different completion request", session_id)
                     return 202, complete_session_response(
                         session,
                         session["status"],
@@ -1898,6 +1994,7 @@ class StreamSessionManager:
             # Persist the input boundary first, including on immediate partial
             # completion, or that reload loses both the seal and final index.
             self._save(session)
+            point(self,session_id,"input_sealed")
             failures = self._failed_indexes(session)
             declared_gap_work = bool(session.get("declared_gaps")) and (
                 any(not gap.get("settled") for gap in session["declared_gaps"].values())
@@ -2001,6 +2098,14 @@ class StreamSessionManager:
         sleep_seconds = 0.1
         while True:
             time.sleep(sleep_seconds)
+            if time.monotonic() >= getattr(self, '_next_capture_check', 0):
+                self._next_capture_check = time.monotonic() + 1
+                try:
+                    self.check_capture_leases()
+                except Exception:
+                    # Leave durable state for the next tick; never restart the
+                    # process or power an instance for a capture lease error.
+                    pass
             with self._lock:
                 active = dict(self._active_segment) if self._active_segment else None
             if active is None:
@@ -2274,7 +2379,8 @@ class StreamSessionManager:
                 gap_segment_indexes=list(range(0, int(index))),
             )
             segment = self.decoder.decode(segment_path, self._descriptor_from_entry(entry))
-            result = engine.process_segment(segment)
+            with span(self,session_id,'decode_sample_models_tracking', index):
+                result = engine.process_segment(segment)
         except Exception as exc:
             self._clear_active_segment(session_id, index)
             self._fail_reanalysis(
@@ -2382,6 +2488,7 @@ class StreamSessionManager:
         self._finalize_if_ready(session_id)
 
     @serialized_inference
+    @stage('segment_processing_total')
     def _process_segment(self, session_id, index):
         session = self._load(session_id)
         if (
@@ -2438,7 +2545,8 @@ class StreamSessionManager:
             self._save_trace(session_id, trace)
         open_started = time.perf_counter()
         try:
-            segment = self.decoder.decode(segment_path, descriptor)
+            with span(self,session_id,'segment_open_decode', index):
+                segment = self.decoder.decode(segment_path, descriptor)
         except (ReplayDecodeError, OSError) as exc:
             self._continue_after_segment_failure(
                 session_id,
@@ -2453,7 +2561,8 @@ class StreamSessionManager:
         processing_started = time.perf_counter()
         self._set_active_segment(session_id, index)
         try:
-            result = engine.process_segment(segment)
+            with span(self,session_id,'decode_sample_models_tracking', index):
+                result = engine.process_segment(segment)
         except StreamingAnalysisError as exc:
             self._clear_active_segment(session_id, index)
             self._continue_after_segment_failure(session_id, index, exc, phase="engine")
@@ -2675,7 +2784,10 @@ class StreamSessionManager:
             else:
                 self._finalize_complete(session)
 
+    @stage('algorithm_finalize')
     def _finalize_complete(self, session):
+        if session.get('capture_incomplete'):
+            return self._finalize_partial(session, self._missing_indexes(session), self._failed_indexes(session))
         engine = self._engines.get(session["analysis_session_id"])
         if engine is None:
             session["status"] = "finalized"
@@ -2685,7 +2797,8 @@ class StreamSessionManager:
             return
         finalize_started = time.perf_counter()
         try:
-            result = engine.finalize()
+            with span(self,session["analysis_session_id"],'engine_finalize'):
+                result = engine.finalize()
         except Exception as exc:
             if self._sync_engine_terminal_status(session, engine):
                 self._save(session)
@@ -2723,11 +2836,13 @@ class StreamSessionManager:
             }
             self._save_trace(session_id, trace)
 
+    @stage('algorithm_finalize_partial')
     def _finalize_partial(self, session, missing, failed=()):
         engine = self._engines.get(session["analysis_session_id"])
         if engine is not None:
             try:
-                result = engine.finalize()
+                with span(self,session["analysis_session_id"],'engine_finalize'):
+                    result = engine.finalize()
             except Exception as exc:
                 if self._sync_engine_terminal_status(session, engine):
                     self._save(session)
@@ -2890,6 +3005,7 @@ def _requests_equivalent(existing, request):
         and existing.get("court_corners") == request["court_corners"]
         and existing.get("client_reference") == request.get("client_reference")
         and existing.get("media_identity") == request.get("media_identity")
+        and existing.get("visual_result") == request.get("visual_result")
         and existing.get("configuration") == request["configuration"]
     )
 

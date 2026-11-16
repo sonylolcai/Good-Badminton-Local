@@ -77,3 +77,13 @@ class AnalysisArchiveTests(unittest.TestCase):
         self.assertEqual(box.pending_count(), 0)
         box.run_once()
         self.assertEqual(sender.call_count, 2)
+
+    def test_gpu_timing_is_frozen_inside_existing_trace_object(self):
+        from api.gpu_stage_timing import append
+        append(self.root,{'clock_id':'test-clock','stage':'algorithm_finalize','edge':'end','observed_at':'2026-11-12T00:00:00Z','monotonic_ns':5,'duration_ms':12,'outcome':'returned'})
+        descriptor=upload_analysis_archive(self.manager,self.storage,self.session)
+        trace=next(x for x in descriptor['manifest']['objects'] if x['role']=='trace')
+        raw=(self.root/'oss'/trace['object_key']).read_text()
+        saved=json.loads(raw)
+        self.assertEqual(saved['gpu_stage_timing']['stages']['algorithm_finalize']['total_ms'],12)
+        self.assertNotIn('gpu_stage_timing',json.loads((self.root/'trace.json').read_text()))

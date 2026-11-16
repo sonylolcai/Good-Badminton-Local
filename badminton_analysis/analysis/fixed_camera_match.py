@@ -16,6 +16,7 @@ from ..court.mapper import CourtMapper
 from ..court.reference import BADMINTON_COURT_LENGTH, BADMINTON_COURT_WIDTH
 from ..tracking.bytetrack_adapter import ByteTrackAdapter
 from ..tracking.association_policy import association_policy
+from .court_contact_gate import person_court_gate
 
 
 SCHEMA_VERSION = "2.3"
@@ -92,6 +93,21 @@ class CourtSpace:
         x, y = (float(value) for value in court_xy)
         column = "left" if x < self.width_m / 3 else "right" if x > self.width_m * 2 / 3 else "center"
         row = "rear" if y < self.length_m / 3 else "front" if y > self.length_m * 2 / 3 else "mid"
+        return f"{row}_{column}"
+
+    def half_court_zone_for(self, court_xy):
+        """Return a net-folded 3x3 half-court zone (front=<1.98m, mid=1.98..4.70m, rear>=4.70m from net)."""
+        if court_xy is None or len(court_xy) < 2:
+            return None
+        try:
+            x, y = float(court_xy[0]), float(court_xy[1])
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= x <= self.width_m and 0.0 <= y <= self.length_m):
+            return None
+        column = "left" if x < self.width_m / 3.0 else "right" if x >= self.width_m * 2.0 / 3.0 else "center"
+        depth_from_net = abs(y - self.net_y_m)
+        row = "front" if depth_from_net < 1.98 else "rear" if depth_from_net >= 4.47 else "mid"
         return f"{row}_{column}"
 
     def contains(self, court_xy, margin_m=0.0):
@@ -1993,6 +2009,8 @@ class FixedCameraMatchPipeline:
         athlete_observation_lateral_margin_m=None,
         athlete_observation_baseline_margin_m=None,
         sport_id="badminton",
+        hit_analysis_enabled=True,
+        roster_identity_policy="individual_tracks.v1",
     ):
         if match_mode not in {"auto", "singles", "doubles"}:
             raise ValueError(
@@ -2010,7 +2028,9 @@ class FixedCameraMatchPipeline:
             world_points_m=world_points_m,
             athlete_observation_region=athlete_observation_region,
         )
+        self.hit_analysis_enabled = bool(hit_analysis_enabled)
         self.coordinate_system_id = str(coordinate_system_id)
+        self.sport_id = str(sport_id)
         self.session_mode = str(session_mode)
         self.calibration_scope = str(calibration_scope)
         self.requested_match_mode = match_mode
@@ -2030,7 +2050,15 @@ class FixedCameraMatchPipeline:
             if tracker_backend == "bytetrack"
             else None
         )
-        self.tracker = CourtMultiObjectTracker(
+        if roster_identity_policy == "half_court_slots.v1":
+            # Import lazily: the slot implementation shares this base tracker.
+            from ..tracking.half_court_slots import HalfCourtSlotTracker
+            tracker_class = HalfCourtSlotTracker
+        elif roster_identity_policy == "individual_tracks.v1":
+            tracker_class = CourtMultiObjectTracker
+        else:
+            raise ValueError("Unsupported roster_identity_policy")
+        self.tracker = tracker_class(
             self.court_space,
             fps=fps,
             sport_id=sport_id,
@@ -2086,7 +2114,7 @@ class FixedCameraMatchPipeline:
             self.expected_player_count = self.tracker.expected_roster_count
             self.rallies.expected_player_count = self.expected_player_count
         shuttle = self._shuttle_record(frame_index, shuttlecock)
-        hit_events = self._detect_hit_events(tracks, shuttle, frame_index)
+        hit_events = self._detect_hit_events(tracks, shuttle, frame_index) if self.hit_analysis_enabled else []
         rally = self.rallies.update(frame_index, tracks, shuttle, hit_events)
         return {
             "schema_version": SCHEMA_VERSION,
@@ -2100,6 +2128,8 @@ class FixedCameraMatchPipeline:
             "match_roster": self.tracker.roster_summary(),
             "tracking": {
                 "backend": self.tracker_backend,
+                "hit_analysis_enabled": self.hit_analysis_enabled,
+                "hit_person_scope": "strict_calibrated_quad.v1" if self.sport_id == 'badminton' else 'sport_default',
                 "measurement_statuses": ["detected", "predicted", "missing"],
                 "prediction_policy": "predicted and missing locations are not detector measurements or score evidence",
             },
@@ -2227,6 +2257,12 @@ class FixedCameraMatchPipeline:
                 self._hit_contact_frames.pop(track["track_id"], None)
         distance, contact_gate, nearest, _hand_name = min(candidates, key=lambda item: item[0])
         track_id = nearest["track_id"]
+        # Check the closest person BEFORE accepting a contact. Never substitute
+        # a farther in-court player for a closer neighbouring-court player.
+        if (self.sport_id == 'badminton' and person_court_gate(
+                nearest, self.court_space.mapper.image_court_corners.tolist())['status'] != 'inside'):
+            self._hit_contact_frames.pop(track_id, None)
+            return []
         if distance > contact_gate:
             return []
         if track_id in self._hit_contact_frames:

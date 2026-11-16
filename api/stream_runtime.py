@@ -128,7 +128,7 @@ def _load_tracknet_detector(model_path: str, model_sha256: str, device: str):
     return LightweightTrackNetDetector(weights_path=model_path, device=device)
 
 
-def _derived_far_court_roi(corners, frame_shape):
+def _derived_far_court_roi(corners, frame_shape, *, include_upper_body=False):
     """Return a tight rectangular far-half ROI from ordered court corners.
 
     The session contract uses the existing calibration order
@@ -151,6 +151,10 @@ def _derived_far_court_roi(corners, frame_shape):
     )
     height, width = int(frame_shape[0]), int(frame_shape[1])
     pad_x, pad_y = max(4, round(width * 0.025)), max(4, round(height * 0.025))
+    if include_upper_body:
+        # Calibration describes the FLOOR. A player's head can be well above
+        # the far baseline in image space; a floor-only crop detects legs.
+        pad_y = max(pad_y, round(height * .15))
     x1 = max(0, int(np.floor(far_half[:, 0].min())) - pad_x)
     y1 = max(0, int(np.floor(far_half[:, 1].min())) - pad_y)
     x2 = min(width, int(np.ceil(far_half[:, 0].max())) + pad_x)
@@ -187,7 +191,8 @@ class PoseObservationProvider:
                 far_roi=(
                     self.far_roi
                     if self.far_roi is not None
-                    else _derived_far_court_roi(self.tracker.image_corners, frame.shape)
+                    else _derived_far_court_roi(self.tracker.image_corners, frame.shape,
+                        include_upper_body=self.tracker.roster_identity_policy == "anchored_roster.v1")
                 ),
                 imgsz=self.pose_imgsz,
             )
@@ -627,6 +632,7 @@ class StreamProcessorFactory:
             lock_match_roster=bool(configuration.get("lock_match_roster", False)),
             match_mode=str(configuration.get("match_mode", "person_only")),
             expected_roster_count=configuration.get("expected_player_count"),
+            roster_identity_policy=configuration.get("roster_identity_policy", "individual_tracks.v1"),
             roster_stable_frames=int(configuration.get("roster_stable_frames", 3)),
             max_roster_count=int(configuration.get("max_roster_count", 4)),
             roster_discovery_seconds=float(
@@ -691,8 +697,16 @@ class StreamProcessorFactory:
         # those tests isolated without changing the production path.
         session_id = str(session.get("analysis_session_id") or f"factory-{id(session)}")
         candidate_photos = CandidatePhotoCollector(
-            self.data_dir / "stream_sessions" / session_id / "candidate_photos"
+            self.data_dir / "stream_sessions" / session_id / "candidate_photos",
+            anchored_roster_count=(configuration.get("expected_player_count")
+                                   if configuration.get("roster_identity_policy") == "anchored_roster.v1" else None),
         )
+
+        if configuration.get("candidate_photo_policy") == "same_frame_roster.v1":
+            from .same_frame_photos import SameFramePhotoCollector
+            candidate_photos = SameFramePhotoCollector(
+                self.data_dir / "stream_sessions" / session_id / "candidate_photos",
+                count=configuration.get("expected_player_count"), session_id=session_id)
 
         shuttle_detector = configuration["shuttle_detector"]
         if shuttle_detector == "none":

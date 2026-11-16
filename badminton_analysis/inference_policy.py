@@ -79,6 +79,9 @@ def execution_profile(sport_id, detector, route='batch'):
                        'badminton_analysis/tracking/association_policy.py',
                        'badminton_analysis/tracking/bytetrack_adapter.py',
                        'badminton_analysis/tracking/person_only.py',
+                       'badminton_analysis/tracking/half_court_slots.py',
+                       'badminton_analysis/tracking/anchored_roster.py',
+                       'api/candidate_photos.py',
                        'badminton_analysis/analysis/fixed_camera_match.py')}),
                'pose_checkpoint_sha256': file_digest(pose_checkpoint(sport_id))}
     if detector == 'tracknet_v3':

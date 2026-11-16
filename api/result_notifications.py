@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from urllib.error import HTTPError
+from .gpu_stage_timing import stage, span
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 from good_badminton_contracts.gpu_notifications import SCHEMA, encode, event_id, signature
@@ -17,11 +18,15 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 class ResultNotifications:
-    def __init__(self, manager, archive, *, url, secret, send=None, clock=time.time, archive_results=None, not_before=None):
-        parsed = urlsplit(url)
-        if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
-                or parsed.query or parsed.fragment or len(secret.encode()) < 32):
-            raise ValueError('GPU callback requires a credential-free HTTPS URL and a 32-byte secret')
+    def __init__(self, manager, archive, *, url, secret, send=None, clock=time.time, archive_results=None, not_before=None, environment_urls=None):
+        self.environment_urls = dict(environment_urls or {})
+        if not set(self.environment_urls) <= {'test', 'production'}:
+            raise ValueError('invalid callback environment')
+        for target in [url, *self.environment_urls.values()]:
+            parsed = urlsplit(target)
+            if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+                    or parsed.query or parsed.fragment or len(secret.encode()) < 32):
+                raise ValueError('GPU callback requires a credential-free HTTPS URL and a 32-byte secret')
         self.manager, self.archive = manager, archive
         self.url, self.secret, self.clock = url, secret, clock
         self.send = send or self._send
@@ -94,7 +99,13 @@ class ResultNotifications:
         timestamp = str(int(self.clock()))
         headers = {'Content-Type': 'application/json', 'X-Gpu-Timestamp': timestamp,
                    'X-Gpu-Signature': signature(self.secret, timestamp, raw)}
-        request = Request(self.url, data=raw, headers=headers, method='POST')
+        target = self.url
+        if self.environment_urls:
+            environment = (payload.get('media_identity') or {}).get('environment')
+            if environment not in self.environment_urls:
+                raise ValueError('callback environment is not enabled')
+            target = self.environment_urls[environment]
+        request = Request(target, data=raw, headers=headers, method='POST')
         with build_opener(NoRedirect).open(request, timeout=10) as response:
             result = json.loads(response.read(32768))
             if response.status not in {200, 202} or result.get('event_id') != payload['event_id'] or result.get('status') != 'accepted':
@@ -128,11 +139,13 @@ class ResultNotifications:
                             value = previous_payload
                         else:
                             from .analysis_archive import upload_analysis_archive
-                            value['analysis_archive'] = upload_analysis_archive(self.manager, self.archive.storage, session)
+                            with span(self.manager,sid,'analysis_archive_upload'):
+                                value['analysis_archive'] = upload_analysis_archive(self.manager, self.archive.storage, session)
                             value['event_id'] = event_id(value)
                         state.update(event_id=value['event_id'], payload=value)
                         self._save(sid, state)
-                    self.send(value)
+                    with span(self.manager,sid,'business_notification_http'):
+                        self.send(value)
                     state.update(acknowledged_event_id=value['event_id'], acknowledged_base_event_id=base_id, acknowledged_at=self.clock())
                     self._save(sid, state)
                 except Exception as exc:

@@ -85,6 +85,7 @@ class BadmintonAnalysisSystem:
                  match_mode='singles', tracker_backend='bytetrack',
                  enable_bytetrack=True, lock_match_roster=True,
                  roster_stable_frames=2, roster_discovery_seconds=3.0,
+                 roster_identity_policy='individual_tracks.v1',
                  shuttle_detector=None,
                  tracknet_measurements_path=None, huji_action_model=None,
                  huji_sample_hz=6.0, enable_huji_play_state=True,
@@ -98,7 +99,10 @@ class BadmintonAnalysisSystem:
                  athlete_observation_margin_m=0.35,
                  athlete_observation_lateral_margin_m=None,
                  athlete_observation_baseline_margin_m=None,
-                 inference_device=None):
+                 inference_device=None, analysis_stage="full"):
+        if analysis_stage not in ("full", "rallies"):
+            raise ValueError("analysis_stage must be full or rallies")
+        self.analysis_stage = analysis_stage
         self.video_path = video_path
         self.sport_id = str(sport_id)
         self.court_dimensions = tuple(float(value) for value in court_dimensions)
@@ -185,6 +189,7 @@ class BadmintonAnalysisSystem:
         self.lock_match_roster = bool(lock_match_roster)
         self.roster_stable_frames = max(1, int(roster_stable_frames))
         self.roster_discovery_seconds = float(roster_discovery_seconds)
+        self.roster_identity_policy = roster_identity_policy
         if self.roster_discovery_seconds < 0.0:
             raise ValueError("roster_discovery_seconds must be non-negative")
         if output_video_style not in {'annotated', 'skeleton'}:
@@ -471,7 +476,9 @@ class BadmintonAnalysisSystem:
             lock_match_roster=self.lock_match_roster,
             roster_stable_frames=self.roster_stable_frames,
             roster_discovery_seconds=self.roster_discovery_seconds,
+            roster_identity_policy=self.roster_identity_policy,
             shuttle_enabled=self.shuttle_detector != 'none',
+            hit_analysis_enabled=self.analysis_stage == "full",
             movement_rally_settle_seconds=self.movement_rally_settle_seconds,
             court_dimensions=self.court_dimensions,
             world_points_m=self.calibration_world_points_m,
@@ -520,6 +527,21 @@ class BadmintonAnalysisSystem:
                 progress_callback(frame_count, total_frames)
             raise_if_cancelled(cancel_callback)
 
+        # Finalize against decoded source frames, not an optimistic container
+        # count. Keep the original count as evidence of edit-list differences.
+        if frame_count > 0:
+            declared_total_frames = total_frames
+            total_frames = frame_count
+            video_duration = frame_count / fps
+            with open(self.metadata_path, 'r', encoding='utf-8') as source:
+                finalized_metadata = json.load(source)
+            finalized_metadata['video'].update(
+                container_declared_frames=declared_total_frames,
+                total_frames=frame_count, duration_sec=video_duration,
+            )
+            write_json(self.metadata_path, finalized_metadata)
+            if progress_callback is not None:
+                progress_callback(frame_count, frame_count)
         cleanup_t0 = time.perf_counter()
         self._cleanup(cap, state_callback=state_callback)
         self._record_execution_metric("cleanup", time.perf_counter() - cleanup_t0)
@@ -690,6 +712,7 @@ class BadmintonAnalysisSystem:
                 },
             },
         }
+        metadata["analysis_stage"] = self.analysis_stage
         write_json(self.metadata_path, metadata)
 
     def _process_frame(self, frame, template_gray, corners, roi_corners, frame_count, out, detect_frame_count,
@@ -1265,7 +1288,14 @@ class BadmintonAnalysisSystem:
         if self.detection_writer is not None:
             self.detection_writer.close()
             self.detection_writer = None
-        if self.shuttle_detector == 'none':
+        if self.analysis_stage == 'rallies':
+            from .analysis.rally_segmentation import generate_rally_stage_artifacts
+            self.offline_artifacts = generate_rally_stage_artifacts(self.detections_path)
+            with open(self.metadata_path, 'r', encoding='utf-8') as source:
+                metadata = json.load(source)
+            metadata['derived'] = self.offline_artifacts
+            write_json(self.metadata_path, metadata)
+        elif self.shuttle_detector == 'none':
             # Keep raw person evidence usable without fabricating ball events.
             # Unlike earlier versions, a person-only task now emits cautious
             # movement-terminal candidates from the fixed-camera state machine.

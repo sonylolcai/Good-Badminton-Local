@@ -50,6 +50,9 @@ class TrackNetStreamProcessor:
         self.frame_shape: tuple[int, int] | None = None
         self.last_segment_index: int | None = None
         self.last_source_frame_identity_declared = False
+        # Transient device copies of the background and at most eight frames.
+        # CPU uint8 images remain the canonical, backward-compatible checkpoint.
+        self._device_images: dict[int, tuple[np.ndarray, Any]] = {}
 
     @staticmethod
     def _resized_rgb(frame: np.ndarray) -> np.ndarray:
@@ -79,6 +82,24 @@ class TrackNetStreamProcessor:
         self.frames.clear()
         self.background = None
         self.frame_interval_sec = None
+        self._device_images.clear()
+
+    def _window_tensor(self):
+        import torch
+
+        current = {}
+        channels = []
+        for image in (self.background, *self.frames):
+            cached = self._device_images.get(id(image))
+            if cached is None or cached[0] is not image:
+                # Preserve the original CPU float32 division exactly. Normalize
+                # and transfer each image once instead of all nine each frame.
+                tensor = torch.from_numpy(np.moveaxis(image, -1, 0).copy()).float().div_(255.0)
+                cached = (image, tensor.to(self.detector.device))
+            current[id(image)] = cached
+            channels.append(cached[1])
+        self._device_images = current
+        return torch.cat(channels, dim=0).unsqueeze(0)
 
     def _detect_gap(self, frame_index: int, source_time_sec: float, shape: tuple[int, int]) -> str | None:
         if self.last_frame_index is None:
@@ -105,11 +126,9 @@ class TrackNetStreamProcessor:
 
         if self.background is None:
             self.background = np.median(np.stack(self.frames), axis=0).astype(np.uint8)
-        channels = [self.background, *self.frames]
-        image = np.concatenate(channels, axis=2)
-        tensor = torch.from_numpy(np.moveaxis(image, -1, 0).copy()).float().div_(255.0)
+        tensor = self._window_tensor()
         with torch.no_grad():
-            heatmap = self.detector.model(tensor.unsqueeze(0).to(self.detector.device))
+            heatmap = self.detector.model(tensor)
         heatmap_np = heatmap[0, WINDOW_FRAMES - 1].detach().cpu().numpy()
         visible, x, y, peak = self.detector._extract_coordinate_from_heatmap(
             heatmap_np,
@@ -183,9 +202,13 @@ class TrackNetStreamProcessor:
         return events
 
     def finalize(self, _context: Any) -> list[ProcessorEvent]:
+        self._device_images.clear()
         return []
 
     def snapshot_state(self) -> dict[str, Any]:
+        # A retained, idle engine must not pin per-session GPU buffers after a
+        # segment commits. Rebuild from the canonical images on its next frame.
+        self._device_images.clear()
         return {
             "state_version": STATE_VERSION,
             "model_sha256": self.model_sha256,
@@ -216,6 +239,7 @@ class TrackNetStreamProcessor:
         frames = [self._decode_image(value) for value in encoded_frames]
         background = state.get("background_png")
         self.frames = deque(frames, maxlen=WINDOW_FRAMES)
+        self._device_images.clear()
         self.background = self._decode_image(background) if background is not None else None
         self.last_frame_index = (
             int(state["last_frame_index"]) if state.get("last_frame_index") is not None else None

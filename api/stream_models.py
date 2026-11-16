@@ -159,6 +159,7 @@ def validate_create_request(body):
             "analysis_mode",
             "client_reference",
             "media_identity",
+            "visual_result",
             "configuration",
         },
         "request body",
@@ -183,6 +184,15 @@ def validate_create_request(body):
         "client_reference": client_reference,
         "configuration": configuration,
     }
+
+    if "visual_result" in body:
+        projection = body["visual_result"]
+        if (not isinstance(projection, dict) or set(projection) != {"schema_version", "implementation_sha256"}
+                or projection.get("schema_version") != "stream-visual-result.v1"
+                or not isinstance(projection.get("implementation_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", projection["implementation_sha256"]) is None):
+            raise ValueError("invalid visual_result projection")
+        normalized["visual_result"] = dict(projection)
 
     if "media_identity" in body:
         from .media_identity import validate_media_identity
@@ -217,6 +227,8 @@ def validate_configuration(configuration):
         "max_roster_count",
         "expected_player_count",
         "roster_discovery_seconds",
+        "roster_identity_policy",
+        "candidate_photo_policy",
         "match_mode",
         "far_player_enhancement",
         "far_pose_roi",
@@ -260,6 +272,7 @@ def validate_configuration(configuration):
         # per-sport profile rejects counts its mode does not support.
         "expected_player_count": configuration.get("expected_player_count"),
         "roster_discovery_seconds": configuration.get("roster_discovery_seconds", 3.0),
+        "roster_identity_policy": configuration.get("roster_identity_policy", "individual_tracks.v1"),
         "match_mode": configuration.get("match_mode", "person_only"),
         # Fixed-camera far-half inference is an optional detection aid, not a
         # business identity rule.  It is opt-in because it changes the actual
@@ -290,9 +303,21 @@ def validate_configuration(configuration):
     if isinstance(discovery_seconds, bool) or not 1.0 <= float(discovery_seconds) <= 15.0:
         raise ValueError("roster_discovery_seconds must be from 1 to 15")
     normalized["roster_discovery_seconds"] = float(discovery_seconds)
+    if normalized["roster_identity_policy"] not in {"individual_tracks.v1", "half_court_slots.v1", "anchored_roster.v1"}:
+        raise ValueError("Unsupported roster_identity_policy")
+    if normalized["roster_identity_policy"] in {"half_court_slots.v1", "anchored_roster.v1"} and (
+        not normalized["lock_match_roster"] or normalized["expected_player_count"] not in {2, 4}
+    ):
+        raise ValueError("Half-court slots require a locked two/four player roster")
     normalized["far_player_enhancement"] = _bool(
         normalized["far_player_enhancement"], "far_player_enhancement"
     )
+    if "candidate_photo_policy" in configuration:
+        if (configuration["candidate_photo_policy"] != "same_frame_roster.v1"
+                or configuration.get("expected_player_count") not in (2, 4)
+                or configuration.get("lock_match_roster") is not True):
+            raise ValueError("Invalid candidate_photo_policy")
+        normalized["candidate_photo_policy"] = configuration["candidate_photo_policy"]
     if "far_pose_roi" in configuration:
         roi = configuration["far_pose_roi"]
         if not isinstance(roi, list) or len(roi) != 4:

@@ -117,6 +117,49 @@ class MediaArchiveTests(unittest.TestCase):
             recovered = StreamMediaArchive(self.manager, self.storage)
             self.assertEqual(recovered.process_session(self.session_id), result)
 
+    def test_sparse_source_pts_are_archived_unchanged_and_explicitly_reported(self):
+        directory=self.root/'sparse';directory.mkdir()
+        subprocess.run([
+            'ffmpeg','-nostdin','-v','error','-f','lavfi','-i','testsrc2=size=64x64:rate=10:duration=2.3',
+            '-vf',"select='not(eq(n,5))'",'-fps_mode','vfr',
+            '-an','-c:v','libx264','-pix_fmt','yuv420p','-g','10','-keyint_min','10','-sc_threshold','0',
+            '-f','segment','-segment_time','1','-reset_timestamps','1',str(directory/'%03d.mp4')
+        ],check=True,capture_output=True)
+        self.fixtures=[(p.read_bytes(),self.archive.inspector.inspect(p)) for p in sorted(directory.glob('*.mp4'))]
+        self.ingest();self.seal()
+        result=self.archive.process_session(self.session_id)
+        self.assertEqual(result['status'],'ready',result)
+        timing=result['source_timing']
+        self.assertEqual(timing['status'],'gaps_observed');self.assertEqual(timing['gap_count'],1)
+        self.assertEqual(timing['capture_completeness'],'not_verified')
+        self.assertAlmostEqual(timing['gaps'][0]['interval_sec'],.2)
+        manifest=self.archive.manifest(self.session_id)
+        integrity=json.loads(self.storage._path(manifest['integrity']['object_key']).read_text())
+        self.assertEqual(integrity['status'],'source_gaps')
+        self.assertEqual(manifest['total_source_frames'],22)
+        # Master verification in process_session compares every decoded frame
+        # hash and PTS against these originals, including the sparse interval.
+        self.assertFalse(self.archive.release_verified_media(self.session_id,now=10**12))
+
+    def test_events_compression_negotiation_preserves_payload_and_authentication(self):
+        from fastapi import Header, HTTPException
+        def authenticate(x_api_key: str = Header(default='')):
+            if x_api_key != 'test-key':raise HTTPException(401)
+        app=FastAPI()
+        register_stream_routes(app,stream_manager=self.manager,require_api_key=authenticate,
+            require_upload_access=authenticate,health_payload=lambda:{},media_archive=self.archive)
+        client=TestClient(app);route=f'/api/v1/stream-sessions/{self.session_id}/events'
+        payload={'events':[{'data':'abc'*1000}],'next_cursor':'same-cursor'}
+        with patch('api.stream_routes.read_events_handler',return_value=(200,payload)):
+            self.assertEqual(client.get(route).status_code,401)
+            plain=client.get(route,headers={'X-API-Key':'test-key','Accept-Encoding':'identity'})
+            zipped=client.get(route,headers={'X-API-Key':'test-key','Accept-Encoding':'gzip'})
+            disabled=client.get(route,headers={'X-API-Key':'test-key','Accept-Encoding':'gzip;q=0'})
+        self.assertEqual(plain.json(),zipped.json());self.assertEqual(zipped.json(),payload)
+        self.assertEqual(zipped.headers.get('content-encoding'),'gzip')
+        self.assertNotIn('content-encoding',disabled.headers)
+        self.assertLess(int(zipped.headers['content-length']),int(plain.headers['content-length']))
+
     def test_upload_failure_never_commits_manifest_and_retries_after_restart(self):
         self.ingest()
         self.seal()

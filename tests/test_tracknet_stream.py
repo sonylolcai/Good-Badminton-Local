@@ -42,6 +42,39 @@ def _context(index, segment_index, fps=30):
 
 
 class TrackNetStreamTests(unittest.TestCase):
+    def test_cached_inputs_match_reference_through_shift_restore_and_gap(self):
+        detector = _Detector()
+        processor = TrackNetStreamProcessor(detector, model_sha256='a' * 64)
+        checked = []
+        def check_input(actual):
+            image = np.concatenate([processor.background, *processor.frames], axis=2)
+            reference = torch.from_numpy(np.moveaxis(image, -1, 0).copy()).float().div_(255).unsqueeze(0)
+            self.assertTrue(torch.equal(actual, reference), 'model input changed')
+            self.assertLessEqual(len(processor._device_images), 9)
+            checked.append(processor.last_frame_index)
+            return torch.zeros((1, 8, 288, 512))
+        detector.model = check_input
+        rng = np.random.default_rng(7)
+        for index in range(11):
+            processor.process_frame(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8), _context(index, index // 4))
+        cache_before = dict(processor._device_images)
+        processor.process_frame(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8), _context(11, 2))
+        reused = [key for key in cache_before if key in processor._device_images]
+        self.assertEqual(len(reused), 8, 'reuse background and seven overlapping frames')
+        self.assertTrue(all(cache_before[key][1] is processor._device_images[key][1] for key in reused))
+        state = processor.snapshot_state()
+        self.assertEqual(processor._device_images, {}, 'checkpoint releases idle device buffers')
+        processor.restore_state(state)
+        self.assertEqual(processor._device_images, {})
+        processor.process_frame(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8), _context(12, 3))
+        processor.process_frame(np.zeros((64, 64, 3), dtype=np.uint8), _context(20, 4))
+        self.assertEqual(processor._device_images, {})
+        for index in range(21, 28):
+            processor.process_frame(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8), _context(index, 4))
+        self.assertEqual(checked, [7, 8, 9, 10, 11, 12, 27])
+        processor.finalize(None)
+        self.assertEqual(processor._device_images, {}, 'finalized sessions release device buffers')
+
     def test_engine_persists_cross_segment_ball_evidence_in_source_order(self):
         frame = np.zeros((64, 64, 3), dtype=np.uint8)
 

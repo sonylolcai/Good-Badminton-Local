@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
+import json
+import shutil
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
@@ -34,8 +38,12 @@ class CandidatePhotoCollector:
     later, user-confirmed claim.
     """
 
-    def __init__(self, directory: Path | str):
+    def __init__(self, directory: Path | str, *, anchored_roster_count: int | None = None):
         self.directory = Path(directory)
+        if anchored_roster_count is not None and anchored_roster_count not in {2, 4}:
+            raise ValueError("A photo roster requires two or four people")
+        self.anchored_roster_count = anchored_roster_count
+        self._frozen_set = None
         self._best_quality: dict[str, float] = {}
         self._best_rank: dict[str, float] = {}
 
@@ -45,6 +53,8 @@ class CandidatePhotoCollector:
         context: FrameContext,
         events: Iterable[ProcessorEvent],
     ) -> list[ProcessorEvent]:
+        if self.anchored_roster_count is not None:
+            return self._attach_roster(frame, context, list(events))
         output: list[ProcessorEvent] = []
         for event in events:
             candidate = self._capture(frame, context, event)
@@ -65,23 +75,122 @@ class CandidatePhotoCollector:
             )
         return output
 
+    def _attach_roster(self, frame, context, events):
+        if self._frozen_set is not None:
+            return events
+        selected = [e for e in events if e.event_type == "person_observation"]
+        if len(selected) != self.anchored_roster_count or any(e.evidence_state != "detected" for e in selected):
+            return events
+        tracks = [e.data.get("track") or {} for e in selected]
+        ids = sorted(str(t.get("track_id") or "") for t in tracks)
+        anchors = [t.get("identity_anchor") for t in tracks]
+        reference = anchors[0]
+        if (len(set(ids)) != self.anchored_roster_count or not reference
+                or reference.get("policy") != "anchored_roster.v1"
+                or reference.get("track_ids") != ids
+                or any(anchor != reference for anchor in anchors)
+                or reference.get("source_frame_index") != context.source_frame_index
+                or abs(reference.get("source_time_sec", -1) - context.source_time_sec) > 1e-6
+                or any(t.get("identity_status") != "anchored" for t in tracks)):
+            return events
+        from badminton_analysis.tracking.anchored_roster import overlapping_boxes
+        boxes = [(t.get("location_evidence") or {}).get("bbox_xyxy") for t in tracks]
+        if (any(not isinstance(box, (list, tuple)) or len(box) != 4
+                or not all(isinstance(v, (int, float)) and np.isfinite(v) for v in box)
+                for box in boxes)
+                or any(overlapping_boxes(a, b) for i, a in enumerate(boxes) for b in boxes[i+1:])):
+            return events
+        self.directory.mkdir(parents=True, exist_ok=True)
+        destination = self.directory / "anchor_set"
+        set_id = f"anchor_{context.source_frame_index}_{context.measurement_bucket}"
+        # One directory rename publishes all images + manifest together. A
+        # crash before rename exposes none; a retry after rename reuses the
+        # exact committed set rather than mixing in a later frame.
+        if destination.exists():
+            manifest = json.loads((destination / "manifest.json").read_text())
+            if manifest.get("set_id") != set_id or sorted(manifest.get("photos", {})) != ids:
+                raise ValueError("Photo roster frame differs from committed set")
+            self._verify_photo_set(manifest)
+            photos = manifest["photos"]
+        else:
+            staging = Path(tempfile.mkdtemp(prefix=".anchor-set-", dir=self.directory))
+            try:
+                collector = CandidatePhotoCollector(staging)
+                photos = {}
+                for event in selected:
+                    photo = collector._capture(frame, context, event)
+                    if photo is None:
+                        raise ValueError("Incomplete same-frame photo roster")
+                    tid = photo["track_id"]
+                    photo.update(photo_set_id=set_id, source_frame_index=int(context.source_frame_index),
+                                 selection_policy="same_frame_roster_v1", frozen=True)
+                    photo["sha256"] = hashlib.sha256((staging / f"{tid}.jpg").read_bytes()).hexdigest()
+                    photos[tid] = photo
+                manifest = {"version": "same-frame-roster.v1", "set_id": set_id, "photos": photos}
+                (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+                os.replace(staging, destination)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+        self._frozen_set = manifest
+        output = []
+        for event in events:
+            tid = (event.data.get("track") or {}).get("track_id")
+            if event.event_type == "person_observation" and tid in photos:
+                data = deepcopy(dict(event.data)); data["candidate_photo"] = deepcopy(photos[tid])
+                event = ProcessorEvent(event_type=event.event_type, evidence_state=event.evidence_state,
+                                       confidence=event.confidence, data=data,
+                                       source_time_sec=event.source_time_sec, segment_index=event.segment_index)
+            output.append(event)
+        return output
+
+    def _verify_photo_set(self, manifest):
+        photos = manifest.get("photos") or {}
+        if (manifest.get("version") != "same-frame-roster.v1" or not manifest.get("set_id")
+                or len(photos) != self.anchored_roster_count):
+            raise ValueError("Incomplete photo roster checkpoint")
+        frames = set()
+        for tid, photo in photos.items():
+            if not _TRACK_ID_PATTERN.fullmatch(tid):
+                raise ValueError("Invalid photo roster ID")
+            if (photo.get("track_id") != tid or photo.get("photo_set_id") != manifest["set_id"]
+                    or photo.get("frozen") is not True):
+                raise ValueError("Photo roster checkpoint metadata mismatch")
+            frames.add((photo.get("source_frame_index"), photo.get("source_time_sec")))
+            path = self.directory / "anchor_set" / f"{tid}.jpg"
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != photo.get("sha256"):
+                raise ValueError("Photo roster checkpoint file mismatch")
+        if len(frames) != 1 or None in next(iter(frames)):
+            raise ValueError("Photo roster checkpoint source frame mismatch")
+
     def snapshot_state(self) -> dict[str, Any]:
         return {
-            "state_version": "candidate-photo.v2",
+            "state_version": "candidate-photo.v3",
+            "anchored_roster_count": self.anchored_roster_count,
+            "frozen_set": deepcopy(self._frozen_set),
             "best_quality": dict(self._best_quality),
             "best_rank": dict(self._best_rank),
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
         version = state.get("state_version")
-        if version not in {"candidate-photo.v1", "candidate-photo.v2"}:
+        if version not in {"candidate-photo.v1", "candidate-photo.v2", "candidate-photo.v3"}:
             raise ValueError("unsupported candidate photo checkpoint")
+        if state.get("anchored_roster_count") != self.anchored_roster_count:
+            raise ValueError("Candidate photo checkpoint roster policy mismatch")
+        frozen = state.get("frozen_set")
+        if frozen is not None:
+            self._verify_photo_set(frozen)
+            manifest_path = self.directory / "anchor_set" / "manifest.json"
+            if not manifest_path.is_file() or json.loads(manifest_path.read_text()) != frozen:
+                raise ValueError("Photo roster checkpoint manifest mismatch")
+        self._frozen_set = deepcopy(frozen)
         self._best_quality = {
             str(track_id): float(quality)
             for track_id, quality in dict(state.get("best_quality") or {}).items()
             if _TRACK_ID_PATTERN.fullmatch(str(track_id)) and float(quality) >= 0.0
         }
-        if version == "candidate-photo.v2":
+        if version in {"candidate-photo.v2", "candidate-photo.v3"}:
             rank_source = dict(state.get("best_rank") or {})
         else:
             # A v1 checkpoint has no pose-orientation evidence. Preserve its
@@ -124,10 +233,16 @@ class CandidatePhotoCollector:
             return None
         confidence = max(0.0, min(1.0, float(track.get("confidence") or 0.0)))
         size_factor = min(1.0, (bottom - top) / max(1.0, height * 0.28))
+        frontal_score, view_label = self._front_view_score(track, bbox_width=right - left)
+        # Sharpness is bounded by one. Skip its image work only when even the
+        # best possible sharpness cannot beat the existing selection.
+        upper_quality = round(confidence * (0.55 + 0.30 * size_factor + 0.15), 4)
+        upper_rank = round(0.55 * frontal_score + 0.45 * upper_quality, 4)
+        if upper_rank <= self._best_rank.get(track_id, -1.0):
+            return None
         crop = image[top:bottom, left:right]
         sharpness = self._sharpness(crop)
         quality = round(confidence * (0.55 + 0.30 * size_factor + 0.15 * sharpness), 4)
-        frontal_score, view_label = self._front_view_score(track, bbox_width=right - left)
         # Front-facing evidence is intentionally weighted above marginal
         # detection-quality differences. A very poor crop still cannot win,
         # because quality remains nearly half of the final rank.

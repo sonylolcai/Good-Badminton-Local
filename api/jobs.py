@@ -508,6 +508,7 @@ class AnalysisJobManager:
             "annotated_video": result.get("video"),
             "metadata": result.get("metadata"),
             "detections": result.get("detections"),
+            "shuttle_tracks": (result.get("derived") or {}).get("tracks_path"),
             "tracknet_raw_csv": result.get("tracknet_raw_csv"),
             "performance_report": result.get("performance_report"),
             "movement_metrics": result.get("movement_metrics"),

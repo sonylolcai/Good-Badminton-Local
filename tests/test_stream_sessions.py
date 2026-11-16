@@ -115,6 +115,12 @@ class StreamSessionManagerTests(unittest.TestCase):
         self.assertEqual(completed["status"], "finalized")
         status, final_status = self.manager.get_status(session_id)
         self.assertEqual(final_status["status"], "finalized")
+        same = {"schema_version": "stream-session.v1", "expected_last_segment_index": 1, "allow_partial": False}
+        self.assertEqual(self.manager.complete(session_id, same)[1]["status"], "finalized")
+        for change in ({"expected_last_segment_index": 0}, {"allow_partial": True}):
+            with self.subTest(change=change), self.assertRaises(StreamSessionError) as conflict:
+                self.manager.complete(session_id, {**same, **change})
+            self.assertEqual(conflict.exception.status_code, 409)
 
     def test_stream_request_persists_tracking_and_no_substitution_defaults(self):
         _, created = self._create("business-stream-tracker-config")

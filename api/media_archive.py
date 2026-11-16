@@ -6,11 +6,13 @@ published first under an immutable input revision; no bucket listing is needed.
 
 from __future__ import annotations
 
+from .gpu_stage_timing import stage, span
 import hashlib
 import json
 import math
 import os
 import shutil
+import statistics
 import subprocess
 import threading
 import time
@@ -146,9 +148,16 @@ def verify_segments(snapshot, segment_path, inspector):
                 or any(not isinstance(t, (int, float)) or isinstance(t, bool) or not math.isfinite(t) for t in offsets)
                 or any(abs(a - b) > 0.002 for a, b in zip(offsets, evidence["frame_offsets_sec"]))):
             raise MediaValidationError(f"segment {index}: source timestamps missing or disagree with media")
-        period = evidence["frame_period_sec"]
-        if any(b - a > period * 1.5 for a, b in zip(offsets, offsets[1:])):
-            raise MediaValidationError(f"segment {index}: internal source timestamp gap")
+        # A valid source may have sparse PTS (for example one dropped camera
+        # frame). Preserve those timestamps and report them; full decode/hash
+        # and declared-vs-decoded checks still reject corruption or invention.
+        intervals = [b - a for a, b in zip(offsets, offsets[1:])]
+        period = statistics.median(intervals) if intervals else evidence['frame_period_sec']
+        evidence['timestamp_gaps'] = [
+            {'segment_index': index, 'start_sec': entry['source_start_time_sec'] + a,
+             'end_sec': entry['source_start_time_sec'] + b, 'interval_sec': b - a,
+             'nominal_frame_period_sec': period}
+            for a, b in zip(offsets, offsets[1:]) if b - a > period * 1.5]
         if abs(entry["duration_sec"] - evidence["duration_sec"]) > 0.002:
             raise MediaValidationError(f"segment {index}: declared and decoded durations disagree")
         if previous:
@@ -197,6 +206,7 @@ class StreamMediaArchive:
             raise MediaValidationError("media archive is not ready")
         return json.loads((self._directory(session_id) / state["revision"] / "manifest.json").read_text())
 
+    @stage('media_archive_total')
     def process_session(self, session_id):
         # Serializes automatic and manual work without holding the ingest lock
         # across decoding, assembly or network I/O. Input is immutable after seal.
@@ -216,7 +226,8 @@ class StreamMediaArchive:
                      "analysis_quality_verified": False, "attempts": int(old.get("attempts", 0)) + 1}
             write_json(root / "status.json", state)
             try:
-                if getattr(self.storage, "allowed_root", None):
+                if (getattr(self.storage, "allowed_root", None)
+                        or getattr(self.storage, "requires_media_identity", False)):
                     if not snapshot.get("media_identity"):
                         raise MediaValidationError("DogeCloud archive requires a business-issued media identity")
                     try:
@@ -233,10 +244,12 @@ class StreamMediaArchive:
             write_json(root / "status.json", result)
             return result
 
+    @stage('media_prepare_upload')
     def _prepare(self, snapshot, revision, root, state):
         session_id = snapshot["analysis_session_id"]
         path_for = lambda i: self.manager._segment_path(session_id, i)
-        checked = verify_segments(snapshot, path_for, self.inspector)
+        with span(self.manager,session_id,'media_verify_source_decode'):
+            checked = verify_segments(snapshot, path_for, self.inspector)
         directory = root / revision
         directory.mkdir(parents=True, exist_ok=True)
         concat = directory / "concat.txt"
@@ -262,12 +275,14 @@ class StreamMediaArchive:
                 ensure_capacity(self.manager, 0, session_id=session_id)
             # Bound even a malformed/buggy concat output. QA rejects a truncated result.
             maximum_output = int(required * 1.1) + 1024**2
-            self.inspector._run([
-                self.inspector.ffmpeg, "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "0",
-                "-i", str(concat), "-map", "0", "-c", "copy", "-movflags", "+faststart",
-                "-fs", str(maximum_output), str(master),
-            ])
-            master_evidence = self.inspector.inspect(master)
+            with span(self.manager,session_id,'media_assemble_copy'):
+                self.inspector._run([
+                    self.inspector.ffmpeg, "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "0",
+                    "-i", str(concat), "-map", "0", "-c", "copy", "-movflags", "+faststart",
+                    "-fs", str(maximum_output), str(master),
+                ])
+            with span(self.manager,session_id,'media_verify_master_decode'):
+                master_evidence = self.inspector.inspect(master)
         if master_evidence["decoded_frame_hashes"] != expected_hashes:
             raise MediaValidationError("assembled video frames differ from ordered original segments")
         expected_duration = sum(e["duration_sec"] for e in checked)
@@ -283,18 +298,27 @@ class StreamMediaArchive:
         base = (media_prefix(snapshot["media_identity"]) if snapshot.get("media_identity") else
                 f"{self.prefix}/{snapshot['sport_id']}/{session_id}/{revision}")
         manifest = deepcopy(snapshot)
+        gaps = [gap for evidence in checked for gap in evidence['timestamp_gaps']]
+        source_timing = {'schema_version': 'source-timing.v1',
+                         'status': 'gaps_observed' if gaps else 'regular',
+                         'gap_count': len(gaps), 'gaps': gaps,
+                         'capture_completeness': 'not_verified',
+                         'policy': 'Original decoded frames and timestamps preserved; no gap filling or wall-clock coverage claim.'}
         manifest.update({"revision": revision, "status": "ready", "analysis_quality_verified": False,
                          "validation": "full_decode_frame_hash_and_source_timeline",
+                         'source_timing': source_timing,
                          "total_source_frames": len(expected_hashes)})
         state["status"] = "uploading"
         write_json(root / "status.json", state)
         for entry, evidence in zip(manifest["segments"], checked):
             entry["object_key"] = f"{base}/segments/{entry['segment_index']:08d}.mp4"
             entry["decoded_frame_count"] = evidence["frame_count"]
-            self.storage.upload(entry["object_key"], path_for(entry["segment_index"]))
+            with span(self.manager,session_id,'media_object_upload'):
+                self.storage.upload(entry["object_key"], path_for(entry["segment_index"]))
         integrity = {
             "schema_version": "media-integrity.v1", "revision": revision,
-            "sport_id": snapshot["sport_id"], "status": "complete",
+            "sport_id": snapshot["sport_id"], "status": "source_gaps" if gaps else "complete",
+            'source_timing': source_timing,
             "expected_last_segment_index": snapshot["expected_last_segment_index"],
             "source_frame_identity_verified": True, "source_timeline_verified": True,
             "master_decoded_frames_match_segments": True,
@@ -308,15 +332,19 @@ class StreamMediaArchive:
         write_json(integrity_path, integrity)
         manifest["integrity"] = {"object_key": f"{base}/integrity.json", "sha256": sha256_file(integrity_path),
                                  "content_length_bytes": integrity_path.stat().st_size}
-        self.storage.upload(manifest["integrity"]["object_key"], integrity_path)
+        with span(self.manager,session_id,'media_object_upload'):
+            self.storage.upload(manifest["integrity"]["object_key"], integrity_path)
         manifest["master"] = {"object_key": f"{base}/master.mp4", "sha256": sha256_file(master),
                               "content_length_bytes": master.stat().st_size, "duration_sec": expected_duration}
-        self.storage.upload(manifest["master"]["object_key"], master)
+        with span(self.manager,session_id,'media_object_upload'):
+            self.storage.upload(manifest["master"]["object_key"], master)
         manifest_path = directory / "manifest.json"
         write_json(manifest_path, manifest)
         key = f"{base}/manifest.json"
-        self.storage.upload(key, manifest_path)  # Commit last; failures never publish a ready manifest.
+        with span(self.manager,session_id,'media_object_upload'):
+            self.storage.upload(key, manifest_path)  # Commit last; failures never publish a ready manifest.
         return {**state, "status": "ready", "ready_at": time.time(), "manifest_object_key": key,
+                'source_timing': source_timing,
                 "manifest_sha256": sha256_file(manifest_path), "total_source_frames": len(expected_hashes),
                 "analysis_at_archive": session_analysis_status(self.manager.get_session(session_id))}
 
@@ -335,6 +363,8 @@ class StreamMediaArchive:
         with self._run_lock:
             state = self.status(session_id)
             if state.get("status") != "ready" or state.get("local_cache_status") == "released":
+                return False
+            if (state.get('source_timing') or {}).get('status') == 'gaps_observed':
                 return False
             if now - state.get("ready_at", state.get("attempted_at", now)) < grace:
                 return False
@@ -465,6 +495,6 @@ def archive_from_environment(manager):
     if os.environ.get("GOOD_BADMINTON_MEDIA_ARCHIVE_ENABLED", "0").lower() not in {"1", "true"}:
         return None
     return StreamMediaArchive(
-        manager, oss_from_environment(manager.data_dir / "oss-checkpoints"),
+        manager, oss_from_environment(manager.data_dir / "oss-checkpoints", allow_environment_routing=True),
         prefix=os.environ.get("GOOD_BADMINTON_OSS_PREFIX", "match-media"),
     )

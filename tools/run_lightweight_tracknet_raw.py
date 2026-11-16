@@ -51,6 +51,10 @@ def main():
     print('GOOD_BADMINTON_TRACKNET_EVENT=' + json.dumps({'stage': 'inference', 'runtime': 'lightweight', 'total_frames': count}), flush=True)
     detector = LightweightTrackNetDetector(checkpoint, device=args.device)
     detections = detector.predict_video(video, interpolate_isolated_missing=False)
+    declared_count = count
+    count = detector.last_decoded_frame_count
+    if count <= 0:
+        raise RuntimeError('TrackNet input contains no decodable video frames')
     raw = out / 'tracknet_raw' / (video.stem + '_ball.csv')
     export_raw(detections, count, raw)
     observed = sum(d['visible'] for d in detections)
@@ -60,6 +64,7 @@ def main():
         'source_video_sha256': hashlib.sha256(video.read_bytes()).hexdigest(),
         'raw_csv_sha256': hashlib.sha256(raw.read_bytes()).hexdigest(),
         'source_frame_count': count, 'observed_count': observed,
+        'container_declared_frame_count': declared_count,
         'observed_fraction': observed / count if count else None,
         'seq_len': detector.seq_len, 'sliding_step': detector.seq_len,
         'heatmap_threshold': detector.heatmap_threshold,
