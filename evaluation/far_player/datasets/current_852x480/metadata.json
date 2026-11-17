@@ -1,0 +1,48 @@
+{
+  "schema_version": "1.0",
+  "ground_truth_source": "agent_visual_review_with_model_proposals",
+  "reviewer": "Codex visual review; model boxes used only as proposals",
+  "review_status": "reviewed",
+  "video": {
+    "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\gradio\\e36fd7a72b6e4b1e510f6941204ef63c4fbf1d18e1f8c72314db2f106564a37a\\3-【近视角·高帧率】36岁 尚能饭否？-480P 标清-AVC.mp4",
+    "filename": "3-【近视角·高帧率】36岁 尚能饭否？-480P 标清-AVC.mp4",
+    "size_bytes": 14432725,
+    "sha256": "1d07d824b666fdd12e41d5cd87c0d3ba3e1cc7a2fed866b57a1d91c446e3de23",
+    "width": 852,
+    "height": 480,
+    "fps": 30.00001229224213,
+    "frame_count": 25931,
+    "duration_sec": 864.3663125
+  },
+  "sampling": {
+    "method": "explicit_frame_indices",
+    "source_frame_indices": [
+      1800,
+      1950,
+      2100,
+      2250,
+      2400,
+      2550,
+      2700,
+      2850,
+      3000,
+      3150,
+      3300,
+      3450
+    ],
+    "sample_count": 12,
+    "notes": "12 visually reviewed frames from 60s to 115s at 5s intervals; preliminary engineering baseline"
+  },
+  "far_roi_normalized": [
+    0.265258,
+    0,
+    0.91784,
+    0.55
+  ],
+  "far_roi_xyxy": [
+    226,
+    0,
+    782,
+    264
+  ]
+}

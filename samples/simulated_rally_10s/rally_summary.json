@@ -1,0 +1,115 @@
+{
+  "schema_version": "2.0-simulated",
+  "simulation_notice": "Synthetic example for schema and scoring validation; not a real athlete assessment.",
+  "rally": {
+    "rally_id": 1,
+    "start_time_sec": 0,
+    "end_time_sec": 10,
+    "duration_sec": 10,
+    "shot_count": 12,
+    "winner_id": "player_a",
+    "loser_id": "player_b",
+    "end_reason": "unforced_error_net",
+    "last_hitter_id": "player_b",
+    "boundary_confidence": 0.94
+  },
+  "sampling": {
+    "source_fps": 30,
+    "player_detection_hz": 10,
+    "shuttlecock_detection_hz": 30,
+    "player_samples_per_track": 101,
+    "shuttlecock_samples": 301
+  },
+  "players": {
+    "player_a": {
+      "distance_m": 23.2,
+      "average_speed_mps": 2.32,
+      "max_speed_mps": 6.14,
+      "predicted_samples": 3,
+      "data_completeness": 0.97,
+      "zone_time_sec": {
+        "rear_center": 1.3,
+        "mid_center": 5,
+        "rear_right": 1.8,
+        "front_center": 1,
+        "front_right": 0.5,
+        "mid_left": 0.5
+      },
+      "shots": 6,
+      "winners": 0,
+      "forced_errors": 0,
+      "unforced_errors": 0,
+      "shot_quality_mean": 81.2,
+      "pressure_shot_quality_mean": 80.0,
+      "demonstration_scorecard": {
+        "court_coverage": 82,
+        "movement_efficiency": 79,
+        "recovery": 81,
+        "attack_quality": 76,
+        "defense_stability": 84,
+        "shot_selection": 80,
+        "consistency": 85,
+        "overall": 81
+      }
+    },
+    "player_b": {
+      "distance_m": 26.24,
+      "average_speed_mps": 2.62,
+      "max_speed_mps": 5.85,
+      "predicted_samples": 3,
+      "data_completeness": 0.97,
+      "zone_time_sec": {
+        "mid_center": 4.8,
+        "front_center": 1.1,
+        "rear_center": 0.9,
+        "rear_left": 1.6,
+        "rear_right": 1.6,
+        "front_left": 0.1
+      },
+      "shots": 6,
+      "winners": 0,
+      "forced_errors": 0,
+      "unforced_errors": 1,
+      "shot_quality_mean": 76,
+      "pressure_shot_quality_mean": null,
+      "demonstration_scorecard": {
+        "court_coverage": 80,
+        "movement_efficiency": 77,
+        "recovery": 76,
+        "attack_quality": 84,
+        "defense_stability": 75,
+        "shot_selection": 70,
+        "consistency": 62,
+        "overall": 74
+      }
+    }
+  },
+  "shuttlecock": {
+    "max_observed_sample_speed_kmh": 183.4,
+    "predicted_samples": 9,
+    "data_completeness": 0.97
+  },
+  "error_metrics": {
+    "player_a_unforced_error_rate_per_shot": 0,
+    "player_b_unforced_error_rate_per_shot": 0.167,
+    "warning": "One rally is far below the minimum sample size for a stable error-rate or ability conclusion."
+  },
+  "assessment_validity": {
+    "level": "insufficient_sample",
+    "valid_for": [
+      "schema validation",
+      "single-rally movement description",
+      "event pipeline test"
+    ],
+    "not_valid_for": [
+      "stable athlete level",
+      "career or match-wide error rate",
+      "opponent-adjusted tactical rating"
+    ],
+    "recommended_minimum": {
+      "valid_rallies": 20,
+      "valid_shots_per_player": 50,
+      "detection_completeness": 0.9
+    }
+  }
+}

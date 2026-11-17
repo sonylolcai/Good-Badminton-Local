@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.goodbadminton.venue-gateway</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__APP_DIR__/.venv/bin/python</string>
+    <string>__APP_DIR__/agent.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__APP_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GOOD_BADMINTON_VENUE_ENV_FILE</key>
+    <string>__ENV_FILE__</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/venue-gateway.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/venue-gateway.stderr.log</string>
+</dict>
+</plist>

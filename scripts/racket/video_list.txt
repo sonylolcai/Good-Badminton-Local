@@ -1,0 +1,8 @@
+# 球拍数据集抽帧视频清单（UTF-8，每行一个视频路径，# 开头为注释）
+S:\Software Tool\bilibili-download\DownKyi-1.6.1\Media\【4k60帧】王正行，南京萝卜双打全场回放！.mp4
+S:\Software Tool\bilibili-download\DownKyi-1.6.1\Media\低视角（韩国女双）2016 羽毛球比赛外录现场 女双 女子双打 羽毛球比赛 体育运动.mp4
+S:\Software Tool\bilibili-download\DownKyi-1.6.1\Media\【4K 50帧】神龙！2024校运会 安塞龙vs森.mp4
+S:\Software Tool\bilibili-download\DownKyi-1.6.1\Media\9分逆转国际球员！什么叫世界冠军！什么叫法拉利啊！.mp4
+S:\Software Tool\bilibili-download\DownKyi-1.6.1\Media\桃田获得冠军！！退役依然可以给国家队上课！！.mp4
+S:\Software Tool\bilibili-download\DownKyi-1.6.1\Media\桃田vs黄旭俊，轻松进入决赛！.mp4
+S:\Software Tool\bilibili-download\DownKyi-1.6.1\Media\【4k60帧】王正行（国退）vs高博帅（湖南省健将）！天气真的太热了！.mp4

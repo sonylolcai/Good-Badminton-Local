@@ -1,0 +1,11 @@
+{
+  "schema_version": "stream-session.v1",
+  "segment_index": 0,
+  "source_start_time_sec": 0.0,
+  "duration_sec": 2.0,
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "idempotency_key": "ssn-01-segment-000000",
+  "content_type": "video/iso.segment",
+  "content_length_bytes": 1048576,
+  "court_corners": [[100, 80], [1820, 80], [1900, 1020], [40, 1020]]
+}

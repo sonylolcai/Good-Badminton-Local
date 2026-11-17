@@ -1,0 +1,15 @@
+{
+  "schema_version": "stream-session.v1",
+  "request_id": "req-segment-conflict-0001",
+  "analysis_session_id": "ssn_01J5STREAMSESSION001",
+  "error": {
+    "code": "segment_hash_conflict",
+    "message": "segment_index 0 was already accepted with a different SHA-256 digest",
+    "retryable": false,
+    "details": {
+      "segment_index": 0,
+      "accepted_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "submitted_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    }
+  }
+}

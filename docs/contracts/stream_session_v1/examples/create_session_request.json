@@ -1,0 +1,19 @@
+{
+  "schema_version": "stream-session.v1",
+  "camera_id": "court-01-camera-a",
+  "calibration_id": "court-01-calibration-20260823",
+  "court_corners": [[100, 80], [1820, 80], [1900, 1020], [40, 1020]],
+  "analysis_mode": "person_only",
+  "client_reference": "opaque-business-session-8f35f2",
+  "configuration": {
+    "analysis_sample_hz": 10,
+    "pose_imgsz": 960,
+    "shuttle_detector": "none",
+    "generate_annotated_video": false,
+    "tracker_backend": "bytetrack",
+    "lock_match_roster": true,
+    "roster_stable_frames": 3,
+    "preserve_audio": false,
+    "court_health_check_hz": 2
+  }
+}

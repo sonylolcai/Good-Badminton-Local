@@ -1,0 +1,22 @@
+{
+  "version": "anonymous-visual-metrics.v1",
+  "sha256": "cdd846390211ec49fa8ef188be1e924967bebe1df4ea55fe68667d645ba9b1f8",
+  "origin": "synchronized with business_gateway metrics 2026-11-17; R8 contiguous core stability action state machine + time-local opponent resolution",
+  "files": {
+    "result_contract.py": "0cd1315124a7718b2b8a1608eac89d83ed9024b1e640d69a95b2b3c773d41ac4",
+    "metrics/heatmap_grid.py": "7e7321355422ade8ba1e06841013ade81165058715a349f88eca566db01b667e",
+    "metrics/receiving_route_estimate.py": "128853f2a2133dcb86749dda416aea5dbeb7f82aecd6a7f601acf905b633fde4",
+    "metrics/movement_profile.py": "79f0b04f824cf8913608a53d66d42a04940159537d3d0989ceb72e5c0fe9d229",
+    "metrics/performance_charts.py": "b02b9cd64696f522bfcebd7d21b764b956bd0a71d0a328699c42b2bf0956e44d",
+    "metrics/__init__.py": "20376862c720e62b2e32437c68fed435c363784846b032cab6cde55b93329e81",
+    "metrics/movement.py": "da0aa2f0966f19535a0f8ad03b991173fe07d1a25079ba34a2a46de24c63d18a",
+    "metrics/technical_profile.py": "c35604b076b0330923c20eff9580285ce7210ec9ed5d1919404687e92fbdca4d",
+    "metrics/detections_reader.py": "92ae619ea3c9354c35cbde4f10b308f4a5d89cefccbb6fc97c50dcec044426be",
+    "metrics/tactical_pose_metrics.py": "ddc4fb8174619a7728e2e21470e121594c83e308322b73648c3a3a542dae6734",
+    "metrics/shot_route_profile.py": "205aea0166ef693ec62db17450c885cb1d0cdcffca5a9bda795cbd123072dcad",
+    "derivation.py": "de25667a970f9e7811ad5ec832397cff092747a8e05402936201ef70853dbb14",
+    "detections_core.py": "9c881e07a3ce69e1306720e03d3b1bba56ab18e79b560019806c4f0df25be17c",
+    "candidates.py": "99725f3b06a5b0ded6abe71aa5bf52e7c63f2434469de954ee42e5e4e9fa5f25"
+  },
+  "runtime_sha256": "d70fe5e628ecf72ba611478e65de897d7ccdbd151cdc7d40522173aaf504bfc1"
+}

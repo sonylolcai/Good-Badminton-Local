@@ -6,6 +6,15 @@ import time
 import cv2
 
 
+def _find_ffmpeg():
+    """Prefer MoviePy's bundled FFmpeg, then fall back to PATH."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
 def encode_vscode_compatible_mp4(input_video_path, output_path, audio_source_path=None):
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -16,7 +25,7 @@ def encode_vscode_compatible_mp4(input_video_path, output_path, audio_source_pat
         final_output_path = f"{output_path}.h264.tmp.mp4"
 
     command = [
-        "ffmpeg",
+        _find_ffmpeg(),
         "-y",
         "-i",
         input_video_path,
@@ -55,7 +64,14 @@ def encode_vscode_compatible_mp4(input_video_path, output_path, audio_source_pat
         ]
     )
 
-    result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
     if result.returncode != 0 or not os.path.exists(final_output_path) or os.path.getsize(final_output_path) == 0:
         message = result.stderr.strip()[-1000:] if result.stderr else "unknown ffmpeg error"
         raise RuntimeError(f"ffmpeg H.264 export failed: {message}")

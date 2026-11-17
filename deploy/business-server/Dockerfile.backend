@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_INDEX_URL=$PIP_INDEX_URL
+COPY deploy/business-server/requirements.txt /tmp/requirements.txt
+# The business server may have a slow outbound route to PyPI during its first
+# deployment.  Keep a bounded retry policy so a transient read timeout does
+# not leave the release half-built.
+RUN pip install --no-cache-dir --retries 5 --timeout 120 -r /tmp/requirements.txt
+COPY . /app

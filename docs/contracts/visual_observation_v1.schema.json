@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://good-sports.local/contracts/visual-observation.v1.schema.json",
+  "title": "Visual Observation v1",
+  "description": "Sport-neutral person and ball evidence emitted by independently deployed GPU vision implementations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sport_id",
+    "observation_type",
+    "source_frame_index",
+    "source_time_sec",
+    "coordinate_system",
+    "evidence_state",
+    "confidence",
+    "data"
+  ],
+  "properties": {
+    "schema_version": { "const": "visual-observation.v1" },
+    "sport_id": { "enum": ["badminton", "tennis"] },
+    "observation_type": { "enum": ["person", "ball"] },
+    "source_frame_index": { "type": "integer", "minimum": 0 },
+    "source_time_sec": { "type": "number", "minimum": 0 },
+    "coordinate_system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "unit", "court_dimensions_m"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "unit": { "const": "meter" },
+        "court_dimensions_m": {
+          "type": "array",
+          "prefixItems": [
+            { "type": "number", "exclusiveMinimum": 0 },
+            { "type": "number", "exclusiveMinimum": 0 }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "evidence_state": { "enum": ["detected", "predicted", "missing"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "data": {
+      "oneOf": [
+        { "$ref": "#/$defs/personData" },
+        { "$ref": "#/$defs/ballData" }
+      ]
+    }
+  },
+  "$defs": {
+    "nullablePoint": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "array",
+          "prefixItems": [{ "type": "number" }, { "type": "number" }],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      ]
+    },
+    "nullableBox": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "array",
+          "prefixItems": [
+            { "type": "number" }, { "type": "number" },
+            { "type": "number" }, { "type": "number" }
+          ],
+          "minItems": 4,
+          "maxItems": 4
+        }
+      ]
+    },
+    "poseData": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["format", "evidence_state", "keypoints_image", "keypoint_scores"],
+      "properties": {
+        "format": { "const": "coco17_image_v1" },
+        "evidence_state": { "enum": ["detected", "missing"] },
+        "keypoints_image": { "type": ["array", "null"] },
+        "keypoint_scores": { "type": ["array", "null"] }
+      }
+    },
+    "personData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "track_id", "role", "bbox_xyxy", "ground_image_xy", "court_xy_m", "pose"],
+      "properties": {
+        "kind": { "const": "person" },
+        "track_id": { "type": "string", "minLength": 1 },
+        "role": { "type": ["string", "null"] },
+        "bbox_xyxy": { "$ref": "#/$defs/nullableBox" },
+        "ground_image_xy": { "$ref": "#/$defs/nullablePoint" },
+        "court_xy_m": { "$ref": "#/$defs/nullablePoint" },
+        "pose": { "$ref": "#/$defs/poseData" }
+      }
+    },
+    "ballData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "image_xy", "court_xy_m", "model_checkpoint"],
+      "properties": {
+        "kind": { "enum": ["shuttlecock", "tennis_ball"] },
+        "image_xy": { "$ref": "#/$defs/nullablePoint" },
+        "court_xy_m": { "$ref": "#/$defs/nullablePoint" },
+        "model_checkpoint": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

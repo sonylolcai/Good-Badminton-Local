@@ -1,0 +1,15 @@
+{
+  "schema_version": "stream-session.v1",
+  "analysis_session_id": "ssn_01J5STREAMSESSION001",
+  "segment_index": 0,
+  "session_status": "queued",
+  "receipt": {
+    "accepted": true,
+    "reused": false,
+    "received_at": "2026-08-23T10:00:02Z",
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "content_length_bytes": 1048576,
+    "processing_disposition": "queued"
+  },
+  "status_url": "/api/v1/stream-sessions/ssn_01J5STREAMSESSION001"
+}

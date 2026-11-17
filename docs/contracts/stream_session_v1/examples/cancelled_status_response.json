@@ -1,0 +1,29 @@
+{
+  "schema_version": "stream-session.v1",
+  "analysis_session_id": "ssn_01J5STREAMSESSION001",
+  "status": "cancelled",
+  "current_stage": "cancelled",
+  "updated_at": "2026-08-23T10:04:00Z",
+  "sealed": true,
+  "progress": {
+    "received_segments": 120,
+    "processed_segments": 118,
+    "failed_segments": 0,
+    "received_duration_sec": 240.0,
+    "processed_source_time_sec": 236.0,
+    "failed_source_time_sec": 0.0,
+    "backlog_duration_sec": 4.0,
+    "next_expected_segment_index": 120,
+    "missing_segment_indexes": [],
+    "failed_segment_indexes": []
+  },
+  "track_candidates": [],
+  "error": {
+    "code": "cancelled_by_operator",
+    "message": "session processing was cancelled by an authorized operator",
+    "retryable": false,
+    "details": {}
+  },
+  "processing_errors": [],
+  "artifacts": []
+}

@@ -12,19 +12,30 @@ from .detector import auto_detect_court_corners, render_auto_court_preview
 
 
 class CourtMapper:
-    def __init__(self, image_court_corners, court_dimensions=(6.1, 13.4)):
+    def __init__(self, image_court_corners, court_dimensions=(6.1, 13.4), world_points_m=None):
         """
         Initialize CourtMapper with court corners and dimensions
         Args:
             image_court_corners: List of 4 points [(x1,y1), ...] representing court corners in image
             court_dimensions: Tuple of (width, height) in meters, default badminton court size
+            world_points_m: Optional four world-coordinate points matching the
+                image points.  This is required when the camera only sees a
+                calibrated sub-region such as a tennis near half-court.
         """
         self.image_court_corners = np.array(image_court_corners, dtype=np.float32)
         self.court_dimensions = court_dimensions
-        court_points = np.array([
-            [0, 0], [court_dimensions[0], 0],
-            [court_dimensions[0], court_dimensions[1]], [0, court_dimensions[1]]
-        ], dtype=np.float32)
+        if world_points_m is None:
+            court_points = np.array([
+                [0, 0], [court_dimensions[0], 0],
+                [court_dimensions[0], court_dimensions[1]], [0, court_dimensions[1]]
+            ], dtype=np.float32)
+        else:
+            court_points = np.asarray(world_points_m, dtype=np.float32)
+            if court_points.shape != (4, 2):
+                raise ValueError("world_points_m must contain exactly four [x, y] points")
+            if len({tuple(point) for point in court_points.tolist()}) != 4:
+                raise ValueError("world_points_m must contain four distinct points")
+        self.world_points_m = court_points
         self.matrix = cv2.getPerspectiveTransform(self.image_court_corners, court_points)
         self.inv_matrix = cv2.getPerspectiveTransform(court_points, self.image_court_corners)
 
@@ -38,7 +49,10 @@ class CourtMapper:
         Returns:
             Transformed (x,y) coordinates in court space
         """
-        if not isinstance(point, (list, tuple, np.ndarray)) or not point:
+        if (
+            not isinstance(point, (list, tuple, np.ndarray))
+            or len(np.asarray(point).reshape(-1)) == 0
+        ):
             return []
         point = np.array(point, dtype=np.float32).reshape(-1, 1, 2)
         transformed_points = cv2.perspectiveTransform(point, self.matrix)

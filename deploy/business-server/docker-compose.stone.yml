@@ -1,0 +1,96 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${GOOD_BADMINTON_POSTGRES_USER:-goodbadminton}
+      POSTGRES_PASSWORD: ${GOOD_BADMINTON_POSTGRES_PASSWORD:?set in business.env}
+      POSTGRES_DB: ${GOOD_BADMINTON_POSTGRES_DB:-good_badminton}
+    volumes:
+      - good_badminton_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks: [private]
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/business-server/Dockerfile.backend
+    env_file: /etc/good-badminton/business.env
+    command: ["python", "deploy/business-server/apply_migrations.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [private]
+    profiles: [migration]
+
+  seed-good-yushi:
+    build:
+      context: ../..
+      dockerfile: deploy/business-server/Dockerfile.backend
+    env_file: /etc/good-badminton/business.env
+    command: ["python", "deploy/business-server/seed_good_yushi_pilot.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [private]
+    profiles: [seed]
+
+  edge-gateway:
+    container_name: good-badminton-edge-gateway
+    build:
+      context: ../..
+      dockerfile: deploy/business-server/Dockerfile.backend
+    env_file: /etc/good-badminton/business.env
+    command: ["python", "-m", "business_gateway.edge_api"]
+    volumes:
+      - edge_staging:/var/lib/good-badminton/edge-staging
+      - edge_preview:/var/lib/good-badminton/edge-preview
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [private, stone_proxy]
+
+  operator-api:
+    container_name: good-badminton-operator-api
+    build:
+      context: ../..
+      dockerfile: deploy/business-server/Dockerfile.backend
+    env_file: /etc/good-badminton/business.env
+    command: ["uvicorn", "operator_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      edge-gateway:
+        condition: service_started
+    restart: unless-stopped
+    networks: [private, stone_proxy]
+
+  operator-web:
+    container_name: good-badminton-operator-web
+    build:
+      context: ../..
+      dockerfile: deploy/business-server/Dockerfile.web
+      args:
+        NEXT_PUBLIC_OPERATOR_API_BASE_URL: ${NEXT_PUBLIC_OPERATOR_API_BASE_URL:?set in business.env}
+        NEXT_PUBLIC_OPERATOR_BASE_PATH: /badminton
+    environment:
+      OPERATOR_API_SERVER_BASE_URL: http://good-badminton-operator-api:8000
+      NEXT_PUBLIC_OPERATOR_BASE_PATH: /badminton
+    restart: unless-stopped
+    networks: [stone_proxy]
+
+networks:
+  private:
+  stone_proxy:
+    external: true
+    name: api-server_default
+
+volumes:
+  good_badminton_postgres:
+  edge_staging:
+  edge_preview:

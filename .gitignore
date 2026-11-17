@@ -6,15 +6,31 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.venv/
-venv/
-env/
+.venv*/
+venv*/
+env*/
 .agents/
 
 # Local inputs and generated outputs
 results/
 outputs/
+api_data*/
+.gpu-api.env
+.webui-remote-gpu.env
+.webui-operator.env
+.env.development
+.env.production
+business_gateway/fixed_video_catalog.local.json
 *.log
+# Local deployment artifact: upload it to the GPU provider, never commit it.
+deploy/good-badminton-gpu-api-upload.zip
+# Deployment archives are generated from the tracked scripts. The TrackNet
+# archive and Ultralytics checkout are third-party inputs, not project source.
+deploy/*.zip
+# Release bundles are generated from tracked deployment scripts; keep them
+# locally for upload, never in Git history.
+deploy/release/*.zip
+Ultralytics/
 
 # Model weights are intentionally not published
 weights/*
@@ -23,8 +39,34 @@ weights/*
 *.pth
 *.onnx
 
+# Local, potentially large training datasets are reproduced from their
+# separately retained source annotations rather than checked into Git.
+datasets/
+
 # OS and editor files
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+
+# Private configuration and compatibility links.
+.env
+.env.*
+*.env
+*.env.*
+!.env*.example
+!*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+project.private.config.json
+venue-gateway-cameras.json
+.webui-remote-gpu.env
+.webui-operator.env
+# Public maintenance files, including the research repo allowlist.
+!config/local-secrets.json
+!config/*.example
+!.githooks/pre-commit
+# Keep last: never unignore private files.
+.secrets/
