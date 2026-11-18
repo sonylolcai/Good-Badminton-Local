@@ -633,6 +633,8 @@ class StreamSessionManager:
             # partial results without mistaking them for a normal full seal.
             value['capture_lease'] = {key: lease[key] for key in
                 ('lease_id', 'state', 'end_reason', 'expires_at', 'ended_at')}
+        if isinstance(session.get("video"), dict) and session["video"]:
+            value["video"] = dict(session["video"])
         return value
 
     def _project_status_evidence(self, session_id):
@@ -786,14 +788,20 @@ class StreamSessionManager:
     def _create_engine(self, session):
         self._verify_execution_profile(session)
         measurement, temporal = self._make_processors(session)
-        if self.engine_factory is not None:
-            return self.engine_factory(session, measurement, temporal)
-        return AnalysisEngine(
+        engine = self.engine_factory(session, measurement, temporal) if self.engine_factory else AnalysisEngine(
             analysis_session_id=session["analysis_session_id"],
             analysis_sample_hz=int(session["configuration"]["analysis_sample_hz"]),
             measurement_processor=measurement,
             temporal_processor=temporal,
         )
+        return self._bind_route_geometry(session, engine)
+
+    @staticmethod
+    def _bind_route_geometry(session, engine):
+        if (isinstance(engine, AnalysisEngine)
+                and session["configuration"].get("shuttle_detector") in {"tracknet_v3", "yolo"}):
+            engine.bind_route_geometry(session.get("calibration_frame_size"))
+        return engine
 
     def _restore_engine(self, session, checkpoint):
         self._verify_execution_profile(session)
@@ -822,8 +830,10 @@ class StreamSessionManager:
                     "engine_factory must accept (session, measurement, temporal, checkpoint) "
                     "to support restart recovery"
                 )
-            return self.engine_factory(session, measurement, temporal, checkpoint)
-        return AnalysisEngine.restore(checkpoint, measurement, temporal_processor=temporal)
+            engine = self.engine_factory(session, measurement, temporal, checkpoint)
+        else:
+            engine = AnalysisEngine.restore(checkpoint, measurement, temporal_processor=temporal)
+        return self._bind_route_geometry(session, engine)
 
     def _verify_execution_profile(self, session):
         recorded = session.get("execution_profile")
@@ -2649,6 +2659,19 @@ class StreamSessionManager:
                 continuity_epoch=int(latest.get("continuity_epoch", 0)),
             )
             self._save_checkpoint(session_id, result.checkpoint)
+            if not latest.get("calibration_frame_size") and result.checkpoint.get("calibration_frame_size"):
+                latest["calibration_frame_size"] = result.checkpoint["calibration_frame_size"]
+            ckpt_video = (result.checkpoint or {}).get("video")
+            if isinstance(ckpt_video, dict) and ckpt_video:
+                existing_video = dict(latest.get("video") or {})
+                for k in ("width", "height", "fps"):
+                    if existing_video.get(k) is None and ckpt_video.get(k) is not None:
+                        existing_video[k] = ckpt_video[k]
+                if existing_video:
+                    latest["video"] = existing_video
+            if latest.get("calibration_frame_size"):
+                height, width = latest["calibration_frame_size"]
+                latest.setdefault("video", {}).update(width=width, height=height)
             latest_entry = latest.get("segments", {}).get(str(index))
             if latest_entry is None:
                 self._fail_session(
@@ -3122,6 +3145,12 @@ class StreamSessionManager:
                 self._mark_interrupted(session, "checkpoint missing after restart; continuity cannot be restored")
                 continue
             if checkpoint is not None:
+                if not session.get("calibration_frame_size") and checkpoint.get("calibration_frame_size"):
+                    session["calibration_frame_size"] = checkpoint["calibration_frame_size"]
+                    height, width = session["calibration_frame_size"]
+                    video = dict(checkpoint.get("video") or {})
+                    video.update(width=width, height=height)
+                    session["video"] = video
                 try:
                     replacement = self._recover_engine_after_failed_cursor(
                         session,

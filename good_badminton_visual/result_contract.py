@@ -74,5 +74,29 @@ def validate_metrics(metrics):
                     or cr.get('track_id')!=p['track_id'] or cr.get('status') not in ('observed','insufficient_measurements')
                     or not isinstance(cr.get('dimensions'),list) or len(cr['dimensions'])!=6):
                 raise ResultContractError()
+        if 'shot_route_profile' in p and isinstance(p['shot_route_profile'],dict) and p['shot_route_profile'].get('source')=='shot_candidates_receiving_region.v1':
+            sr=p['shot_route_profile']
+            n=sr.get('sample_count');hits=sr.get('hit_candidate_count');val=sr.get('value');norm=sr.get('normalized_value')
+            if (sr.get('schema_version')!='shot-route-profile.v1' or sr.get('track_id')!=p['track_id']
+                    or sr.get('metric')!='opponent_receiving_region_diversity'
+                    or sr.get('status') not in ('estimated','insufficient_candidate_pairs')
+                    or type(n) is not int or n<0 or type(hits) is not int or hits<0
+                    or sr.get('competitive_rating') is not False or 'events' in sr or 'event_ids' in sr):
+                raise ResultContractError()
+            if sr.get('status')=='estimated':
+                if n<1 or not finite(val) or not 0<=val<=1 or not finite(norm) or not 0<=norm<=100 or abs(norm-val*100)>.15:
+                    raise ResultContractError()
+            elif n!=0 or val is not None or norm is not None:
+                raise ResultContractError()
+            dist=sr.get('distribution') or {}
+            if not isinstance(dist,dict) or any(k not in {str(i) for i in range(9)} or type(v) is not int or v<0 for k,v in dist.items()) or sum(dist.values())!=n:
+                raise ResultContractError()
+            hm=sr.get('receiving_heatmap')
+            if (not isinstance(hm,dict) or hm.get('schema_version')!='court-heatmap-grid.v1'
+                    or hm.get('coordinate_space')!='opponent_half' or hm.get('rows')!=7 or hm.get('columns')!=6
+                    or not isinstance(hm.get('cells'),list) or len(hm['cells'])!=42
+                    or hm.get('sample_count')!=n or hm.get('total_route_samples')!=n
+                    or sum(int(c.get('count') or 0) for c in hm['cells'] if isinstance(c,dict))!=n):
+                raise ResultContractError()
         ids.append(p['track_id'])
     if len(set(ids))!=len(ids):raise ResultContractError()

@@ -79,6 +79,18 @@ class AnalysisEngine:
         # tracker timeline.
         self.continuity_epoch = 0
         self.gap_segment_indexes: list[int] = []
+        self.video_width: Optional[int] = None
+        self.video_height: Optional[int] = None
+        self.video_fps: Optional[float] = None
+        self.verify_route_geometry = False
+        self.calibration_frame_size: tuple[int, int] | None = None
+
+    def bind_route_geometry(self, saved_size: Any) -> None:
+        self.verify_route_geometry = True
+        if isinstance(saved_size, (list, tuple)) and len(saved_size) == 2 and all(
+            type(value) is int and value > 0 for value in saved_size
+        ):
+            self.calibration_frame_size = tuple(saved_size)
 
     @classmethod
     def restore(
@@ -137,6 +149,13 @@ class AnalysisEngine:
 
         segment_source_frames = 0
         segment_measurement_frames = 0
+        segment_first_time: Optional[float] = None
+        segment_last_time: Optional[float] = None
+        if segment.video_width and segment.video_height and self.video_width is None:
+            self.video_width = int(segment.video_width)
+            self.video_height = int(segment.video_height)
+        if segment.video_fps and float(segment.video_fps) > 0 and self.video_fps is None:
+            self.video_fps = round(float(segment.video_fps), 6)
         events: list[dict] = []
         temporal_frames: list[Any] = []
         temporal_contexts: list[FrameContext] = []
@@ -169,6 +188,8 @@ class AnalysisEngine:
             except (TypeError, ValueError):
                 temporal_accepts_flush_boundary = False
         last_context: Optional[FrameContext] = None
+        first_context: Optional[FrameContext] = None
+        geometry_error: str | None = None
 
         def stage_batch(
             timeline_key: str,
@@ -250,7 +271,19 @@ class AnalysisEngine:
                 if packet.source_time_sec + 1e-9 < self.last_source_time_sec:
                     raise SegmentOrderError("frame source time moves backwards")
 
-                measurement_bucket = int(math.floor(packet.source_time_sec * self.analysis_sample_hz + 1e-9))
+                shape = getattr(packet.frame, "shape", ())
+                decoded_size = (
+                    (int(shape[0]), int(shape[1])) if shape is not None and len(shape) >= 2
+                    and int(shape[0]) > 0 and int(shape[1]) > 0 else None
+                )
+                if decoded_size is not None:
+                    if self.video_height is None or self.video_width is None:
+                        self.video_height, self.video_width = decoded_size
+                if segment_first_time is None:
+                    segment_first_time = float(packet.source_time_sec)
+                segment_last_time = float(packet.source_time_sec)
+
+                measurement_bucket = int(math.floor(packet.source_time_sec * self.analysis_sample_hz + 5e-5))
                 is_measurement = measurement_bucket > self.last_measurement_bucket
                 context = FrameContext(
                     analysis_session_id=self.analysis_session_id,
@@ -263,6 +296,16 @@ class AnalysisEngine:
                         descriptor.source_frame_start_index is not None
                     ),
                 )
+                if first_context is None:
+                    first_context = context
+                    if (self.verify_route_geometry and self.calibration_frame_size is None
+                            and self.continuity_epoch == 0 and descriptor.segment_index == 0):
+                        self.calibration_frame_size = decoded_size
+                if self.verify_route_geometry:
+                    if self.calibration_frame_size is None or decoded_size is None:
+                        geometry_error = geometry_error or "calibration_frame_size_unverified"
+                    elif decoded_size != self.calibration_frame_size:
+                        geometry_error = "calibration_frame_size_mismatch"
                 last_context = context
 
                 if self.temporal_processor is not None:
@@ -296,6 +339,13 @@ class AnalysisEngine:
 
             flush_window(is_final=True)
 
+            if geometry_error and first_context is not None:
+                stage_batch("route_geometry", -1, [(first_context, [ProcessorEvent(
+                    event_type="session_status",
+                    evidence_state="derived",
+                    confidence=1.0,
+                    data={"candidate_route_geometry": geometry_error},
+                )])])
             staged_events.sort(key=lambda item: (item[0], item[1], item[2]))
             for _, _, _, timeline_key, event, ctx in staged_events:
                 events.append(self._materialize_event(event, ctx, timeline_key=timeline_key))
@@ -310,6 +360,14 @@ class AnalysisEngine:
             if callable(close):
                 close()
 
+        if (
+            self.video_fps is None
+            and segment_source_frames >= 2
+            and segment_first_time is not None
+            and segment_last_time is not None
+            and segment_last_time > segment_first_time
+        ):
+            self.video_fps = round((segment_source_frames - 1) / (segment_last_time - segment_first_time), 4)
         self.processed_segments[descriptor.segment_index] = descriptor.sha256
         self.next_expected_segment_index += 1
         checkpoint = self.checkpoint()
@@ -462,6 +520,15 @@ class AnalysisEngine:
                 "event_sequence": self.event_sequence,
                 "continuity_epoch": self.continuity_epoch,
                 "gap_segment_indexes": list(self.gap_segment_indexes),
+                "calibration_frame_size": list(self.calibration_frame_size) if self.calibration_frame_size else None,
+                "video": (
+                    {
+                        **({"width": self.video_width} if self.video_width is not None else {}),
+                        **({"height": self.video_height} if self.video_height is not None else {}),
+                        **({"fps": self.video_fps} if self.video_fps is not None else {}),
+                    }
+                    or None
+                ),
                 "measurement_processor_state": measurement_state,
                 "temporal_processor_state": temporal_state,
             }
@@ -517,6 +584,18 @@ class AnalysisEngine:
         self.gap_segment_indexes = sorted(
             {int(index) for index in checkpoint.get("gap_segment_indexes", [])}
         )
+        if checkpoint.get("calibration_frame_size") is not None:
+            self.bind_route_geometry(checkpoint["calibration_frame_size"])
+        video = checkpoint.get("video") or {}
+        if isinstance(video, Mapping):
+            w, h, fps = video.get("width"), video.get("height"), video.get("fps")
+            self.video_width = int(w) if isinstance(w, (int, float)) and w > 0 else None
+            self.video_height = int(h) if isinstance(h, (int, float)) and h > 0 else None
+            self.video_fps = float(fps) if isinstance(fps, (int, float)) and fps > 0 else None
+        else:
+            self.video_width = None
+            self.video_height = None
+            self.video_fps = None
 
     def _run_processor(
         self,

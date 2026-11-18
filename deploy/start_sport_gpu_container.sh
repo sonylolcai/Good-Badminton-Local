@@ -30,6 +30,7 @@ set -a
 source "$ENV_FILE"
 set +a
 export GOOD_BADMINTON_GPU_PURE_STREAM_ONLY="${GOOD_BADMINTON_GPU_PURE_STREAM_ONLY:-1}"
+export GOOD_BADMINTON_VISUAL_RESULT_ENABLED="${GOOD_BADMINTON_VISUAL_RESULT_ENABLED:-1}"
 PORT="${PORT:-8080}"
 
 # The profile is selected by the immutable Python entry point, not by this

@@ -233,14 +233,29 @@ class VisualResultTests(unittest.TestCase):
             self.assertEqual((code,value['state']),(200,'failed'))
 
     def test_cpu_failure_persists_and_restart_does_not_rerun_failed_evidence(self):
+        from good_badminton_visual.result_contract import ResultContractError
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);s,_,_,manager=fixtures(root);executor=Mock();future=Future()
             executor.submit.return_value=future;service=VisualResultService(manager,active=True,executor=executor)
-            service.notify(s['analysis_session_id']);service.tick();future.set_exception(ValueError('bad evidence'))
+            service.notify(s['analysis_session_id']);service.tick();future.set_exception(ResultContractError('insufficient_player_evidence'))
             service.tick();code,value=service.read(s)
             self.assertEqual((code,value['state']),(200,'failed'))
+            self.assertEqual(value['detail_code'],'insufficient_player_evidence')
             restored=VisualResultService(manager,active=True,executor=Mock())
             restored.notify(s['analysis_session_id']);restored.tick();restored.executor.submit.assert_not_called()
+
+    def test_visual_result_capability_defaults_enabled_when_unset(self):
+        from api.visual_result import enabled
+        with patch.dict('os.environ',{},clear=False):
+            import os
+            previous = os.environ.pop('GOOD_BADMINTON_VISUAL_RESULT_ENABLED', None)
+            try:
+                self.assertTrue(enabled())
+                with patch.dict('os.environ',{'GOOD_BADMINTON_VISUAL_RESULT_ENABLED':'0'}):
+                    self.assertFalse(enabled())
+            finally:
+                if previous is not None:
+                    os.environ['GOOD_BADMINTON_VISUAL_RESULT_ENABLED'] = previous
 
     def test_submit_failure_requeues_for_restart_safe_retry(self):
         with tempfile.TemporaryDirectory() as temp:

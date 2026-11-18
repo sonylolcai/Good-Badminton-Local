@@ -91,7 +91,7 @@ GOOD_BADMINTON_WHEELHOUSE="${GOOD_BADMINTON_WHEELHOUSE:-}" \
 if [[ ! -f "$APP_DIR/.gpu-api.env" ]]; then
   umask 077
   api_key="$(openssl rand -hex 32)"
-  printf 'GOOD_BADMINTON_API_KEY=%s\nGOOD_BADMINTON_API_DATA_DIR=%s/api_data\nPORT=8080\n' \
+  printf 'GOOD_BADMINTON_API_KEY=%s\nGOOD_BADMINTON_API_DATA_DIR=%s/api_data\nGOOD_BADMINTON_VISUAL_RESULT_ENABLED=1\nPORT=8080\n' \
     "$api_key" "$APP_DIR" > "$APP_DIR/.gpu-api.env"
   echo "Created $APP_DIR/.gpu-api.env. Store its API key in the business service secret manager."
 fi

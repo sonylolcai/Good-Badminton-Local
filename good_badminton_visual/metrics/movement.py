@@ -14,20 +14,24 @@ import math
 import time
 from pathlib import Path
 
-from good_badminton_visual.metrics.movement_profile import movement_profile
-from good_badminton_visual.metrics.technical_profile import technical_profile
-from good_badminton_visual.metrics.performance_charts import performance_charts
-from good_badminton_visual.metrics.shot_route_profile import shot_route_profile
-from good_badminton_visual.metrics.receiving_route_estimate import (
+from .movement_profile import movement_profile
+from .technical_profile import technical_profile
+from .performance_charts import performance_charts
+from .shot_route_profile import shot_route_profile
+from .receiving_route_estimate import (
     VERSION as ROUTE_ESTIMATOR_VERSION, estimate_receiving_routes, receiving_route_estimate_profile,
     personal_receiving_estimate_profile,
 )
-from good_badminton_visual.metrics.tactical_pose_metrics import (
+from .stream_candidate_routes import (
+    SOURCE as CANDIDATE_ROUTE_SOURCE,
+    _empty_profile as _empty_candidate_route_profile,
+)
+from .tactical_pose_metrics import (
     build_tactical_and_joint_profile,
     collect_detections_pose_and_shot_evidence,
 )
 
-from good_badminton_visual.metrics.detections_reader import (
+from .detections_reader import (
     collect_track_position_evidence,
 )
 
@@ -64,6 +68,8 @@ def generate_movement_metrics(
     metadata_path=None,
     body_profiles_path=None,
     shot_route_events_path=None,
+    candidate_shot_routes=None,
+    shot_route_mode=None,
 ):
     """Persist per-track movement evidence and a simple energy estimate.
 
@@ -124,17 +130,33 @@ def generate_movement_metrics(
             shot_route_events_path or output_dir / 'evidence' / 'shot_route_events_v1.json', duration_sec=duration_sec)
         estimated_routes = receiving_route_estimate_profile(track_id, route_estimates)
         player['receiving_profile'] = personal_receiving_estimate_profile(track_id, route_estimates)
-        player['shot_route_profile'] = (reviewed_routes if reviewed_routes['status'] == 'observed'
+        legacy_shot_route = dict(reviewed_routes if reviewed_routes['status'] == 'observed'
             or estimated_routes['status'] != 'estimated' else estimated_routes)
-        player['shot_route_profile'].update(estimator_version=ROUTE_ESTIMATOR_VERSION,
+        legacy_shot_route.update(estimator_version=ROUTE_ESTIMATOR_VERSION,
             reviewed_source_sha256=reviewed_routes['source_sha256'],
             confirmed_sample_count=reviewed_routes['sample_count'])
+        if shot_route_mode == CANDIDATE_ROUTE_SOURCE or candidate_shot_routes is not None:
+            if reviewed_routes['status'] == 'observed':
+                player['shot_route_profile'] = dict(reviewed_routes)
+            else:
+                candidate_players = (candidate_shot_routes or {}).get('players') or {}
+                candidate_profile = candidate_players.get(track_id) or _empty_candidate_route_profile(
+                    track_id,
+                    missing_reason=(candidate_shot_routes or {}).get('missing_reason') or 'no_valid_candidate_pairs',
+                )
+                player['shot_route_profile'] = dict(candidate_profile)
+            player['shot_route_profile'].update(
+                reviewed_source_sha256=reviewed_routes['source_sha256'],
+                confirmed_sample_count=reviewed_routes['sample_count'],
+            )
+        else:
+            player['shot_route_profile'] = legacy_shot_route
         tactical_joint = build_tactical_and_joint_profile(
             track_id,
             performance_charts_data=player.get("performance_charts"),
             movement_data=player.get("movement"),
             ability_scores_data=player.get("ability_scores"),
-            shot_route_data=player.get("shot_route_profile"),
+            shot_route_data=legacy_shot_route,
             duration_sec=duration_sec,
             pose_evidence=pose_evidence_by_track.get(track_id),
         )

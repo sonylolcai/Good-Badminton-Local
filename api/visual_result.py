@@ -23,7 +23,10 @@ CONFIGURATION_KEYS = frozenset(('analysis_sample_hz', 'pose_imgsz', 'shuttle_det
     'match_mode', 'far_player_enhancement', 'sport_id', 'session_mode', 'calibration_scope'))
 
 def enabled():
-    return os.environ.get('GOOD_BADMINTON_VISUAL_RESULT_ENABLED') == '1'
+    raw = os.environ.get('GOOD_BADMINTON_VISUAL_RESULT_ENABLED')
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in ('0', 'false', 'no', 'off')
 
 def validate_projection_request(request):
     projection = request.get('visual_result')
@@ -54,7 +57,14 @@ def implementation():
             raise ValueError('visual_result_implementation_mismatch')
     if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != manifest['runtime_sha256']:
         raise ValueError('visual_result_runtime_mismatch')
-    version = {'files': manifest['files'], 'runtime_sha256': manifest['runtime_sha256']}
+    producers = ('api/stream_sessions.py', 'badminton_analysis/streaming/engine.py')
+    geometry_evidence = {
+        name: hashlib.sha256((root.parent/name).read_bytes()).hexdigest() for name in producers
+    }
+    if geometry_evidence != manifest.get('geometry_evidence_sha256'):
+        raise ValueError('visual_result_geometry_evidence_mismatch')
+    version = {'files': manifest['files'], 'runtime_sha256': manifest['runtime_sha256'],
+               'geometry_evidence_sha256': geometry_evidence}
     if hashlib.sha256(encode(version)).hexdigest() != manifest['sha256']:
         raise ValueError('visual_result_implementation_manifest_invalid')
     return manifest['sha256']
@@ -80,11 +90,32 @@ def atomic_json(path, value):
     finally:
         temp.unlink(missing_ok=True)
 
+def _session_video_metadata(root, session):
+    video = dict(session.get('video') or {}) if isinstance(session.get('video'), dict) else {}
+    bound = session.get('calibration_frame_size')
+    if isinstance(bound, list) and len(bound) == 2 and all(type(value) is int and value > 0 for value in bound):
+        video['height'], video['width'] = bound
+    ckpt_path = Path(root) / 'checkpoint.json'
+    if (not video.get('width') or not video.get('height') or not video.get('fps')) and ckpt_path.is_file():
+        try:
+            ckpt = json.loads(ckpt_path.read_text())
+        except (OSError, ValueError):
+            ckpt = {}
+        ckpt_video = ckpt.get('video') if isinstance(ckpt.get('video'), dict) else {}
+        for key in ('width', 'height', 'fps'):
+            if not video.get(key) and ckpt_video.get(key):
+                video[key] = ckpt_video[key]
+        shape = (ckpt.get('temporal_processor_state') or {}).get('frame_shape')
+        if (not video.get('width') or not video.get('height')) and isinstance(shape, (list, tuple)) and len(shape) >= 2:
+            if shape[0] and shape[1]:
+                video['height'], video['width'] = int(shape[0]), int(shape[1])
+    return video or None
+
 def input_identity(root, session):
     path = Path(root) / 'events.jsonl'
     stat = path.stat()
     configuration = {k: v for k, v in session.get('configuration', {}).items() if k in CONFIGURATION_KEYS}
-    return {
+    identity = {
         'analysis_session_id': session['analysis_session_id'],
         'events_revision': int(session.get('events_revision', 1)),
         'continuity_epoch': int(session.get('continuity_epoch', 0)),
@@ -96,6 +127,12 @@ def input_identity(root, session):
         'implementation_sha256': implementation(),
         'visual_result': session.get('visual_result'),
     }
+    if session.get('court_corners') is not None:
+        identity['court_corners_sha256'] = hashlib.sha256(encode(session['court_corners'])).hexdigest()
+    video = _session_video_metadata(root, session)
+    if video is not None:
+        identity['video'] = video
+    return identity
 
 def identity_key(identity):
     return hashlib.sha256(encode(identity)).hexdigest()
@@ -159,8 +196,14 @@ def compute_visual_result(root, identity, terminal):
     from good_badminton_visual.result_contract import validate_metrics
     from good_badminton_visual.candidates import project_candidates
     client = LocalEvidenceClient(events, identity['analysis_session_id'], identity['events_revision'])
+    create_request = {'configuration': configuration}
+    if session.get('court_corners') is not None:
+        create_request['court_corners'] = session['court_corners']
+    video_meta = _session_video_metadata(root, session)
+    if video_meta is not None:
+        create_request['video'] = video_meta
     derived = derive_stream_movement_metrics(root/'visual_result'/identity_key(identity),
-        client=client, terminal_status=terminal, create_request={'configuration': configuration})
+        client=client, terminal_status=terminal, create_request=create_request)
     validate_metrics(derived['metrics'])
     candidates, _ = project_candidates(client.events, identity['analysis_session_id'])
     metric_tracks = {player['track_id'] for player in derived['metrics']['players']}
@@ -263,11 +306,16 @@ class VisualResultService:
                         self.executor = None
                     root = self.manager._session_dir(sid)
                     if _source_unchanged(root, identity):
-                        atomic_json(result_path(root, identity), {
+                        detail_code = getattr(error, 'code', None)
+                        failure_payload = {
                             'schema_version': PROTOCOL, 'analysis_session_id': sid, 'state': 'failed',
                             'gpu_status': identity['status'], 'source': {'identity': identity},
                             'progress': self.manager._compute_progress(self.manager._load(sid)),
-                            'error_code': 'visual_result_aggregation_failed', 'error_type': type(error).__name__})
+                            'error_code': 'visual_result_aggregation_failed', 'error_type': type(error).__name__,
+                        }
+                        if isinstance(detail_code, str) and detail_code:
+                            failure_payload['detail_code'] = detail_code
+                        atomic_json(result_path(root, identity), failure_payload)
                     else:
                         self.notify(sid)
                 except Exception:

@@ -123,6 +123,9 @@ class FrameSegment:
 
     descriptor: SegmentDescriptor
     frames: Iterable[FramePacket]
+    video_width: Optional[int] = None
+    video_height: Optional[int] = None
+    video_fps: Optional[float] = None
 
 
 @dataclass(frozen=True)
