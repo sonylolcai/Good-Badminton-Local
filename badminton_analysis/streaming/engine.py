@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 from datetime import datetime, timezone
@@ -26,6 +27,9 @@ from .processor import StatefulFrameProcessor
 
 
 CHECKPOINT_VERSION = "continuous-analysis.v1"
+MAX_SEGMENT_WINDOW_FRAMES = 32
+MAX_SEGMENT_WINDOW_BYTES = 160 * 1024 * 1024
+MAX_MEASUREMENT_WINDOW_FRAMES = 16
 
 
 def _utc_now() -> str:
@@ -65,6 +69,7 @@ class AnalysisEngine:
         self.last_source_time_sec = -1.0
         self.last_measurement_bucket = -1
         self.last_event_source_time_sec = -1.0
+        self._last_timeline_event_time: dict[str, float] = {}
         self.source_frames = 0
         self.measurement_frames = 0
         self.event_sequence = 0
@@ -133,6 +138,108 @@ class AnalysisEngine:
         segment_source_frames = 0
         segment_measurement_frames = 0
         events: list[dict] = []
+        temporal_frames: list[Any] = []
+        temporal_contexts: list[FrameContext] = []
+        measurement_frames: list[Any] = []
+        measurement_contexts: list[FrameContext] = []
+        staged_events: list[tuple[float, int, int, str, ProcessorEvent, FrameContext]] = []
+        seq_counter = 0
+        window_bytes = 0
+        preprocess_fn = (
+            getattr(self.temporal_processor, "preprocess_frame", None)
+            if self.temporal_processor is not None
+            else None
+        )
+        temporal_batch_fn = (
+            getattr(self.temporal_processor, "process_segment_frames", None)
+            if self.temporal_processor is not None
+            else None
+        )
+        temporal_accepts_flush_boundary = False
+        if callable(temporal_batch_fn):
+            try:
+                sig = inspect.signature(temporal_batch_fn)
+                temporal_accepts_flush_boundary = (
+                    "flush_boundary" in sig.parameters
+                    or any(
+                        param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in sig.parameters.values()
+                    )
+                )
+            except (TypeError, ValueError):
+                temporal_accepts_flush_boundary = False
+        last_context: Optional[FrameContext] = None
+
+        def stage_batch(
+            timeline_key: str,
+            kind_rank: int,
+            pairs: Iterable[tuple[FrameContext, Iterable[ProcessorEvent]]],
+        ) -> None:
+            nonlocal seq_counter
+            for ctx, proc_events in pairs:
+                for event in (proc_events or ()):
+                    if not isinstance(event, ProcessorEvent):
+                        raise TypeError("processors must emit ProcessorEvent instances")
+                    event_time = (
+                        float(event.source_time_sec)
+                        if event.source_time_sec is not None
+                        else float(ctx.source_time_sec)
+                    )
+                    staged_events.append((event_time, kind_rank, seq_counter, timeline_key, event, ctx))
+                    seq_counter += 1
+
+        def flush_window(*, is_final: bool) -> None:
+            nonlocal window_bytes
+            if self.temporal_processor is not None:
+                if temporal_contexts:
+                    if callable(temporal_batch_fn):
+                        if temporal_accepts_flush_boundary:
+                            temporal_pairs = temporal_batch_fn(
+                                temporal_frames, temporal_contexts, flush_boundary=is_final
+                            )
+                        else:
+                            temporal_pairs = temporal_batch_fn(temporal_frames, temporal_contexts)
+                    else:
+                        temporal_pairs = [
+                            (ctx, self.temporal_processor.process_frame(frame, ctx))
+                            for frame, ctx in zip(temporal_frames, temporal_contexts)
+                        ]
+                    stage_batch("temporal", 0, temporal_pairs)
+                elif is_final and last_context is not None:
+                    flush_fn = getattr(self.temporal_processor, "flush_segment", None)
+                    if callable(flush_fn):
+                        flushed = flush_fn()
+                        if flushed:
+                            stage_batch("temporal", 0, [(last_context, flushed)])
+
+            if measurement_contexts:
+                batch_fn = getattr(self.measurement_processor, "process_segment_frames", None)
+                if callable(batch_fn):
+                    raw_pairs = list(batch_fn(measurement_frames, measurement_contexts))
+                    if len(raw_pairs) == len(measurement_contexts) and all(
+                        not (
+                            isinstance(item, tuple)
+                            and len(item) == 2
+                            and isinstance(item[0], FrameContext)
+                        )
+                        for item in raw_pairs
+                    ):
+                        measurement_pairs = list(zip(measurement_contexts, raw_pairs))
+                    else:
+                        measurement_pairs = raw_pairs
+                else:
+                    measurement_pairs = [
+                        (ctx, self.measurement_processor.process_frame(frame, ctx))
+                        for frame, ctx in zip(measurement_frames, measurement_contexts)
+                    ]
+                stage_batch("measurement", 1, measurement_pairs)
+
+            temporal_frames.clear()
+            temporal_contexts.clear()
+            measurement_frames.clear()
+            measurement_contexts.clear()
+            window_bytes = 0
+
         frame_iterator = iter(segment.frames)
         try:
             for packet in frame_iterator:
@@ -156,15 +263,22 @@ class AnalysisEngine:
                         descriptor.source_frame_start_index is not None
                     ),
                 )
+                last_context = context
 
                 if self.temporal_processor is not None:
-                    events.extend(
-                        self._run_processor(self.temporal_processor, packet.frame, context)
-                    )
+                    if callable(preprocess_fn):
+                        prepared = preprocess_fn(packet.frame)
+                        temporal_frames.append(prepared)
+                        window_bytes += int(getattr(prepared[0], "nbytes", 0))
+                    else:
+                        temporal_frames.append(packet.frame)
+                        window_bytes += int(getattr(packet.frame, "nbytes", 0))
+                    temporal_contexts.append(context)
                 if is_measurement:
-                    events.extend(
-                        self._run_processor(self.measurement_processor, packet.frame, context)
-                    )
+                    measurement_frames.append(packet.frame)
+                    measurement_contexts.append(context)
+                    if self.temporal_processor is None or callable(preprocess_fn):
+                        window_bytes += int(getattr(packet.frame, "nbytes", 0))
                     self.last_measurement_bucket = measurement_bucket
                     self.measurement_frames += 1
                     segment_measurement_frames += 1
@@ -172,6 +286,19 @@ class AnalysisEngine:
                 self.last_source_time_sec = float(packet.source_time_sec)
                 self.source_frames += 1
                 segment_source_frames += 1
+
+                if (
+                    len(temporal_contexts) >= MAX_SEGMENT_WINDOW_FRAMES
+                    or len(measurement_contexts) >= MAX_MEASUREMENT_WINDOW_FRAMES
+                    or window_bytes >= MAX_SEGMENT_WINDOW_BYTES
+                ):
+                    flush_window(is_final=False)
+
+            flush_window(is_final=True)
+
+            staged_events.sort(key=lambda item: (item[0], item[1], item[2]))
+            for _, _, _, timeline_key, event, ctx in staged_events:
+                events.append(self._materialize_event(event, ctx, timeline_key=timeline_key))
         except Exception as exc:
             self.status = "interrupted_needs_rebuild"
             self.restore_error = f"{type(exc).__name__}: {exc}"
@@ -217,8 +344,20 @@ class AnalysisEngine:
         events: list[dict] = []
         try:
             if self.temporal_processor is not None:
-                events.extend(self._materialize_many(self.temporal_processor.finalize(context), context))
-            events.extend(self._materialize_many(self.measurement_processor.finalize(context), context))
+                events.extend(
+                    self._materialize_many(
+                        self.temporal_processor.finalize(context),
+                        context,
+                        timeline_key="temporal",
+                    )
+                )
+            events.extend(
+                self._materialize_many(
+                    self.measurement_processor.finalize(context),
+                    context,
+                    timeline_key="measurement",
+                )
+            )
             events.append(
                 self._materialize_event(
                     ProcessorEvent(
@@ -317,6 +456,7 @@ class AnalysisEngine:
                 "last_source_time_sec": self.last_source_time_sec,
                 "last_measurement_bucket": self.last_measurement_bucket,
                 "last_event_source_time_sec": self.last_event_source_time_sec,
+                "last_timeline_event_time": dict(self._last_timeline_event_time),
                 "source_frames": self.source_frames,
                 "measurement_frames": self.measurement_frames,
                 "event_sequence": self.event_sequence,
@@ -363,6 +503,13 @@ class AnalysisEngine:
         self.last_source_time_sec = float(checkpoint["last_source_time_sec"])
         self.last_measurement_bucket = int(checkpoint["last_measurement_bucket"])
         self.last_event_source_time_sec = float(checkpoint["last_event_source_time_sec"])
+        raw_timelines = checkpoint.get("last_timeline_event_time")
+        if isinstance(raw_timelines, Mapping):
+            self._last_timeline_event_time = {
+                str(key): float(val) for key, val in raw_timelines.items()
+            }
+        else:
+            self._last_timeline_event_time = {}
         self.source_frames = int(checkpoint["source_frames"])
         self.measurement_frames = int(checkpoint["measurement_frames"])
         self.event_sequence = int(checkpoint["event_sequence"])
@@ -383,10 +530,21 @@ class AnalysisEngine:
         self,
         events: Iterable[ProcessorEvent],
         context: Any,
+        *,
+        timeline_key: str | None = None,
     ) -> list[dict]:
-        return [self._materialize_event(event, context) for event in (events or ())]
+        return [
+            self._materialize_event(event, context, timeline_key=timeline_key)
+            for event in (events or ())
+        ]
 
-    def _materialize_event(self, event: ProcessorEvent, context: Any) -> dict:
+    def _materialize_event(
+        self,
+        event: ProcessorEvent,
+        context: Any,
+        *,
+        timeline_key: str | None = None,
+    ) -> dict:
         if not isinstance(event, ProcessorEvent):
             raise TypeError("processors must emit ProcessorEvent instances")
         source_time_sec = (
@@ -399,7 +557,12 @@ class AnalysisEngine:
             if event.segment_index is not None
             else int(context.segment_index if hasattr(context, "segment_index") else max(0, context.last_segment_index))
         )
-        if source_time_sec + 1e-9 < self.last_event_source_time_sec:
+        prev_time = (
+            self._last_timeline_event_time.get(timeline_key, -1.0)
+            if timeline_key is not None
+            else self.last_event_source_time_sec
+        )
+        if source_time_sec + 1e-9 < prev_time:
             raise ValueError("processor event source time moves backwards")
 
         event_id_seed = (
@@ -408,7 +571,9 @@ class AnalysisEngine:
         )
         event_id = "evt_" + hashlib.sha256(event_id_seed.encode("utf-8")).hexdigest()[:24]
         self.event_sequence += 1
-        self.last_event_source_time_sec = source_time_sec
+        if timeline_key is not None:
+            self._last_timeline_event_time[timeline_key] = max(prev_time, source_time_sec)
+        self.last_event_source_time_sec = max(self.last_event_source_time_sec, source_time_sec)
         data = dict(event.data)
         data.setdefault("continuity_epoch", self.continuity_epoch)
         payload = {

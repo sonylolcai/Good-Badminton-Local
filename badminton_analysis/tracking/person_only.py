@@ -734,8 +734,7 @@ class PersonOnlyFrameProcessor:
         self.observation_provider = observation_provider
         self.observation_model = deepcopy(observation_model) if observation_model else None
 
-    def process_frame(self, frame: Any, context: FrameContext) -> Iterable[ProcessorEvent]:
-        provided = self.observation_provider(frame, context)
+    def _consume_observations(self, frame: Any, context: FrameContext, provided: Any) -> list[ProcessorEvent]:
         has_fresh_observations = True
         if isinstance(provided, Mapping):
             observations = provided.get("observations") or []
@@ -809,6 +808,30 @@ class PersonOnlyFrameProcessor:
                 )
             )
         return events
+
+    def process_frame(self, frame: Any, context: FrameContext) -> Iterable[ProcessorEvent]:
+        provided = self.observation_provider(frame, context)
+        return self._consume_observations(frame, context, provided)
+
+    def process_segment_frames(
+        self, frames: Iterable[Any], contexts: Iterable[FrameContext]
+    ) -> list[list[ProcessorEvent]]:
+        frame_list = list(frames)
+        context_list = list(contexts)
+        if not frame_list:
+            return []
+        batch_fn = getattr(self.observation_provider, "process_batch", None)
+        if callable(batch_fn):
+            provided_batch = batch_fn(frame_list, context_list)
+        else:
+            provided_batch = [
+                self.observation_provider(frame, context)
+                for frame, context in zip(frame_list, context_list)
+            ]
+        return [
+            self._consume_observations(frame, context, provided)
+            for frame, context, provided in zip(frame_list, context_list, provided_batch)
+        ]
 
     def finalize(self, context: FinalizationContext) -> Iterable[ProcessorEvent]:
         finalized = self.tracker.finalize()

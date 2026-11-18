@@ -17,7 +17,14 @@ from tests.stream_test_utils import create_request
 
 
 class _PoseModel:
+    def __init__(self):
+        self.calls = []
+        self.shapes = []
+
     def __call__(self, _frame, **_kwargs):
+        count = len(_frame) if isinstance(_frame, list) else 1
+        self.calls.append(count)
+        self.shapes.append(_frame[0].shape if isinstance(_frame, list) else _frame.shape)
         points = np.zeros((2, 17, 2), dtype=float)
         points[:, :, 0] = np.asarray([[32.0], [44.0]])
         points[:, :, 1] = np.linspace(12.0, 50.0, 17)
@@ -36,6 +43,7 @@ class _PoseModel:
                     conf=np.asarray([0.95, 0.95], dtype=float),
                 ),
             )
+            for _ in range(count)
         ]
 
 
@@ -133,9 +141,9 @@ class StreamRuntimeTests(unittest.TestCase):
 
     def factory(self, **kwargs):
         kwargs.setdefault("ball_model_factory", lambda _path: _BallModel())
+        kwargs.setdefault("pose_model_factory", lambda _path: _PoseModel())
         return StreamProcessorFactory(
             self.root,
-            pose_model_factory=lambda _path: _PoseModel(),
             **kwargs,
         )
 
@@ -422,6 +430,65 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual(person.data["track"]["association"]["key"], "bytetrack_1")
         self.assertEqual(measurement.person.tracker.tracker_backend, "bytetrack")
         self.assertTrue(measurement.person.tracker.lock_match_roster)
+
+    def test_segment_batch_runs_pose_in_batched_calls_and_tracks_in_order(self):
+        pose_model = _PoseModel()
+        session = create_request()
+        session["configuration"].update({"far_player_enhancement": True, "roster_stable_frames": 1})
+        measurement, _ = self.factory(pose_model_factory=lambda _path: pose_model)(session)
+        frames = [np.zeros((64, 64, 3), dtype=np.uint8) for _ in range(5)]
+        contexts = [
+            FrameContext(
+                analysis_session_id="ssn_task_f_runtime",
+                segment_index=0,
+                source_frame_index=index * 3,
+                source_time_sec=index * 0.1,
+                is_measurement_frame=True,
+                measurement_bucket=index,
+            )
+            for index in range(5)
+        ]
+        results = measurement.process_segment_frames(frames, contexts)
+        self.assertEqual(pose_model.calls, [5, 5])
+        self.assertEqual(len(results), 5)
+        self.assertEqual([ctx.measurement_bucket for ctx, _ in results], [0, 1, 2, 3, 4])
+        self.assertTrue(all(any(e.event_type == "person_observation" for e in evs) for _, evs in results))
+
+    def test_mixed_frame_sizes_recompute_far_roi_per_frame(self):
+        from api.stream_runtime import _derived_far_court_roi
+
+        pose_model = _PoseModel()
+        session = create_request()
+        session["court_corners"] = [[20, 40], [180, 40], [190, 95], [10, 95]]
+        session["configuration"].update({"far_player_enhancement": True, "roster_stable_frames": 1})
+        measurement, _ = self.factory(pose_model_factory=lambda _path: pose_model)(session)
+        frames = [
+            np.zeros((100, 200, 3), dtype=np.uint8),
+            np.zeros((200, 400, 3), dtype=np.uint8),
+        ]
+        contexts = [
+            FrameContext(
+                analysis_session_id="ssn_task_f_runtime",
+                segment_index=0,
+                source_frame_index=index * 3,
+                source_time_sec=index * 0.1,
+                is_measurement_frame=True,
+                measurement_bucket=index,
+            )
+            for index in range(2)
+        ]
+        measurement.process_segment_frames(frames, contexts)
+        x1_0, y1_0, x2_0, y2_0 = _derived_far_court_roi(session["court_corners"], (100, 200, 3))
+        x1_1, y1_1, x2_1, y2_1 = _derived_far_court_roi(session["court_corners"], (200, 400, 3))
+        self.assertEqual(
+            pose_model.shapes,
+            [
+                (100, 200, 3),
+                (y2_0 - y1_0, x2_0 - x1_0, 3),
+                (200, 400, 3),
+                (y2_1 - y1_1, x2_1 - x1_1, 3),
+            ],
+        )
 
 
 if __name__ == "__main__":

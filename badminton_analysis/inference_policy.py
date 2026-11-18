@@ -92,7 +92,7 @@ def execution_profile(sport_id, detector, route='batch'):
                        heatmap_threshold=.5, subpixel_centroid=True,
                        raw_interpolation=False,
                        sampling='every_source_frame',
-                       window_step=8 if route == 'batch' and runtime == 'lightweight' else 1,
+                       window_step=8 if runtime == 'lightweight' else 1,
                        background='uniform_video_median_40' if route == 'batch' and runtime == 'lightweight' else
                                   'configured_official' if route == 'batch' else 'first_window_median',
                        implementation_sha256=fingerprint({

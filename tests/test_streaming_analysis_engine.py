@@ -188,6 +188,77 @@ class StreamingAnalysisEngineTests(unittest.TestCase):
         with self.assertRaises(EngineNotRunnableError):
             engine.process_segment(make_segment(1, 1.0, digest_char="b"))
 
+    def test_large_segment_streams_through_bounded_subwindows(self):
+        import torch
+        from api.tracknet_stream import TrackNetStreamProcessor
+
+        class _Model:
+            def __init__(self):
+                self.batch_sizes = []
+
+            def __call__(self, tensor):
+                self.batch_sizes.append(int(tensor.shape[0]))
+                return torch.zeros((tensor.shape[0], 8, 288, 512), dtype=torch.float32)
+
+        class _Detector:
+            seq_len = 8
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.model = _Model()
+
+            def _extract_coordinate_from_heatmap(self, _heatmap, scaler):
+                return True, 10.0 * scaler[0], 20.0 * scaler[1], 0.9
+
+        detector = _Detector()
+        temporal = TrackNetStreamProcessor(detector, model_sha256="a" * 64)
+        measurement = CountingProcessor()
+        engine = AnalysisEngine("ssn_engine_subwindows", 10, measurement, temporal_processor=temporal)
+
+        result = engine.process_segment(make_segment(0, 0.0, frame_count=70, digest_char="c"))
+
+        ball_events = [e for e in result.events if e["event_type"] == "shuttle_observation"]
+        person_events = [e for e in result.events if e["event_type"] == "person_observation"]
+        self.assertEqual(len(ball_events), 70)
+        self.assertEqual([e["data"]["source_frame_index"] for e in ball_events], list(range(70)))
+        self.assertEqual(len(person_events), 24)
+        self.assertTrue(
+            all(
+                left["source_time_sec"] <= right["source_time_sec"]
+                for left, right in zip(result.events, result.events[1:])
+            )
+        )
+        # 32 -> [4], 32 -> [4], remaining 6 -> [1]
+        self.assertEqual(detector.model.batch_sizes, [4, 4, 1])
+
+    def test_internal_typeerror_in_batch_processor_is_not_replayed(self):
+        from badminton_analysis.streaming import ProcessorExecutionError
+
+        class _BrokenBatchProcessor:
+            def __init__(self):
+                self.calls = 0
+
+            def process_segment_frames(self, frames, contexts, *, flush_boundary=True):
+                self.calls += 1
+                raise TypeError("internal batch bug")
+
+            def snapshot_state(self):
+                return {}
+
+            def restore_state(self, state):
+                pass
+
+        temporal = _BrokenBatchProcessor()
+        engine = AnalysisEngine(
+            "ssn_engine_typeerror",
+            10,
+            CountingProcessor(),
+            temporal_processor=temporal,
+        )
+        with self.assertRaisesRegex(ProcessorExecutionError, "internal batch bug"):
+            engine.process_segment(make_segment(0, 0.0, frame_count=4, digest_char="d"))
+        self.assertEqual(temporal.calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -184,26 +184,56 @@ class PoseObservationProvider:
         self.asymmetric = bool(asymmetric)
         self.far_roi = far_roi
 
-    def __call__(self, frame, _context: FrameContext):
-        if self.asymmetric:
-            detections = self.pose.process_fixed_camera(
-                frame,
-                far_roi=(
-                    self.far_roi
-                    if self.far_roi is not None
-                    else _derived_far_court_roi(self.tracker.image_corners, frame.shape,
-                        include_upper_body=self.tracker.roster_identity_policy == "anchored_roster.v1")
-                ),
-                imgsz=self.pose_imgsz,
+    def _resolved_far_roi(self, frame_shape):
+        return (
+            self.far_roi
+            if self.far_roi is not None
+            else _derived_far_court_roi(
+                self.tracker.image_corners,
+                frame_shape,
+                include_upper_body=self.tracker.roster_identity_policy == "anchored_roster.v1",
             )
-        else:
-            detections = self.pose.process_frame_detailed(frame, imgsz=self.pose_imgsz)
+        )
+
+    def _observations_from_detections(self, detections):
         observations = []
         for detection in detections:
             observation = self._observation(detection)
             if observation is not None:
                 observations.append(observation)
         return {"observations": observations, "has_fresh_observations": True}
+
+    def __call__(self, frame, _context: FrameContext):
+        if self.asymmetric:
+            detections = self.pose.process_fixed_camera(
+                frame,
+                far_roi=self._resolved_far_roi(frame.shape),
+                imgsz=self.pose_imgsz,
+            )
+        else:
+            detections = self.pose.process_frame_detailed(frame, imgsz=self.pose_imgsz)
+        return self._observations_from_detections(detections)
+
+    def process_batch(self, frames, contexts):
+        frame_list = list(frames)
+        context_list = list(contexts)
+        if not frame_list:
+            return []
+        if self.asymmetric:
+            first_shape = frame_list[0].shape[:2]
+            if not all(frame.shape[:2] == first_shape for frame in frame_list):
+                return [self(frame, context) for frame, context in zip(frame_list, context_list)]
+            detections_batch = self.pose.process_fixed_camera_batch(
+                frame_list,
+                far_roi=self._resolved_far_roi(frame_list[0].shape),
+                imgsz=self.pose_imgsz,
+            )
+        else:
+            detections_batch = self.pose.process_frames_batch(
+                frame_list,
+                imgsz=self.pose_imgsz,
+            )
+        return [self._observations_from_detections(detections) for detections in detections_batch]
 
     def _observation(self, detection):
         keypoints = np.asarray(detection.get("keypoints"), dtype=float)
@@ -441,6 +471,28 @@ class CompositeMeasurementProcessor:
         if self.shuttle is not None:
             events.extend(self.shuttle.process_frame(frame, context))
         return events
+
+    def process_segment_frames(self, frames, contexts):
+        frame_list = list(frames)
+        context_list = list(contexts)
+        if not frame_list:
+            return []
+        if hasattr(self.person, "process_segment_frames"):
+            per_frame_events = self.person.process_segment_frames(frame_list, context_list)
+        else:
+            per_frame_events = [
+                list(self.person.process_frame(frame, context))
+                for frame, context in zip(frame_list, context_list)
+            ]
+        all_events = []
+        for frame, context, frame_events in zip(frame_list, context_list, per_frame_events):
+            events = list(frame_events)
+            if self.candidate_photos is not None:
+                events = self.candidate_photos.attach(frame, context, events)
+            if self.shuttle is not None:
+                events.extend(self.shuttle.process_frame(frame, context))
+            all_events.append((context, events))
+        return all_events
 
     def finalize(self, context):
         events = list(self.person.finalize(context))

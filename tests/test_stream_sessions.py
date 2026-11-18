@@ -734,5 +734,207 @@ class StreamSessionManagerTests(unittest.TestCase):
         self.assertTrue(deleted[0]["deleted"])
         self.assertIsNone(manager.get_session(session_id))
 
+    def test_worker_predecodes_next_segment_without_double_decoding(self):
+        decoded_indexes = []
+        base_manager = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=True,
+        )
+        original_decode = base_manager.decoder.decode
+
+        def counting_decode(path, descriptor):
+            decoded_indexes.append(descriptor.segment_index)
+            if descriptor.segment_index == 0:
+                time.sleep(0.05)
+            return original_decode(path, descriptor)
+
+        base_manager.decoder.decode = counting_decode
+        _, created = base_manager.create_session(create_request(), "business-stream-predecode-01")
+        session_id = created["analysis_session_id"]
+        for index in range(3):
+            base_manager.receive_segment(
+                session_id,
+                index,
+                segment_metadata(index, self.segment_bytes, source_start=index * 1.0, duration=1.0),
+                self.segment_bytes,
+            )
+        base_manager.complete(
+            session_id,
+            {"schema_version": "stream-session.v1", "expected_last_segment_index": 2, "allow_partial": False},
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _, status = base_manager.get_status(session_id)
+            if status["status"] == "finalized":
+                break
+            time.sleep(0.02)
+        self.assertEqual(status["status"], "finalized")
+        self.assertEqual(sorted(decoded_indexes), [0, 1, 2])
+
+    def test_predecode_cv2_error_is_isolated_and_worker_continues(self):
+        import cv2
+
+        base_manager = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=True,
+        )
+        original_decode = base_manager.decoder.decode
+
+        def failing_decode(path, descriptor):
+            if descriptor.segment_index == 0:
+                time.sleep(0.05)
+                return original_decode(path, descriptor)
+            if descriptor.segment_index == 1:
+                def broken_frames():
+                    raise cv2.error("simulated corrupt opencv read")
+                    yield  # pragma: no cover
+
+                from badminton_analysis.streaming import FrameSegment
+                return FrameSegment(descriptor=descriptor, frames=broken_frames())
+            return original_decode(path, descriptor)
+
+        base_manager.decoder.decode = failing_decode
+        _, created = base_manager.create_session(create_request(), "business-stream-cv2-err-01")
+        session_id = created["analysis_session_id"]
+        for index in range(3):
+            base_manager.receive_segment(
+                session_id,
+                index,
+                segment_metadata(index, self.segment_bytes, source_start=index * 1.0, duration=1.0),
+                self.segment_bytes,
+            )
+        base_manager.complete(
+            session_id,
+            {"schema_version": "stream-session.v1", "expected_last_segment_index": 2, "allow_partial": True},
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _, status = base_manager.get_status(session_id)
+            if status["status"] == "partial":
+                break
+            time.sleep(0.02)
+        self.assertEqual(status["status"], "partial")
+        self.assertTrue(base_manager.worker_running)
+        self.assertEqual(status["progress"]["processed_segments"], 2)
+        self.assertEqual(status["progress"]["failed_segment_indexes"], [1])
+
+    def test_oversized_predecode_falls_back_to_lazy_decode(self):
+        base_manager = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=True,
+        )
+        base_manager.MAX_PREDECODE_FRAMES = 5
+        _, created = base_manager.create_session(create_request(), "business-stream-oversize-01")
+        session_id = created["analysis_session_id"]
+        for index in range(2):
+            base_manager.receive_segment(
+                session_id,
+                index,
+                segment_metadata(index, self.segment_bytes, source_start=index * 1.0, duration=1.0),
+                self.segment_bytes,
+            )
+        base_manager.complete(
+            session_id,
+            {"schema_version": "stream-session.v1", "expected_last_segment_index": 1, "allow_partial": False},
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _, status = base_manager.get_status(session_id)
+            if status["status"] == "finalized":
+                break
+            time.sleep(0.02)
+        self.assertEqual(status["status"], "finalized")
+        self.assertEqual(status["progress"]["processed_segments"], 2)
+
+    def test_recover_rejects_mismatched_execution_profile(self):
+        import json
+
+        initial = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=False,
+        )
+        _, created = initial.create_session(create_request(), "business-stream-profile-mismatch-01")
+        session_id = created["analysis_session_id"]
+        initial.receive_segment(session_id, 0, segment_metadata(0, self.segment_bytes), self.segment_bytes)
+        initial.drain()
+
+        manifest_path = initial._manifest_path(session_id)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["execution_profile"]["sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        recovered = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=False,
+        )
+        _, status = recovered.get_status(session_id)
+        self.assertEqual(status["status"], "interrupted_needs_rebuild")
+        self.assertIn("execution_profile mismatch", status["error"]["message"])
+
+    def test_runtime_engine_create_mismatch_terminates_session_without_replacement(self):
+        import json
+
+        manager = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=False,
+        )
+        _, created = manager.create_session(create_request(), "business-stream-runtime-mismatch-01")
+        session_id = created["analysis_session_id"]
+
+        manifest_path = manager._manifest_path(session_id)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["execution_profile"]["sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        for index in range(2):
+            manager.receive_segment(
+                session_id,
+                index,
+                segment_metadata(index, self.segment_bytes, source_start=float(index)),
+                self.segment_bytes,
+            )
+        manager.drain()
+
+        _, status = manager.get_status(session_id)
+        self.assertEqual(status["status"], "interrupted_needs_rebuild")
+        self.assertIn("execution_profile mismatch", status["error"]["message"])
+        self.assertEqual(status["progress"]["processed_segments"], 0)
+        self.assertEqual(status["progress"]["failed_segments"], 0)
+        self.assertEqual(status["progress"]["failed_segment_indexes"], [])
+
+    def test_recover_rejects_missing_execution_profile(self):
+        import json
+
+        initial = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=False,
+        )
+        _, created = initial.create_session(create_request(), "business-stream-profile-missing-01")
+        session_id = created["analysis_session_id"]
+        initial.receive_segment(session_id, 0, segment_metadata(0, self.segment_bytes), self.segment_bytes)
+
+        manifest_path = initial._manifest_path(session_id)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("execution_profile", None)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        recovered = StreamSessionManager(
+            Path(self.temp_dir.name),
+            processor_factory=counting_processor_factory(),
+            start_worker=False,
+        )
+        recovered.drain()
+        _, status = recovered.get_status(session_id)
+        self.assertEqual(status["status"], "interrupted_needs_rebuild")
+        self.assertIn("execution_profile missing", status["error"]["message"])
+        self.assertEqual(status["progress"]["processed_segments"], 0)
+
 if __name__ == "__main__":
     unittest.main()

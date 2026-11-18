@@ -12,6 +12,15 @@ class FakeModel:
         self.calls = []
 
     def __call__(self, frame, **kwargs):
+        if isinstance(frame, list):
+            self.calls.append({"batch_size": len(frame), "shape": frame[0].shape, **kwargs})
+            out = []
+            for _ in frame:
+                batch = self.batches.pop(0)
+                keypoints = SimpleNamespace(xy=batch["keypoints"], conf=batch["keypoint_scores"])
+                boxes = SimpleNamespace(xyxy=batch["boxes"], conf=batch["box_scores"])
+                out.append(SimpleNamespace(keypoints=keypoints, boxes=boxes))
+            return out
         self.calls.append({"shape": frame.shape, **kwargs})
         batch = self.batches.pop(0)
         keypoints = SimpleNamespace(xy=batch["keypoints"], conf=batch["keypoint_scores"])
@@ -113,6 +122,56 @@ class YOLOPoseProcessorTests(unittest.TestCase):
         self.assertEqual(len(detections), 1)
         np.testing.assert_allclose(detections[0]["bbox"], [30, 15, 50, 45])
         np.testing.assert_allclose(detections[0]["keypoints"][15], [35, 43])
+
+    def test_fixed_camera_batch_runs_one_full_and_one_roi_batch_call(self):
+        kp1, sc1 = make_person((50, 10, 90, 48), ankle_y=46, score=0.70)
+        kp2, sc2 = make_person((49, 9, 91, 49), ankle_y=47, score=0.92)
+        model = FakeModel(
+            [
+                make_batch([(kp1, sc1, (50, 10, 90, 48), 0.80)]),
+                make_batch([(kp1, sc1, (50, 10, 90, 48), 0.80)]),
+                make_batch([(kp2, sc2, (49, 9, 91, 49), 0.88)]),
+                make_batch([(kp2, sc2, (49, 9, 91, 49), 0.88)]),
+            ]
+        )
+        processor = YOLOPoseProcessor(model=model, device="cpu", merge_iou=0.45)
+        frames = [np.zeros((100, 200, 3), dtype=np.uint8) for _ in range(2)]
+        batched = processor.process_fixed_camera_batch(
+            frames,
+            far_roi=(0.0, 0.0, 1.0, 0.5),
+            imgsz=960,
+        )
+
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(model.calls[0]["batch_size"], 2)
+        self.assertEqual(model.calls[0]["shape"], (100, 200, 3))
+        self.assertEqual(model.calls[1]["batch_size"], 2)
+        self.assertEqual(model.calls[1]["shape"], (50, 200, 3))
+        self.assertEqual(len(batched), 2)
+        for detections in batched:
+            self.assertEqual(len(detections), 1)
+            self.assertEqual(detections[0]["source"], "far_roi")
+            self.assertEqual(set(detections[0]["merged_sources"]), {"full_frame", "far_roi"})
+
+    def test_fixed_camera_batch_splits_large_batches_by_max_batch_size(self):
+        kp, sc = make_person((50, 10, 90, 48), ankle_y=46, score=0.8)
+        frame_count = 35
+        batches = [make_batch([(kp, sc, (50, 10, 90, 48), 0.85)]) for _ in range(frame_count * 2)]
+        model = FakeModel(batches)
+        processor = YOLOPoseProcessor(model=model, device="cpu", merge_iou=0.45)
+        frames = [np.zeros((100, 200, 3), dtype=np.uint8) for _ in range(frame_count)]
+
+        result = processor.process_fixed_camera_batch(
+            frames,
+            far_roi=(0.0, 0.0, 1.0, 0.5),
+            imgsz=960,
+        )
+
+        self.assertEqual(len(result), frame_count)
+        self.assertEqual(
+            [call["batch_size"] for call in model.calls],
+            [16, 16, 3, 16, 16, 3],
+        )
 
 
 if __name__ == "__main__":
