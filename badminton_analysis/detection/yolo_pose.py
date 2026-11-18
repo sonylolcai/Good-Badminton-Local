@@ -37,6 +37,7 @@ class YOLOPoseProcessor:
     """
 
     SUPPORTED_IMAGE_SIZES = (640, 960, 1280)
+    DEFAULT_MAX_BATCH_SIZE = 16
 
     def __init__(
         self,
@@ -107,21 +108,8 @@ class YOLOPoseProcessor:
             dtype=float,
         )
 
-    def _infer(self, frame, *, imgsz, source, roi):
-        if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
-            raise ValueError("frame must be an image array")
-        imgsz = self._validate_imgsz(imgsz)
-        results = self.model(
-            frame,
-            conf=self.conf,
-            device=self.device,
-            imgsz=imgsz,
-            verbose=False,
-        )
-        if results is None or len(results) == 0:
-            return []
-        result = results[0]
-        if result.keypoints is None or result.keypoints.xy is None:
+    def _parse_result(self, result, *, imgsz, source, roi, input_shape):
+        if result is None or result.keypoints is None or result.keypoints.xy is None:
             return []
 
         keypoints = self._to_numpy(result.keypoints.xy)
@@ -174,11 +162,72 @@ class YOLOPoseProcessor:
                         "conf": self.conf,
                         "device": self.device,
                         "roi": [int(value) for value in roi],
-                        "input_shape": [int(frame.shape[0]), int(frame.shape[1])],
+                        "input_shape": [int(input_shape[0]), int(input_shape[1])],
                     },
                 }
             )
         return detections
+
+    def _infer(self, frame, *, imgsz, source, roi):
+        if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
+            raise ValueError("frame must be an image array")
+        imgsz = self._validate_imgsz(imgsz)
+        results = self.model(
+            frame,
+            conf=self.conf,
+            device=self.device,
+            imgsz=imgsz,
+            verbose=False,
+        )
+        if results is None or len(results) == 0:
+            return []
+        return self._parse_result(
+            results[0],
+            imgsz=imgsz,
+            source=source,
+            roi=roi,
+            input_shape=frame.shape,
+        )
+
+    def _infer_batch(self, frames, *, imgsz, source, roi, max_batch_size=None):
+        frame_list = list(frames)
+        if not frame_list:
+            return []
+        for frame in frame_list:
+            if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
+                raise ValueError("frame must be an image array")
+        imgsz = self._validate_imgsz(imgsz)
+        batch_limit = int(max_batch_size or self.DEFAULT_MAX_BATCH_SIZE)
+        if batch_limit < 1:
+            raise ValueError("max_batch_size must be at least 1")
+        parsed = []
+        for start in range(0, len(frame_list), batch_limit):
+            chunk = frame_list[start:start + batch_limit]
+            results = self.model(
+                chunk,
+                conf=self.conf,
+                device=self.device,
+                imgsz=imgsz,
+                verbose=False,
+            )
+            if results is None or len(results) == 0:
+                parsed.extend([] for _ in chunk)
+                continue
+            if len(results) != len(chunk):
+                raise ValueError(
+                    f"expected {len(chunk)} batched YOLO results, got {len(results)}"
+                )
+            parsed.extend(
+                self._parse_result(
+                    result,
+                    imgsz=imgsz,
+                    source=source,
+                    roi=roi,
+                    input_shape=frame.shape,
+                )
+                for frame, result in zip(chunk, results)
+            )
+        return parsed
 
     @staticmethod
     def _resolve_roi(frame_shape, roi):
@@ -303,6 +352,59 @@ class YOLOPoseProcessor:
         merged = self.merge_detections([*full_detections, *far_detections])
         self._last_detections = merged
         return merged
+
+    def process_frames_batch(self, frames, *, imgsz=None):
+        """Run batched full-frame inference over homogeneous frames."""
+        frame_list = list(frames)
+        if not frame_list:
+            return []
+        selected_imgsz = self.imgsz if imgsz is None else self._validate_imgsz(imgsz)
+        first_shape = frame_list[0].shape[:2]
+        if not all(frame.shape[:2] == first_shape for frame in frame_list):
+            return [self.process_frame_detailed(frame, imgsz=selected_imgsz) for frame in frame_list]
+        height, width = int(first_shape[0]), int(first_shape[1])
+        batch_detections = self._infer_batch(
+            frame_list,
+            imgsz=selected_imgsz,
+            source="full_frame",
+            roi=(0, 0, width, height),
+        )
+        self._last_detections = batch_detections[-1]
+        return batch_detections
+
+    def process_fixed_camera_batch(self, frames, far_roi=None, *, imgsz=None):
+        """Run batched full-frame plus far-half ROI inference over homogeneous frames."""
+        frame_list = list(frames)
+        if not frame_list:
+            return []
+        selected_imgsz = self.imgsz if imgsz is None else self._validate_imgsz(imgsz)
+        first_shape = frame_list[0].shape[:2]
+        if not all(frame.shape[:2] == first_shape for frame in frame_list):
+            return [
+                self.process_fixed_camera(frame, far_roi=far_roi, imgsz=selected_imgsz)
+                for frame in frame_list
+            ]
+        height, width = int(first_shape[0]), int(first_shape[1])
+        resolved_roi = self._resolve_roi(frame_list[0].shape, self.far_roi if far_roi is None else far_roi)
+        full_batch = self._infer_batch(
+            frame_list,
+            imgsz=selected_imgsz,
+            source="full_frame",
+            roi=(0, 0, width, height),
+        )
+        x1, y1, x2, y2 = resolved_roi
+        far_batch = self._infer_batch(
+            [frame[y1:y2, x1:x2] for frame in frame_list],
+            imgsz=selected_imgsz,
+            source="far_roi",
+            roi=resolved_roi,
+        )
+        merged_batch = [
+            self.merge_detections([*full_detections, *far_detections])
+            for full_detections, far_detections in zip(full_batch, far_batch)
+        ]
+        self._last_detections = merged_batch[-1]
+        return merged_batch
 
     def process_frame(self, frame, *, imgsz=None, asymmetric=None, far_roi=None):
         """Process one frame while preserving the original tuple return value."""

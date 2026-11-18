@@ -27,6 +27,7 @@ import secrets
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +35,7 @@ from typing import Any, Optional
 
 from badminton_analysis.streaming import (
     AnalysisEngine,
+    FrameSegment,
     OpenCVSegmentDecoder,
     ReplayDecodeError,
     SegmentDescriptor,
@@ -98,6 +100,10 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+class ExecutionProfileMismatchError(RuntimeError):
+    """Raised when a session's persisted execution profile does not match runtime."""
 
 
 class StreamSessionManager:
@@ -166,6 +172,12 @@ class StreamSessionManager:
         self._active_segment = None
         self._timed_out_segments = set()
         self._last_scheduled_session_id = None
+        self._predecode_lock = threading.Lock()
+        self._predecode_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="good-badminton-stream-predecode",
+        )
+        self._prefetched_segment = None
         self._recover_sessions()
         if start_worker:
             self.start()
@@ -304,9 +316,9 @@ class StreamSessionManager:
             "streaming_slo_proven": False,
             "configuration": configuration,
             "execution_topology": {
-                "current_execution_model": "single_gpu_worker_serial_segments",
-                "segments": "serialized_on_one_gpu_worker",
-                "within_segment": "decode_sample_models_tracking_are_currently_serial",
+                "current_execution_model": "two_stage_predecode_and_batched_gpu_worker",
+                "segments": "predecoded_with_serialized_gpu_worker",
+                "within_segment": "batched_segment_inference",
                 "client_upload_vs_gpu_processing": "may_overlap_for_different_segments",
                 "llm": "business_service_only_not_in_gpu_trace",
             },
@@ -772,6 +784,7 @@ class StreamSessionManager:
         return measurement, temporal
 
     def _create_engine(self, session):
+        self._verify_execution_profile(session)
         measurement, temporal = self._make_processors(session)
         if self.engine_factory is not None:
             return self.engine_factory(session, measurement, temporal)
@@ -783,6 +796,7 @@ class StreamSessionManager:
         )
 
     def _restore_engine(self, session, checkpoint):
+        self._verify_execution_profile(session)
         measurement, temporal = self._make_processors(session)
         if measurement is None:
             raise RuntimeError("processor_factory is not configured; cannot restore engine state")
@@ -811,6 +825,23 @@ class StreamSessionManager:
             return self.engine_factory(session, measurement, temporal, checkpoint)
         return AnalysisEngine.restore(checkpoint, measurement, temporal_processor=temporal)
 
+    def _verify_execution_profile(self, session):
+        recorded = session.get("execution_profile")
+        if not isinstance(recorded, dict) or not recorded.get("sha256"):
+            raise ExecutionProfileMismatchError(
+                "execution_profile missing or unverified; refusing to resume session without a matching signature"
+            )
+        configuration = session.get("configuration") or {}
+        current = execution_profile(
+            configuration.get("sport_id", "badminton"),
+            configuration.get("shuttle_detector", "none"),
+            "stream",
+        )
+        if recorded.get("sha256") != current.get("sha256"):
+            raise ExecutionProfileMismatchError(
+                "execution_profile mismatch after service upgrade; refusing to resume session with a different algorithm"
+            )
+
     @stage('engine_create_or_restore')
     def _get_engine(self, session):
         """Return the session's exclusive engine, creating it on first use."""
@@ -819,6 +850,7 @@ class StreamSessionManager:
         if engine is None:
             if self.processor_factory is None:
                 return None
+            self._verify_execution_profile(session)
             engine = self._create_engine(session)
             self._engines[session_id] = engine
         return engine
@@ -1347,6 +1379,8 @@ class StreamSessionManager:
                 "processing_disposition": disposition,
             }
             if disposition == "queued":
+                if self.worker_running:
+                    self._maybe_schedule_predecode_for_successor(session_id, path_index)
                 self._notify()
             return 202, segment_receipt_response(session, path_index, receipt)
 
@@ -2047,6 +2081,7 @@ class StreamSessionManager:
             session["status"] = "cancelled"
             session["sealed"] = True
             self._cancelled_sessions.add(session_id)
+            self._clear_prefetched_segment(session_id)
             session["error"] = {
                 "code": "cancelled_by_operator",
                 "message": "session processing was cancelled by an authorized operator",
@@ -2300,6 +2335,10 @@ class StreamSessionManager:
                 gap_segment_indexes=gap_indexes,
             )
             checkpoint = replacement.checkpoint()
+        except ExecutionProfileMismatchError as exc:
+            self._clear_prefetched_segment(session_id)
+            self._mark_interrupted(session, str(exc))
+            return
         except Exception as exc:
             self._fail_session(session_id, exc)
             return
@@ -2390,6 +2429,11 @@ class StreamSessionManager:
             segment = self.decoder.decode(segment_path, self._descriptor_from_entry(entry))
             with span(self,session_id,'decode_sample_models_tracking', index):
                 result = engine.process_segment(segment)
+        except ExecutionProfileMismatchError as exc:
+            self._clear_active_segment(session_id, index)
+            self._clear_prefetched_segment(session_id)
+            self._mark_interrupted(session, str(exc))
+            return
         except Exception as exc:
             self._clear_active_segment(session_id, index)
             self._fail_reanalysis(
@@ -2522,6 +2566,10 @@ class StreamSessionManager:
         # session and keep the queue worker alive for subsequent sessions.
         try:
             engine = self._get_engine(session)
+        except ExecutionProfileMismatchError as exc:
+            self._clear_prefetched_segment(session_id)
+            self._mark_interrupted(session, str(exc))
+            return
         except Exception as exc:
             self._continue_after_segment_failure(session_id, index, exc, phase="engine_create")
             return
@@ -2553,10 +2601,17 @@ class StreamSessionManager:
             self._trace_stage(trace, "queue_wait", queue_wait)
             self._save_trace(session_id, trace)
         open_started = time.perf_counter()
+        self._set_active_segment(session_id, index)
         try:
             with span(self,session_id,'segment_open_decode', index):
-                segment = self.decoder.decode(segment_path, descriptor)
-        except (ReplayDecodeError, OSError) as exc:
+                prefetched = self._consume_prefetched_segment(
+                    session_id, index, entry.get("sha256")
+                )
+                segment = prefetched.result() if prefetched is not None else None
+                if segment is None:
+                    segment = self.decoder.decode(segment_path, descriptor)
+        except Exception as exc:
+            self._clear_active_segment(session_id, index)
             self._continue_after_segment_failure(
                 session_id,
                 index,
@@ -2566,9 +2621,11 @@ class StreamSessionManager:
             return
         open_elapsed = time.perf_counter() - open_started
         if self._is_cancelled(session_id):
+            self._clear_active_segment(session_id, index)
             return
+        if self.worker_running:
+            self._schedule_next_predecode(session_id, index)
         processing_started = time.perf_counter()
-        self._set_active_segment(session_id, index)
         try:
             with span(self,session_id,'decode_sample_models_tracking', index):
                 result = engine.process_segment(segment)
@@ -2625,6 +2682,96 @@ class StreamSessionManager:
         self._clear_active_segment(session_id, index)
         self._finalize_if_ready(session_id)
 
+    MAX_PREDECODE_BYTES = 400 * 1024 * 1024
+    MAX_PREDECODE_FRAMES = 120
+
+    def _decode_segment_eager(self, segment_path, descriptor):
+        segment = self.decoder.decode(segment_path, descriptor)
+        frame_iterator = iter(segment.frames)
+        packets = []
+        total_bytes = 0
+        try:
+            for packet in frame_iterator:
+                total_bytes += int(getattr(packet.frame, "nbytes", 0))
+                if (
+                    len(packets) >= self.MAX_PREDECODE_FRAMES
+                    or total_bytes > self.MAX_PREDECODE_BYTES
+                ):
+                    return None
+                packets.append(packet)
+        finally:
+            close = getattr(frame_iterator, "close", None)
+            if callable(close):
+                close()
+        return FrameSegment(descriptor=descriptor, frames=packets)
+
+    def _clear_prefetched_segment(self, session_id=None):
+        with self._predecode_lock:
+            current = self._prefetched_segment
+            if current is None:
+                return
+            if session_id is None or current[0] == str(session_id):
+                current[3].cancel()
+                self._prefetched_segment = None
+
+    def _consume_prefetched_segment(self, session_id, index, sha256):
+        with self._predecode_lock:
+            current = self._prefetched_segment
+            if current is None:
+                return None
+            cached_session, cached_index, cached_sha, future = current
+            if (
+                cached_session == str(session_id)
+                and cached_index == int(index)
+                and cached_sha == sha256
+            ):
+                self._prefetched_segment = None
+                return future
+            return None
+
+    def _maybe_schedule_predecode_for_successor(self, session_id, uploaded_index):
+        with self._lock:
+            active = dict(self._active_segment) if self._active_segment else None
+        if (
+            active is not None
+            and active.get("session_id") == str(session_id)
+            and int(active.get("index", -1)) + 1 == int(uploaded_index)
+        ):
+            self._schedule_next_predecode(session_id, int(active["index"]))
+
+    def _schedule_next_predecode(self, session_id, current_index):
+        next_index = int(current_index) + 1
+        session = self._load(session_id)
+        if session is None or session.get("status") in TERMINAL_SESSION_STATES:
+            return
+        if session.get("declared_gaps", {}).get(str(next_index)) is not None:
+            return
+        entry = session.get("segments", {}).get(str(next_index))
+        if entry is None or self._entry_settled(entry):
+            return
+        segment_path = self._segment_path(session_id, next_index)
+        if not segment_path.is_file():
+            return
+        sha256 = entry.get("sha256")
+        with self._predecode_lock:
+            current = self._prefetched_segment
+            if (
+                current is not None
+                and current[0] == str(session_id)
+                and current[1] == next_index
+                and current[2] == sha256
+            ):
+                return
+            if current is not None:
+                if not current[3].done():
+                    return
+                self._prefetched_segment = None
+            descriptor = self._descriptor_from_entry(entry)
+            future = self._predecode_executor.submit(
+                self._decode_segment_eager, segment_path, descriptor
+            )
+            self._prefetched_segment = (str(session_id), next_index, sha256, future)
+
     def _set_active_segment(self, session_id, index, *, repair=False):
         with self._lock:
             self._active_segment = {
@@ -2654,6 +2801,12 @@ class StreamSessionManager:
         epoch after the failed source-time interval.  This is intentionally a
         partial result, never a claim that post-gap tracks are the same people.
         """
+        self._clear_prefetched_segment(session_id)
+        if isinstance(exc, ExecutionProfileMismatchError):
+            session = self._load(session_id)
+            if session is not None and session.get("status") not in TERMINAL_SESSION_STATES:
+                self._mark_interrupted(session, str(exc))
+            return
         session = self._load(session_id)
         if session is None or session.get("status") in TERMINAL_SESSION_STATES:
             return
@@ -2688,6 +2841,9 @@ class StreamSessionManager:
                 gap_segment_indexes=self._failed_indexes(session) + [int(index)],
             )
             recovery_checkpoint = replacement.checkpoint()
+        except ExecutionProfileMismatchError as recovery_exc:
+            self._mark_interrupted(session, str(recovery_exc))
+            return
         except Exception as recovery_exc:
             self._fail_session(
                 session_id,
@@ -2895,6 +3051,12 @@ class StreamSessionManager:
             self._finish_trace(latest, "partial")
 
     def _fail_session(self, session_id, exc):
+        self._clear_prefetched_segment(session_id)
+        if isinstance(exc, ExecutionProfileMismatchError):
+            session = self._load(session_id)
+            if session is not None and session.get("status") not in TERMINAL_SESSION_STATES:
+                self._mark_interrupted(session, str(exc))
+            return
         session = self._load(session_id)
         if session is None or session.get("status") in TERMINAL_SESSION_STATES:
             return
@@ -2949,6 +3111,11 @@ class StreamSessionManager:
             if session.get("status") in TERMINAL_SESSION_STATES:
                 continue
             session_id = session["analysis_session_id"]
+            try:
+                self._verify_execution_profile(session)
+            except Exception as exc:
+                self._mark_interrupted(session, str(exc))
+                continue
             checkpoint = self._load_checkpoint(session_id)
             processed = self._processed_count(session)
             if processed > 0 and checkpoint is None:
@@ -2995,16 +3162,21 @@ class StreamSessionManager:
                 self._save(session)
 
     def _mark_interrupted(self, session, message):
-        session["status"] = "interrupted_needs_rebuild"
-        session["error"] = {
-            "code": "interrupted_needs_rebuild",
-            "message": message,
-            "retryable": False,
-            "details": {},
-        }
-        self._append_state_history(session, "interrupted_needs_rebuild", "service_restarted")
-        self._save(session)
-        self._finish_trace(session, "interrupted_needs_rebuild")
+        session_id = session["analysis_session_id"]
+        with self._lock:
+            latest = self._load(session_id) or session
+            if latest.get("status") in TERMINAL_SESSION_STATES:
+                return
+            latest["status"] = "interrupted_needs_rebuild"
+            latest["error"] = {
+                "code": "interrupted_needs_rebuild",
+                "message": message,
+                "retryable": False,
+                "details": {},
+            }
+            self._append_state_history(latest, "interrupted_needs_rebuild", "service_restarted")
+            self._save(latest)
+            self._finish_trace(latest, "interrupted_needs_rebuild")
 
 
 def _requests_equivalent(existing, request):
