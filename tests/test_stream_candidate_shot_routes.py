@@ -881,7 +881,7 @@ class StreamCandidateShotRoutesTests(unittest.TestCase):
                 health = TestClient(app).get("/api/v1/health").json()
                 self.assertEqual(health["visual_result_version"], "stream-visual-result.v1")
                 self.assertEqual(health["visual_metrics_implementation_sha256"], implementation())
-                self.assertEqual(health["visual_result_identity_policies"], ["individual_tracks.v1", "half_court_slots.v1"])
+                self.assertEqual(health["visual_result_identity_policies"], ["individual_tracks.v1", "half_court_slots.v1", "anchored_roster.v1"])
             finally:
                 if old_pure is None:
                     os.environ.pop("GOOD_BADMINTON_GPU_PURE_STREAM_ONLY", None)

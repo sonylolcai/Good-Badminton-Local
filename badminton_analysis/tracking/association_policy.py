@@ -11,7 +11,7 @@ def association_policy(sport_id="badminton"):
         "anchor_body_min": 0.55 if badminton else 0.70,
         "anchor_location_min": 0.50 if badminton else 0.70,
         "anchor_identity_min": 0.75 if badminton else 0.80,
-        "weak_recovery_max_distance_m": 1.50,
+        "weak_recovery_max_distance_m": 3.00 if badminton else 1.50,
         "weak_recovery_slot_margin_m": 0.35,
         "weak_pair_cost_margin_m": 0.50,
         "direct_key_motion_guard": badminton,

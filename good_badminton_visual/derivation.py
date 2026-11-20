@@ -62,7 +62,10 @@ def derive_stream_movement_metrics(
     configuration = dict(create_request.get("configuration") or {})
     anchor_reference = None
     if configuration.get("roster_identity_policy") == "anchored_roster.v1":
-        anchor_reference = _validate_anchored_roster(events, configuration.get("expected_player_count"))
+        anchor_reference = _validate_anchored_roster(
+            events, configuration.get("expected_player_count"),
+            require_photos=configuration.get("allow_anonymous_report") is not True,
+        )
     sample_hz = int(configuration.get("analysis_sample_hz") or 10)
     records = _materialize_detection_records(events, sample_hz=sample_hz)
     detections_path = evidence_dir / "stream_person_detections.jsonl"
@@ -185,8 +188,8 @@ def derive_stream_movement_metrics(
     }
 
 
-def _validate_anchored_roster(events, expected_count):
-    """Require the actual shared frame proof, never infer it from configuration."""
+def _validate_anchored_roster(events, expected_count, *, require_photos=True):
+    """Validate the shared identity reference and the legacy photo requirement."""
     import re
 
     observations = [e for e in events if e.get("event_type") == "person_observation"]
@@ -209,6 +212,9 @@ def _validate_anchored_roster(events, expected_count):
         raise ResultContractError("invalid_identity_scope")
     ids = set(reference["track_ids"])
     photos = {}
+    set_ids: set[str] = set()
+    same_frame_coords: set[tuple[int, float]] = set()
+    upgrade_coords: list[tuple[int, float]] = []
     for event in observations:
         data = event.get("data") or {}
         track = data.get("track") or {}
@@ -220,27 +226,47 @@ def _validate_anchored_roster(events, expected_count):
             or (event.get("evidence_state") == "detected" and track.get("identity_status") != "anchored")
         ):
             raise ResultContractError("invalid_identity_scope")
+        if not require_photos:
+            continue
         photo = data.get("candidate_photo")
         if photo:
+            policy = photo.get("selection_policy") if isinstance(photo, dict) else None
+            frame_idx = photo.get("source_frame_index") if isinstance(photo, dict) else None
             if (
                 not isinstance(photo, dict)
                 or photo.get("track_id") != track.get("track_id")
                 or photo.get("frozen") is not True
-                or photo.get("selection_policy") != "same_frame_roster_v1"
-                or photo.get("source_frame_index") != reference.get("source_frame_index")
+                or policy not in {"same_frame_roster_v1", "anchored_front_upgrade_v1"}
+                or type(frame_idx) is not int
+                or frame_idx < reference["source_frame_index"]
                 or not finite(photo.get("source_time_sec"))
-                or abs(photo["source_time_sec"] - reference["source_time_sec"]) > 1e-6
-                or abs(float(event["source_time_sec"]) - reference["source_time_sec"]) > 1e-6
+                or photo["source_time_sec"] + 1e-6 < reference["source_time_sec"]
+                or abs(float(event["source_time_sec"]) - photo["source_time_sec"]) > 1e-6
                 or not isinstance(photo.get("photo_set_id"), str)
                 or not photo["photo_set_id"]
             ):
                 raise ResultContractError("invalid_identity_scope")
+            set_ids.add(photo["photo_set_id"])
+            if policy == "same_frame_roster_v1":
+                same_frame_coords.add((frame_idx, round(float(photo["source_time_sec"]), 6)))
+            else:
+                if (
+                    frame_idx <= reference["source_frame_index"]
+                    or float(photo["source_time_sec"]) <= reference["source_time_sec"] + 1e-6
+                ):
+                    raise ResultContractError("invalid_identity_scope")
+                upgrade_coords.append((frame_idx, float(photo["source_time_sec"])))
             photos[track["track_id"]] = photo
-    if (
-        set(photos) != ids
-        or len({p.get("photo_set_id") for p in photos.values()}) != 1
-        or not all(p.get("photo_set_id") for p in photos.values())
-    ):
+    if same_frame_coords:
+        if len(same_frame_coords) != 1:
+            raise ResultContractError("invalid_identity_scope")
+        base_frame, base_time = next(iter(same_frame_coords))
+        if any(
+            frame_idx <= base_frame or src_time <= base_time + 1e-6
+            for frame_idx, src_time in upgrade_coords
+        ):
+            raise ResultContractError("invalid_identity_scope")
+    if require_photos and (set(photos) != ids or len(set_ids) != 1):
         raise ResultContractError("invalid_identity_scope")
     return reference
 

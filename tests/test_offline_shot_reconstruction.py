@@ -11,6 +11,7 @@ from badminton_analysis.analysis.offline_shot_reconstruction import (
     detect_rally_terminal_candidates,
     evaluate_rally_terminal_predictions,
     generate_offline_artifacts,
+    infer_missing_cross_net_opposite_returns,
     infer_missing_shuttle_events,
     reconstruct_shuttle_track,
     _deduplicate_seeds,
@@ -19,6 +20,31 @@ from badminton_analysis.analysis.offline_shot_reconstruction import (
 
 
 class OfflineShotReconstructionTests(unittest.TestCase):
+    def test_cross_net_return_requires_one_upstream_rally_and_continuous_measured_ball(self):
+        events = [
+            {"event_id": "s1", "hit_time_sec": 0., "hitter": {"court_xy_m": [2, 10]}},
+            {"event_id": "s2", "hit_time_sec": .8, "hitter": {"court_xy_m": [3, 9]}},
+        ]
+        tracks = [
+            {"frame": i, "time_sec": t, "image_xy": [x, 200], "status": "detected",
+             "trajectory_id": "one", "confidence": .9}
+            for i, (t, x) in enumerate(((.3, 230), (.4, 200), (.5, 240)), 1)
+        ]
+        rows = [{"time_sec": .4, "spatial": {"tracks": [{
+            "status": "detected", "track_id": "opponent", "court_xy_m": [2, 3],
+            "confidence": .9, "location_evidence": {"hands_image": {"right": [200, 200]}},
+        }]}}]
+        one = [{"start_time_sec": 0., "end_time_sec": .8}]
+        two = [{"start_time_sec": 0., "end_time_sec": .35}, {"start_time_sec": .36, "end_time_sec": .8}]
+
+        result = infer_missing_cross_net_opposite_returns(rows, tracks, events, rallies=one)
+        self.assertEqual("cross_net_opposite_return_candidate", result[1]["candidate_source"])
+        self.assertEqual("opponent", result[1]["hitter"]["track_id"])
+        self.assertFalse(result[1]["decision"]["eligible_for_statistics"])
+        self.assertEqual(2, len(infer_missing_cross_net_opposite_returns(rows, tracks, events, rallies=two)))
+        tracks[1]["status"] = "reconstructed"
+        self.assertEqual(2, len(infer_missing_cross_net_opposite_returns(rows, tracks, events, rallies=one)))
+
     def test_reconstructs_only_a_short_bounded_gap_and_marks_long_gap_unknown(self):
         rows = [
             self._row(1, [10, 10], accepted=True, confidence=0.50),

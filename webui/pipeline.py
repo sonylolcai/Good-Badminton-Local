@@ -611,7 +611,7 @@ def _reencode_for_browser(video_path, output_dir, cancel_cb=None):
         return video_path
 
     try:
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + 1800
         while process.poll() is None:
             if cancel_cb is not None and cancel_cb():
                 process.terminate()
@@ -790,7 +790,7 @@ def run_analysis(video_path, template_path, corners, options, progress_cb=None,
     shuttle_sample_hz = float(options.get("shuttle_sample_hz", analysis_sample_hz))
     pose_conf = float(options.get("pose_conf", 0.15))
     far_player_enhancement = bool(options.get("far_player_enhancement", True))
-    far_pose_roi = options.get("far_pose_roi", (0.12, 0.30, 0.86, 0.82))
+    far_pose_roi = options.get("far_pose_roi", None)
     # ByteTrack only receives already-sampled pose detections. The shared
     # timestamp cadence remains the sole detector/tracker update budget.
     tracker_backend = options.get("tracker_backend", "bytetrack")

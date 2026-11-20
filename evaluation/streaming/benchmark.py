@@ -44,6 +44,9 @@ class TimingDecoder:
 class _TimedFrameSegment:
     def __init__(self, segment, accumulator: TimingAccumulator):
         self.descriptor = segment.descriptor
+        self.video_width = segment.video_width
+        self.video_height = segment.video_height
+        self.video_fps = segment.video_fps
         self._frames = segment.frames
         self._accumulator = accumulator
 

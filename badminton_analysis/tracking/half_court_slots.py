@@ -7,12 +7,20 @@ slots by minimum total displacement. A replacement starts a new measured piece.
 """
 from itertools import permutations
 from collections import deque
+from math import isfinite, sqrt
 
 from ..analysis.fixed_camera_match import CourtMultiObjectTracker
 
 
 HALF_COURT_SLOTS = "half_court_slots.v1"
 INDIVIDUAL_TRACKS = "individual_tracks.v1"
+NET_HYSTERESIS_M = 0.40
+
+
+def _slot_appearance_distance(a, b):
+    if not a or not b or len(a) != 192 or len(b) != 192:
+        return None
+    return sqrt(max(0., 1. - min(1., sum(sqrt(max(0., x * y)) for x, y in zip(a, b)))))
 
 
 class HalfCourtSlotTracker(CourtMultiObjectTracker):
@@ -33,9 +41,14 @@ class HalfCourtSlotTracker(CourtMultiObjectTracker):
         self.occupancy_segments = {}
         self._ready_samples = deque()
         self._last_balanced_frame = None
+        self._slot_appearances = {}
 
-    def _end(self, observation):
-        return "end_a" if observation["court_xy"][1] < self.court_space.length_m / 2 else "end_b"
+    def _end(self, observation, *, prefer_end=None):
+        y = float(observation["court_xy"][1])
+        mid = self.court_space.length_m / 2
+        if prefer_end in ("end_a", "end_b") and abs(y - mid) <= NET_HYSTERESIS_M:
+            return prefer_end
+        return "end_a" if y < mid else "end_b"
 
     def _qualified(self, observations):
         # Side spectators and low-confidence duplicate boxes cannot fill a slot.
@@ -88,33 +101,45 @@ class HalfCourtSlotTracker(CourtMultiObjectTracker):
             track_id = f"track_{self._next_id - 1:03d}"
             self.slot_ends[track_id] = self._end(row)
             self.occupancy_segments[track_id] = 1
+            if row.get("anchor_clear") and len(row.get("anchor_appearance", [])) == 192:
+                self._slot_appearances[track_id] = list(row["anchor_appearance"])
         self.roster_track_ids = sorted(self.tracks)
         self.roster_status = "locked"
         self.roster_locked_frame = int(frame_index)
         self._last_roster_reason = "balanced_half_court_slots_ready"
         return self.snapshot(frame_index)
 
+    def _pair_cost(self, track_id, track, row, frame_index):
+        predicted = self._predict_position(track, frame_index)
+        pos_cost = self._distance(predicted, row["court_xy"])
+        ref = self._slot_appearances.get(track_id)
+        feat = row.get("anchor_appearance")
+        app_dist = _slot_appearance_distance(ref, feat) if ref and feat else None
+        if app_dist is not None:
+            return pos_cost + 1.5 * app_dist
+        return pos_cost
+
     def _update_locked_or_open_tracks(self, frame_index, observations):
         rows = self._qualified(observations)
         self._last_roster_candidate_count = len(rows)
         assignments = {}
         used = set()
-        # Known visual keys only keep a slot while still on its physical half.
+        # Known visual keys only keep a slot while still on its physical half (with net hysteresis).
         for index, row in enumerate(rows):
             owner = self._association_keys.get(row.get("association_key"))
-            if owner in self.tracks and owner not in assignments and self.slot_ends[owner] == self._end(row):
+            if owner in self.tracks and owner not in assignments and self._end(row, prefer_end=self.slot_ends[owner]) == self.slot_ends[owner]:
                 assignments[owner] = index
                 used.add(index)
         for end in ("end_a", "end_b"):
             slots = sorted(t for t in self.tracks if t not in assignments and self.slot_ends[t] == end)
-            candidates = [i for i, row in enumerate(rows) if i not in used and self._end(row) == end]
+            candidates = [i for i, row in enumerate(rows) if i not in used and self._end(row, prefer_end=end) == end]
             # At most two slots per half. Enumerate the small bipartite match,
             # allowing extra detections without creating new permanent IDs.
             count = min(len(slots), len(candidates))
             if not count:
                 continue
             choices = (
-                (sum(self._distance(self.tracks[t].court_xy, rows[i]["court_xy"]) for t, i in zip(ts, indices)), ts, indices)
+                (sum(self._pair_cost(t, self.tracks[t], rows[i], frame_index) for t, i in zip(ts, indices)), ts, indices)
                 for ts in permutations(slots, count)
                 for indices in permutations(candidates, count)
             )
@@ -144,6 +169,8 @@ class HalfCourtSlotTracker(CourtMultiObjectTracker):
                     track.association_key = None
             previous_distance = self.track_metrics[track_id]["distance_m"]
             self._apply_observation(track, frame_index, row, association_source=source)
+            if row.get("anchor_clear") and len(row.get("anchor_appearance", [])) == 192:
+                self._slot_appearances[track_id] = list(row["anchor_appearance"])
             if replacement:
                 self.track_metrics[track_id]["distance_m"] = previous_distance
                 self.track_metrics[track_id]["recovered_detected_frames"] += 1
@@ -168,7 +195,8 @@ class HalfCourtSlotTracker(CourtMultiObjectTracker):
     def snapshot_state(self):
         result = super().snapshot_state()
         result["half_court_slots"] = {"version": HALF_COURT_SLOTS, "slot_ends": dict(self.slot_ends), "occupancy_segments": dict(self.occupancy_segments),
-                                     "ready_samples": list(self._ready_samples), "last_balanced_frame": self._last_balanced_frame}
+                                     "ready_samples": list(self._ready_samples), "last_balanced_frame": self._last_balanced_frame,
+                                     "slot_appearances": {k: list(v) for k, v in self._slot_appearances.items()}}
         return result
 
     def restore_state(self, state):
@@ -183,3 +211,8 @@ class HalfCourtSlotTracker(CourtMultiObjectTracker):
         self.occupancy_segments = dict(slots["occupancy_segments"])
         self._ready_samples = deque((int(frame), bool(valid)) for frame, valid in slots.get("ready_samples", []))
         self._last_balanced_frame = slots.get("last_balanced_frame")
+        self._slot_appearances = {
+            str(k): list(v)
+            for k, v in dict(slots.get("slot_appearances") or {}).items()
+            if isinstance(v, list) and len(v) == 192 and all(isfinite(x) and x >= 0 for x in v)
+        }

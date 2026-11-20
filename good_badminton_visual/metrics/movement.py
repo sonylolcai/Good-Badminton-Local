@@ -614,7 +614,10 @@ def _valid_segments(points, fps):
         missing_sample = (left.get('sample_index') is not None and right.get('sample_index') is not None
                           and right['sample_index'] != left['sample_index'] + 1)
         reconnect = any(p.get('association_source') in {
-            'roster_reassociation', 'roster_end_recovery', 'half_court_slot_replacement',
+            'roster_reassociation',
+            'roster_end_recovery',
+            'half_court_slot_replacement',
+            'anchored_roster_reference_recovery',
         } for p in (left, right))
         if seconds <= 0 or seconds > MAX_JOIN_GAP_SECONDS or missing_sample or reconnect:
             excluded += 1

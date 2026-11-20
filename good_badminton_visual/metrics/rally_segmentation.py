@@ -3,12 +3,15 @@
 No hit events, stroke labels, hitter identity, or review-candidate files are read.
 Heuristic intervals are review proposals, never score or physical landing truth.
 """
+import hashlib
+import json
 import math
+from pathlib import Path
 from bisect import bisect_left, bisect_right
 from .court_contact_gate import valid_quad, person_court_gate
 from .rally_activity import find_settle_terminals
 
-VERSION = 'rally-segmentation.stage1.v2.1'
+VERSION = 'rally-segmentation.stage1.v2.2'
 POLICY = {'sample_step_sec': .1, 'flight_window_sec': .5, 'flight_min_points': 3,
           'flight_min_path_px': 55, 'flight_min_speed_px_s': 100,
           'flight_max_speed_px_s': 2500, 'flight_max_step_gap_sec': .22,
@@ -303,23 +306,49 @@ def segment_rallies(track_rows, person_rows, polygon, *, video_end_sec, pixel_sc
             'accuracy':'not_measured_no_complete_human_boundary_reference'}
 
 
+def derivation_provenance(detections_path, *, fps, play_state_path=None):
+    def hash_file(path):
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    detection_file = Path(detections_path)
+    inputs = {"detections": hash_file(detection_file)}
+    metadata = detection_file.parent / "metadata.json"
+    if metadata.is_file():
+        source = json.loads(metadata.read_text(encoding="utf-8"))
+        calibration = {"video": source.get("video"), "court": source.get("court")}
+        encoded = json.dumps(calibration, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        inputs["video_and_calibration"] = hashlib.sha256(encoded).hexdigest()
+    if play_state_path is not None and Path(play_state_path).is_file():
+        inputs["play_state"] = hash_file(play_state_path)
+    sources = ("court_contact_gate.py", "offline_shot_reconstruction.py", "rally_activity.py", "rally_segmentation.py")
+    return {
+        "input_sha256": inputs,
+        "algorithm_sha256": {name: hash_file(Path(__file__).with_name(name)) for name in sources},
+        "fps": fps,
+    }
+
+
 def generate_rally_stage_artifacts(detections_path):
     """Export only upstream observations and stage-one proposals, never shots."""
-    import json
-    from pathlib import Path
     from .offline_shot_reconstruction import reconstruct_shuttle_track, load_jsonl, write_jsonl
     path=Path(detections_path);directory=path.parent
     metadata=json.loads((directory/'metadata.json').read_text())
     video=metadata['video'];polygon=metadata['court']['corners']
     rows=load_jsonl(path)
     scale=video.get('width',1920)/1920
-    tracks=reconstruct_shuttle_track(rows,fps=video.get('fps',30),width=video.get('width',1920),height=video.get('height',1080),px_scale=scale)
+    tracks=reconstruct_shuttle_track(rows,fps=video.get('fps',30),width=video.get('width',1920),height=video.get('height',1080),px_scale=scale,court_polygon=polygon)
     context=segment_rallies(tracks,rows,polygon,video_end_sec=video['duration_sec'],pixel_scale=scale)
+    context['provenance'] = derivation_provenance(path, fps=video.get('fps', 30))
     target=directory/'derived';target.mkdir(parents=True,exist_ok=True)
     track_path=target/'shuttle_tracks_v2.jsonl';rally_path=target/'rallies_stage1.json'
     write_jsonl(track_path,tracks)
     rally_path.write_text(json.dumps(context,ensure_ascii=False,indent=2),encoding='utf-8')
     return {'version':VERSION,'status':'rally_stage_only','tracks_path':str(track_path),'rallies_path':str(rally_path),
             'frame_count':len(tracks),'rally_count':len(context['rallies']),
+            'provenance':context['provenance'],
             'uncertain_interval_count':len(context.get('uncertain_intervals',[])),
             'event_count':0,'contact_analysis_performed':False,'hitter_analysis_performed':False}

@@ -72,7 +72,9 @@ def execution_profile(sport_id, detector, route='batch'):
                        'badminton_analysis/detection/yolo_pose.py',
                        'badminton_analysis/visualization/player_pose.py',
                        'api/stream_runtime.py',
-                       'badminton_analysis/analysis/offline_shot_reconstruction.py')}),
+                       'badminton_analysis/analysis/offline_shot_reconstruction.py',
+                       'badminton_analysis/analysis/rally_activity.py',
+                       'badminton_analysis/analysis/rally_segmentation.py')}),
                'person_association_policy': association_policy(sport_id),
                'person_association_implementation_sha256': fingerprint({
                    p: file_digest(ROOT / p) for p in (

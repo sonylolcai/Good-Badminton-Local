@@ -259,6 +259,97 @@ class AnchoredRosterTests(unittest.TestCase):
         self.assertEqual(anchored[0],legacy[0]);self.assertEqual(anchored[2],legacy[2])
         self.assertEqual(corners[0],[711.5,350])
 
+    def test_partial_overlap_masks_appearance_and_preserves_locked_ids(self):
+        from copy import deepcopy
+        from badminton_analysis.tracking.anchored_roster import prepare_anchor_observations
+        frame,rows=scene()
+        # Give each player strip a textured BGR pattern (sharpness >= 9) so occlusion masking is distinguishable.
+        textured=frame.copy()
+        colors=[(220,40,40),(40,200,40),(40,60,230),(210,200,40)]
+        for r,bgr in zip(rows,colors):
+            x1,y1,x2,y2=r['bbox_xyxy']
+            textured[y1:y2,x1:x2]=bgr
+            textured[y1:y2:4,x1:x2:4]=(255,255,255)
+        current_rows=rows
+        processor=PersonOnlyFrameProcessor(self.tracker(),lambda f,c:current_rows)
+        for bucket in range(11):
+            opening=list(processor.process_frame(textured,context(bucket)))
+        baseline={i:e.data['track']['track_id'] for i,e in enumerate(opening)}
+
+        def shift_player(item,dx,new_court):
+            out=deepcopy(item)
+            x1,y1,x2,y2=out['bbox_xyxy']
+            out['bbox_xyxy']=[x1+dx,y1,x2+dx,y2]
+            out['keypoints_image']=[[p[0]+dx,p[1]] if p else None for p in out['keypoints_image']]
+            out['court_xy']=list(new_court)
+            return out
+
+        # Walk players 0 & 1 gradually over 4 frames (<=0.6m/step) into ~50% overlap while updating textured crops.
+        for step in range(1,5):
+            cur_frame=frame.copy()
+            moved=deepcopy(rows)
+            moved[0]=shift_player(rows[0],step*8.5,[1.0+step*0.4,3.0])
+            moved[1]=shift_player(rows[1],-step*11.5,[5.0-step*0.45,3.0])
+            for r,bgr in zip(moved,colors):
+                x1,y1,x2,y2=[int(v) for v in r['bbox_xyxy']]
+                cur_frame[y1:y2,x1:x2]=bgr
+                cur_frame[y1:y2:4,x1:x2:4]=(255,255,255)
+            ctx=context(10+step)
+            if step==4:
+                prepped=prepare_anchor_observations(cur_frame,moved,ctx)
+                self.assertGreater(prepped[0]['overlap_ratio'],0.35)
+                self.assertFalse(prepped[0]['anchor_clear'])
+                self.assertEqual(len(prepped[0]['anchor_appearance']),192)
+                self.assertFalse(prepped[2].get('anchor_occluded',False))
+                self.assertTrue(prepped[2]['anchor_clear'])
+            current_rows=moved
+            updated=list(processor.process_frame(cur_frame,ctx))
+
+        detected=[e for e in updated if e.event_type=='person_observation' and e.evidence_state=='detected']
+        self.assertEqual(len(detected),4)
+        for ev in detected:
+            track=ev.data['track']
+            self.assertEqual(track['identity_status'],'anchored')
+            bx=track['location_evidence']['bbox_xyxy'][0]
+            if abs(bx-moved[0]['bbox_xyxy'][0])<1.0:
+                self.assertEqual(track['track_id'],baseline[0])
+            elif abs(bx-moved[1]['bbox_xyxy'][0])<1.0:
+                self.assertEqual(track['track_id'],baseline[1])
+
+    def test_progressive_discovery_fallback_recovers_missing_slot_and_roundtrips_checkpoint(self):
+        from copy import deepcopy
+        frame,rows=scene()
+        textured=frame.copy()
+        for r,bgr in zip(rows,[(220,40,40),(40,200,40),(40,60,230),(210,200,40)]):
+            x1,y1,x2,y2=r['bbox_xyxy']
+            textured[y1:y2,x1:x2]=bgr
+            textured[y1:y2:4,x1:x2:4]=(255,255,255)
+        current_rows=rows
+        tracker=self.tracker()
+        processor=PersonOnlyFrameProcessor(tracker,lambda f,c:current_rows)
+        # First 5 buckets (0..4): all 4 players unoccluded -> saves discovery_slot_anchors.
+        for bucket in range(5):
+            processor.process_frame(textured,context(bucket))
+        state=tracker.snapshot_state()
+        self.assertIn('discovery_slot_anchors',state['court_tracker']['anchored_roster'])
+        restored_tracker=self.tracker()
+        restored_tracker.restore_state(state)
+        # Buckets 5..21: player 1 within slot gate ([4.3, 3.1]) has flat-green blurry crop (sharpness=0 -> anchor_clear=False); progressive fallback locks all 4.
+        blurred=textured.copy()
+        x1,y1,x2,y2=rows[1]['bbox_xyxy']
+        blurred[y1:y2,x1:x2]=(40,200,40)
+        moved=deepcopy(rows)
+        moved[1]['court_xy']=[4.3,3.1]
+        current_rows=moved
+        restored_proc=PersonOnlyFrameProcessor(restored_tracker,lambda f,c:current_rows)
+        final_events=[]
+        for bucket in range(5,22):
+            final_events=list(restored_proc.process_frame(blurred,context(bucket)))
+        anchored=[e.data['track'] for e in final_events if e.event_type=='person_observation' and e.evidence_state=='detected']
+        self.assertEqual(len(anchored),4)
+        self.assertTrue(all(t['identity_status']=='anchored' for t in anchored))
+        self.assertEqual(len({t['track_id'] for t in anchored}),4)
+
 
 if __name__=='__main__':
     unittest.main()

@@ -74,31 +74,40 @@ class RallyActivityTests(unittest.TestCase):
         self.assertEqual([],r['rallies'])
         self.assertEqual('human_excluded',r['assignments']['s1']['rally_phase'])
 
-    def test_calibrated_offline_output_applies_gate_and_keeps_all_original_event_ids(self):
+    def test_calibrated_offline_rallies_do_not_depend_on_shot_candidates(self):
         import json
         import tempfile
         from pathlib import Path
         from unittest.mock import patch
         from badminton_analysis.analysis import offline_shot_reconstruction as offline
-        events=[event(1,1),event(2,1.5,'b',10),event(3,3),event(4,3.5,'c',3),event(5,5),event(6,5.5,'b',10)]
-        tracks=flight(1)+flight(3)+flight(5)
+        from tests.test_rally_precision import bodies, flight as stage_flight
+
+        events = [event(1, .4), event(2, .6, 'b', 10), event(3, 3), event(4, 5.3, 'b', 10)]
+        tracks = stage_flight(.2) + stage_flight(5)
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)
+            root = Path(tmp)
             (root/'detections.jsonl').write_text(json.dumps({'frame':1,'time_sec':1})+'\n')
-            (root/'metadata.json').write_text(json.dumps({'court':{'corners':QUAD},'video':{'width':1920,'height':1080}}))
+            (root/'metadata.json').write_text(json.dumps({
+                'court': {'corners': QUAD}, 'video': {'width': 1920, 'height': 1080, 'duration_sec': 7},
+            }))
             with patch.object(offline,'reconstruct_shuttle_track',return_value=tracks), \
-                 patch.object(offline,'build_shot_events',return_value=events), \
+                 patch.object(offline,'build_shot_events',side_effect=[events, []]), \
                  patch.object(offline,'infer_missing_shuttle_events',side_effect=lambda rows,events: events), \
                  patch.object(offline,'refresh_event_evidence',side_effect=lambda events,tracks: events), \
-                 patch.object(offline,'build_rallies',return_value=[]), \
-                 patch.object(offline,'detect_rally_terminal_candidates',return_value=[{'time_sec':2,'source':'descent_then_compact_settle','confidence':.72}]):
-                output=offline.generate_offline_artifacts(root/'detections.jsonl',fps=30)
-            effective=offline.load_jsonl(output['events_path'])
-            self.assertEqual([f's{i}' for i in range(1,7)],[e['event_id'] for e in effective])
-            self.assertEqual('awaiting_restart',effective[2]['rally_phase'])
+                 patch.object(offline, 'detect_rally_terminal_candidates', return_value=[]), \
+                 patch('badminton_analysis.analysis.rally_segmentation.body_activity', return_value=bodies(duration=7)):
+                output = offline.generate_offline_artifacts(root/'detections.jsonl', fps=30)
+                no_shots = offline.generate_offline_artifacts(root/'detections.jsonl', root/'no_shots', fps=30)
+
+            effective = offline.load_jsonl(output['events_path'])
+            self.assertEqual(['s1', 's2', 's3', 's4'], [event['event_id'] for event in effective])
             self.assertIsNone(effective[2]['rally_id'])
-            self.assertEqual(2,output['rally_count'])
-            self.assertTrue((root/'derived/rally_activity_v1.json').is_file())
+            self.assertEqual(2, output['rally_count'])
+            self.assertEqual(2, no_shots['rally_count'])
+            self.assertEqual(0, no_shots['event_count'])
+            self.assertEqual(Path(output['rally_stage_path']).read_bytes(), Path(no_shots['rally_stage_path']).read_bytes())
+            self.assertIn('detections', output['provenance']['input_sha256'])
+            self.assertIn('rally_segmentation.py', output['provenance']['algorithm_sha256'])
 
 
 

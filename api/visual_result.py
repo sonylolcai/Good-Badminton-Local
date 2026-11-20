@@ -14,13 +14,17 @@ import threading
 import time
 
 PROTOCOL = 'stream-visual-result.v1'
-SUPPORTED_IDENTITY_POLICIES = ('individual_tracks.v1', 'half_court_slots.v1')
+# The previous implementation uses the same derivation for sessions without the
+# anonymous report opt-in. Keep their pinned obligations and cache keys intact.
+PREVIOUS_IMPLEMENTATION = '995d6e67cb6113b9875f74a13873adabcb1bedc3419f8ec94dfae574575efd89'
+SUPPORTED_IDENTITY_POLICIES = ('individual_tracks.v1', 'half_court_slots.v1', 'anchored_roster.v1')
 MAX_RESULT_BYTES = 4 * 1024 * 1024
 SESSION_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z')
 CONFIGURATION_KEYS = frozenset(('analysis_sample_hz', 'pose_imgsz', 'shuttle_detector',
     'tracker_backend', 'lock_match_roster', 'roster_stable_frames', 'max_roster_count',
     'expected_player_count', 'roster_discovery_seconds', 'roster_identity_policy',
-    'match_mode', 'far_player_enhancement', 'sport_id', 'session_mode', 'calibration_scope'))
+    'match_mode', 'far_player_enhancement', 'sport_id', 'session_mode', 'calibration_scope',
+    'allow_anonymous_report'))
 
 def enabled():
     raw = os.environ.get('GOOD_BADMINTON_VISUAL_RESULT_ENABLED')
@@ -124,7 +128,7 @@ def input_identity(root, session):
         'event_file': [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns],
         'configuration_sha256': hashlib.sha256(encode(configuration)).hexdigest(),
         'roster_identity_policy': configuration.get('roster_identity_policy', 'individual_tracks.v1'),
-        'implementation_sha256': implementation(),
+        'implementation_sha256': (session.get('visual_result') or {}).get('implementation_sha256') or implementation(),
         'visual_result': session.get('visual_result'),
     }
     if session.get('court_corners') is not None:
@@ -172,16 +176,17 @@ def compute_visual_result(root, identity, terminal):
         return {'stale': True}
     session = json.loads((root/'manifest.json').read_text())
     projection = session.get('visual_result')
-    if not projection or projection.get('implementation_sha256') != implementation():
+    pinned_implementation = (projection or {}).get('implementation_sha256')
+    active_implementation = implementation()
+    compatible_previous = (pinned_implementation == PREVIOUS_IMPLEMENTATION
+                           and (session.get('configuration') or {}).get('allow_anonymous_report') is not True)
+    if pinned_implementation != active_implementation and not compatible_previous:
         raise ValueError('visual_result_not_requested_or_version_changed')
     if session['status'] not in ('finalized', 'partial'):
         return {'stale': True}
     configuration = {k: v for k, v in session.get('configuration', {}).items() if k in CONFIGURATION_KEYS}
     if configuration.get('sport_id', 'badminton') != 'badminton':
         raise ValueError('visual_result_sport_not_supported')
-    if configuration.get('roster_identity_policy') == 'anchored_roster.v1':
-        # This frozen revision predates anchored-roster validation. Fail closed.
-        raise ValueError('visual_result_algorithm_not_compatible_with_anchored_roster')
     events = []
     digest = hashlib.sha256()
     size = 0

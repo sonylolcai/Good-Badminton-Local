@@ -145,13 +145,18 @@ class VisualResultTests(unittest.TestCase):
         from api.visual_result import implementation
         from tests.stream_test_utils import create_request
         with tempfile.TemporaryDirectory() as temp:
-            manager=StreamSessionManager(temp,start_worker=False);request=create_request()
-            request['visual_result']={'schema_version':'stream-visual-result.v1','implementation_sha256':implementation()}
-            request['configuration']['roster_identity_policy']='anchored_roster.v1'
-            request['configuration']['expected_player_count']=4
+            manager=StreamSessionManager(temp,start_worker=False)
+            anchored=create_request()
+            anchored['visual_result']={'schema_version':'stream-visual-result.v1','implementation_sha256':implementation()}
+            anchored['configuration']['roster_identity_policy']='anchored_roster.v1'
+            anchored['configuration']['expected_player_count']=4
+            unsupported=create_request()
+            unsupported['visual_result']={'schema_version':'stream-visual-result.v1','implementation_sha256':implementation()}
+            unsupported['configuration']['sport_id']='tennis'
             with patch.dict('os.environ',{'GOOD_BADMINTON_VISUAL_RESULT_ENABLED':'1'}):
-                with self.assertRaises(StreamSessionError):manager.create_session(request)
-            self.assertEqual(manager._list_sessions(),[])
+                self.assertEqual(manager.create_session(anchored,'anchored-allowed-001')[0],202)
+                with self.assertRaises(StreamSessionError):manager.create_session(unsupported,'unsupported-sport-001')
+            self.assertEqual(len(manager._list_sessions()),1)
 
     def test_terminal_save_only_notifies_requested_summary_sessions(self):
         from api.stream_sessions import StreamSessionManager
@@ -289,3 +294,17 @@ class VisualResultTests(unittest.TestCase):
             manager._load_events.assert_not_called()
 
 if __name__=='__main__':unittest.main()
+
+
+class PreviousImplementationTests(unittest.TestCase):
+    def test_unfinished_admitted_session_keeps_previous_result_identity(self):
+        from api.visual_result import PREVIOUS_IMPLEMENTATION
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session, _, terminal, manager = fixtures(root)
+            session['visual_result']['implementation_sha256'] = PREVIOUS_IMPLEMENTATION
+            (root/'manifest.json').write_text(json.dumps(session))
+            identity = input_identity(root, session)
+            self.assertEqual(identity['implementation_sha256'], PREVIOUS_IMPLEMENTATION)
+            self.assertEqual(compute_visual_result(root, identity, terminal), {'ready': True})
+            self.assertEqual(VisualResultService(manager).read(session)[1]['state'], 'ready')

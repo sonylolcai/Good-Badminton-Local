@@ -137,6 +137,103 @@ class CandidatePhotoCollectorTests(unittest.TestCase):
             )[0]
             self.assertNotIn("candidate_photo", later_side.data)
 
+    def test_anchored_roster_upgrades_only_unoccluded_front_facing_track(self):
+        import json
+        from badminton_analysis.streaming.models import FrameContext, ProcessorEvent
+
+        def full_body_pose(x1: float, y1: float, x2: float, y2: float, *, frontal: bool):
+            cx = (x1 + x2) / 2.0
+            pts = [None] * 17
+            scores = [None] * 17
+            if frontal:
+                pts[0] = [cx, y1 + 14.0]
+                pts[1] = [cx - 7.0, y1 + 10.0]
+                pts[2] = [cx + 7.0, y1 + 10.0]
+                pts[3] = [cx - 12.0, y1 + 13.0]
+                pts[4] = [cx + 12.0, y1 + 13.0]
+                for idx in range(5):
+                    scores[idx] = 0.95
+            pts[5], pts[6] = [cx - 14.0, y1 + 30.0], [cx + 14.0, y1 + 30.0]
+            pts[11], pts[12] = [cx - 12.0, y1 + 70.0], [cx + 12.0, y1 + 70.0]
+            pts[15], pts[16] = [cx - 12.0, y1 + 120.0], [cx + 12.0, y1 + 120.0]
+            for idx in (5, 6, 11, 12, 15, 16):
+                scores[idx] = 0.95
+            return pts, scores
+
+        anchor = {
+            "policy": "anchored_roster.v1",
+            "track_ids": ["track_001", "track_002", "track_003", "track_004"],
+            "source_frame_index": 10,
+            "source_time_sec": 1.0,
+            "measurement_bucket": 10,
+        }
+
+        def make_events(boxes, frontal_flags, time_sec: float):
+            evs = []
+            for tid, box, front in zip(anchor["track_ids"], boxes, frontal_flags):
+                pts, scores = full_body_pose(*box, frontal=front)
+                evs.append(
+                    ProcessorEvent(
+                        event_type="person_observation",
+                        evidence_state="detected",
+                        confidence=0.9,
+                        data={
+                            "track": {
+                                "track_id": tid,
+                                "confidence": 0.9,
+                                "identity_status": "anchored",
+                                "identity_anchor": anchor,
+                                "location_evidence": {"bbox_xyxy": list(box)},
+                                "pose": {"keypoints_image": pts, "keypoint_scores": scores},
+                            }
+                        },
+                        source_time_sec=time_sec,
+                        segment_index=0,
+                    )
+                )
+            return evs
+
+        sep_boxes = [[20, 20, 100, 160], [140, 20, 220, 160], [280, 20, 360, 160], [420, 20, 500, 160]]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            collector = CandidatePhotoCollector(root, anchored_roster_count=4)
+            frame0 = np.full((240, 560, 3), 80, dtype=np.uint8)
+            ctx10 = FrameContext(analysis_session_id="s1", segment_index=0, source_frame_index=10, source_time_sec=1.0, is_measurement_frame=True, measurement_bucket=10)
+            init_out = collector.attach(frame0, ctx10, make_events(sep_boxes, [False, False, False, False], 1.0))
+            self.assertEqual([e.data["candidate_photo"]["selection_policy"] for e in init_out], ["same_frame_roster_v1"] * 4)
+
+            # Frame 20: track_001 is front-facing BUT overlaps track_002 (>5%) -> MUST NOT upgrade.
+            ov_boxes = [[20, 20, 100, 160], [75, 20, 155, 160], [280, 20, 360, 160], [420, 20, 500, 160]]
+            frame1 = np.full((240, 560, 3), 210, dtype=np.uint8)
+            ctx20 = FrameContext(analysis_session_id="s1", segment_index=0, source_frame_index=20, source_time_sec=2.0, is_measurement_frame=True, measurement_bucket=20)
+            ov_out = collector.attach(frame1, ctx20, make_events(ov_boxes, [True, False, False, False], 2.0))
+            self.assertFalse(any("candidate_photo" in e.data for e in ov_out))
+
+            # Frame 30: separated front-facing track_001 -> upgrades ONLY track_001.
+            frame2 = np.full((240, 560, 3), 230, dtype=np.uint8)
+            ctx30 = FrameContext(analysis_session_id="s1", segment_index=0, source_frame_index=30, source_time_sec=3.0, is_measurement_frame=True, measurement_bucket=30)
+            up_out = collector.attach(frame2, ctx30, make_events(sep_boxes, [True, False, False, False], 3.0))
+            self.assertEqual(up_out[0].data["candidate_photo"]["selection_policy"], "anchored_front_upgrade_v1")
+            self.assertFalse(any("candidate_photo" in e.data for e in up_out[1:]))
+            manifest = json.loads((root / "anchor_set" / "manifest.json").read_text())
+            self.assertEqual(manifest["photos"]["track_001"]["selection_policy"], "anchored_front_upgrade_v1")
+            self.assertEqual(manifest["photos"]["track_002"]["selection_policy"], "same_frame_roster_v1")
+            restored = CandidatePhotoCollector(root, anchored_roster_count=4)
+            restored.restore_state(collector.snapshot_state())
+
+    def test_non_anchored_collector_skips_overlapping_other_track(self):
+        from copy import deepcopy
+        with tempfile.TemporaryDirectory() as temporary:
+            collector = CandidatePhotoCollector(Path(temporary))
+            ev1 = _event(frontal=True)
+            ev2 = deepcopy(ev1)
+            ev2.data["track"]["track_id"] = "track_002"
+            # Overlap ev2 heavily onto ev1 ([25, 12, 75, 112]).
+            ev2.data["track"]["location_evidence"]["bbox_xyxy"] = [35, 12, 85, 112]
+            frame = np.full((128, 128, 3), 120, dtype=np.uint8)
+            out = collector.attach(frame, _context(1.0), [ev1, ev2])
+            self.assertFalse(any("candidate_photo" in e.data for e in out))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -654,7 +654,15 @@ HALF_SLOT_SOURCES = {
     "half_court_slot_continuity",
     "half_court_slot_replacement",
 }
-TRUSTED_PERSON_SOURCES = {"bytetrack", "court_association", "roster_bootstrap"}
+TRUSTED_PERSON_SOURCES = {
+    "bytetrack",
+    "court_association",
+    "roster_bootstrap",
+    "anchored_roster_opening",
+    "anchored_roster_continuity",
+    "anchored_roster_appearance",
+    "anchored_roster_reference_recovery",
+}
 CANDIDATE_HIT_SOURCES = {
     "pose_wrist_pair_estimate.v1",
     "shot_candidates_receiving_region.v1",

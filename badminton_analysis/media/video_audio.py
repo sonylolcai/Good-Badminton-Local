@@ -70,7 +70,7 @@ def encode_vscode_compatible_mp4(input_video_path, output_path, audio_source_pat
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=180,
+        timeout=1800,
     )
     if result.returncode != 0 or not os.path.exists(final_output_path) or os.path.getsize(final_output_path) == 0:
         message = result.stderr.strip()[-1000:] if result.stderr else "unknown ffmpeg error"

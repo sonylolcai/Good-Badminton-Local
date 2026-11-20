@@ -18,6 +18,7 @@ from .heatmap_grid import receiving_heatmap
 from .offline_shot_reconstruction import (
     _pixel_scale,
     build_shot_events,
+    infer_missing_cross_net_opposite_returns,
     reconstruct_shuttle_track,
     refresh_event_evidence,
 )
@@ -25,7 +26,7 @@ from .rally_segmentation import segment_rallies
 
 SOURCE = "shot_candidates_receiving_region.v1"
 SCHEMA_VERSION = "shot-route-profile.v1"
-ALGORITHM_VERSION = "stream-candidate-routes.v1"
+ALGORITHM_VERSION = "stream-candidate-routes.v2"
 HALF_SLOT_SOURCES = frozenset(
     {
         "half_court_slot_opening",
@@ -33,7 +34,18 @@ HALF_SLOT_SOURCES = frozenset(
         "half_court_slot_replacement",
     }
 )
-PERSON_TRACK_SOURCES = frozenset({"bytetrack", "court_association", "roster_bootstrap", "anchored_roster"})
+PERSON_TRACK_SOURCES = frozenset(
+    {
+        "bytetrack",
+        "court_association",
+        "roster_bootstrap",
+        "anchored_roster",
+        "anchored_roster_opening",
+        "anchored_roster_continuity",
+        "anchored_roster_appearance",
+        "anchored_roster_reference_recovery",
+    }
+)
 MIN_BODY_CONFIDENCE = 0.5
 MIN_LOCATION_CONFIDENCE = 0.5
 MIN_IDENTITY_CONFIDENCE = 0.7
@@ -86,7 +98,16 @@ def _identity_confidence(track: Mapping[str, Any]) -> float:
         return float(association["identity_confidence"])
     if source in HALF_SLOT_SOURCES:
         return 0.95
-    return {"bytetrack": 0.95, "court_association": 0.85, "roster_bootstrap": 0.95, "anchored_roster": 0.95}.get(
+    return {
+        "bytetrack": 0.95,
+        "court_association": 0.85,
+        "roster_bootstrap": 0.95,
+        "anchored_roster": 0.95,
+        "anchored_roster_opening": 0.85,
+        "anchored_roster_continuity": 0.85,
+        "anchored_roster_appearance": 0.85,
+        "anchored_roster_reference_recovery": 0.85,
+    }.get(
         source, 0.0
     )
 
@@ -705,6 +726,7 @@ def derive_stream_candidate_shot_routes(
             width=width,
             height=height,
             px_scale=px_scale,
+            court_polygon=court_corners,
         )
         for tr in track_rows:
             shuttle_xy_by_scope_frame[(scope, int(tr["frame"]))] = tr.get("image_xy")
@@ -730,6 +752,9 @@ def derive_stream_candidate_shot_routes(
             fps=fps,
             px_scale=px_scale,
             court_polygon=court_corners,
+        )
+        raw_events = infer_missing_cross_net_opposite_returns(
+            hit_rows, track_rows, raw_events, rallies=rally_stage["rallies"], px_scale=px_scale,
         )
         raw_events = refresh_event_evidence(raw_events, track_rows)
         epoch_events = []

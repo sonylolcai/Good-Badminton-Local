@@ -741,7 +741,7 @@ class PersonOnlyFrameProcessor:
             has_fresh_observations = bool(provided.get("has_fresh_observations", True))
         else:
             observations = provided or []
-        if self.tracker.roster_identity_policy == ANCHORED_ROSTER and has_fresh_observations:
+        if self.tracker.roster_identity_policy in {ANCHORED_ROSTER, HALF_COURT_SLOTS} and has_fresh_observations:
             observations = prepare_anchor_observations(frame, observations, context)
         snapshot = self.tracker.update(
             # The tracker cadence is the configured 10/15/30 Hz measurement

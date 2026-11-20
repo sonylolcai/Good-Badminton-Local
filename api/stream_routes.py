@@ -81,7 +81,7 @@ def register_stream_routes(
                 if app.state.visual_result_service.enabled else None),
             "visual_metrics_implementation_sha256": (visual_implementation()
                 if app.state.visual_result_service.enabled else None),
-            "visual_result_identity_policies": (["individual_tracks.v1", "half_court_slots.v1"]
+            "visual_result_identity_policies": (["individual_tracks.v1", "half_court_slots.v1", "anchored_roster.v1"]
                 if app.state.visual_result_service.enabled else []),
             "roster_identity_policies": (["individual_tracks.v1", "half_court_slots.v1", "anchored_roster.v1"]
                                          if payload.get('sport_id') == 'badminton' else ["individual_tracks.v1"]),

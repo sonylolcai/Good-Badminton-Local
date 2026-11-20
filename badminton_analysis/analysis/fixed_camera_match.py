@@ -176,6 +176,7 @@ class _Track:
     # history, so the mini-court does not invent a path through an occlusion.
     court_history: list = field(default_factory=list)
     court_observation_history: list = field(default_factory=list)
+    home_court_end: Optional[str] = None
 
 
 class CourtMultiObjectTracker:
@@ -210,6 +211,7 @@ class CourtMultiObjectTracker:
     ):
         if match_mode not in {"auto", "singles", "doubles", "person_only"}:
             raise ValueError("match_mode must be 'auto', 'singles', 'doubles', or 'person_only'")
+        self.sport_id = str(sport_id or "badminton").strip().lower()
         self.person_association_policy = association_policy(sport_id)
         self.court_space = court_space
         self.fps = float(fps)
@@ -407,6 +409,26 @@ class CourtMultiObjectTracker:
             )
             return tracks
 
+        if self.match_mode in {"singles", "doubles"} and self.expected_roster_count in {2, 4}:
+            body_min = self.person_association_policy["recovery_body_min"]
+            location_min = self.person_association_policy["recovery_location_min"]
+            bootstrap_observations = [
+                obs
+                for obs in observations
+                if (
+                    float(obs.get("confidence") or 0.0) >= body_min
+                    and float(obs.get("location_confidence") or 0.0) >= location_min
+                    and (
+                        self.sport_id != "badminton"
+                        or self.court_space.contains(obs["court_xy"])
+                    )
+                )
+            ]
+        else:
+            bootstrap_observations = observations
+        self._last_roster_candidate_count = len(bootstrap_observations)
+        candidate_count = len(bootstrap_observations)
+
         if candidate_count != self.expected_roster_count:
             self._roster_stable_observation_frames = 0
             self._roster_bootstrap_association_keys = None
@@ -417,8 +439,26 @@ class CourtMultiObjectTracker:
             )
             return self.snapshot(frame_index)
 
+        if self.match_mode in {"singles", "doubles"} and self.expected_roster_count in {2, 4}:
+            per_half = self.expected_roster_count // 2
+            end_a_count = sum(
+                1 for obs in bootstrap_observations if self._court_end(obs.get("court_xy")) == "end_a"
+            )
+            end_b_count = sum(
+                1 for obs in bootstrap_observations if self._court_end(obs.get("court_xy")) == "end_b"
+            )
+            if end_a_count != per_half or end_b_count != per_half:
+                self._roster_stable_observation_frames = 0
+                self._roster_bootstrap_association_keys = None
+                self._roster_discovery_started_frame = None
+                self._last_roster_reason = (
+                    "waiting_for_balanced_court_ends"
+                    f" (end_a={end_a_count}, end_b={end_b_count}, expected_per_end={per_half})"
+                )
+                return self.snapshot(frame_index)
+
         if self.require_association_keys and any(
-            not observation.get("association_key") for observation in observations
+            not observation.get("association_key") for observation in bootstrap_observations
         ):
             self._roster_stable_observation_frames = 0
             self._roster_bootstrap_association_keys = None
@@ -437,7 +477,7 @@ class CourtMultiObjectTracker:
                 self._last_roster_reason = "awaiting_second_stable_roster_observation"
                 return self.snapshot(frame_index)
             ordered = sorted(
-                observations,
+                bootstrap_observations,
                 key=lambda item: (float(item["court_xy"][1]), float(item["court_xy"][0])),
             )
             for observation in ordered:
@@ -451,7 +491,7 @@ class CourtMultiObjectTracker:
         association_keys = None
         if self.require_association_keys:
             association_keys = tuple(
-                sorted(str(observation["association_key"]) for observation in observations)
+                sorted(str(observation["association_key"]) for observation in bootstrap_observations)
             )
             if len(set(association_keys)) != self.expected_roster_count:
                 self._roster_stable_observation_frames = 0
@@ -487,7 +527,7 @@ class CourtMultiObjectTracker:
         # real name, team, or image-side identity.  Court coordinates make the
         # ordering independent of whether the camera is rear, side, or oblique.
         ordered = sorted(
-            observations,
+            bootstrap_observations,
             key=lambda item: (float(item["court_xy"][1]), float(item["court_xy"][0])),
         )
         for observation in ordered:
@@ -554,6 +594,23 @@ class CourtMultiObjectTracker:
                 measured_xy = track.court_history[-1] if track.court_history else track.court_xy
                 if self._distance(measured_xy, observation["court_xy"]) > gate:
                     continue
+                if (
+                    self.sport_id == "badminton"
+                    and self.lock_match_roster
+                    and self.match_mode in {"singles", "doubles"}
+                ):
+                    obs_end = self._court_end(observation.get("court_xy"))
+                    track_end = self._track_recovery_end(track)
+                    if not self._recovery_source_allowed(observation, track_end):
+                        continue
+                    if (
+                        obs_end is not None
+                        and track_end is not None
+                        and obs_end != track_end
+                        and float(observation.get("location_confidence") or 0.0)
+                        < self.person_association_policy["recovery_location_min"]
+                    ):
+                        continue
             assignments.append((track_id, index))
             assignment_sources[(track_id, index)] = "bytetrack"
             unmatched_track_ids.remove(track_id)
@@ -880,6 +937,7 @@ class CourtMultiObjectTracker:
                         [int(frame), list(point)]
                         for frame, point in track.court_observation_history
                     ],
+                    "home_court_end": track.home_court_end,
                 }
                 for track_id, track in sorted(self.tracks.items())
             },
@@ -981,6 +1039,10 @@ class CourtMultiObjectTracker:
                     (int(item[0]), tuple(float(value) for value in item[1][:2]))
                     for item in record.get("court_observation_history", [])
                 ],
+                home_court_end=(
+                    record.get("home_court_end")
+                    or self._court_end(record["court_xy"][:2])
+                ),
             )
         self.tracks = restored_tracks
         self._next_id = int(state.get("next_id", 1))
@@ -1049,6 +1111,7 @@ class CourtMultiObjectTracker:
             court_observation_history=[
                 (int(frame_index), court_xy)
             ],
+            home_court_end=self._court_end(court_xy),
         )
         if observation.get("association_key"):
             self._association_keys[observation["association_key"]] = track_id
@@ -1209,7 +1272,7 @@ class CourtMultiObjectTracker:
             track = self.tracks[track_id]
             if track.missed_frames <= self.roster_reacquire_frames:
                 continue
-            court_end = self._court_end(track.court_xy)
+            court_end = self._track_recovery_end(track)
             if court_end is not None:
                 tracks_by_end.setdefault(court_end, []).append(track_id)
 
@@ -1272,7 +1335,7 @@ class CourtMultiObjectTracker:
 
         tracks_by_end = {}
         for track_id in unmatched_track_ids:
-            court_end = self._court_end(self.tracks[track_id].court_xy)
+            court_end = self._track_recovery_end(self.tracks[track_id])
             if court_end is None or court_end in tracks_by_end:
                 return []
             tracks_by_end[court_end] = track_id
@@ -1313,14 +1376,15 @@ class CourtMultiObjectTracker:
 
         missing_by_end = {}
         for track_id in unmatched_track_ids:
-            court_end = self._court_end(self.tracks[track_id].court_xy)
+            court_end = self._track_recovery_end(self.tracks[track_id])
             if court_end is not None:
                 missing_by_end.setdefault(court_end, []).append(track_id)
 
         candidates_by_end = {}
         for index in unmatched_observations:
-            court_end = self._court_end(observations[index].get("court_xy"))
-            if court_end is not None:
+            observation = observations[index]
+            court_end = self._court_end(observation.get("court_xy"))
+            if court_end is not None and self._recovery_source_allowed(observation, court_end):
                 candidates_by_end.setdefault(court_end, []).append(index)
 
         anchors_by_end = {}
@@ -1381,7 +1445,7 @@ class CourtMultiObjectTracker:
         tracks_by_end = {}
         for track_id in unmatched_track_ids:
             track = self.tracks[track_id]
-            court_end = self._court_end(track.court_xy)
+            court_end = self._track_recovery_end(track)
             if court_end is not None:
                 tracks_by_end.setdefault(court_end, []).append(track_id)
         observations_by_end = {}
@@ -1393,7 +1457,7 @@ class CourtMultiObjectTracker:
             ):
                 continue
             court_end = self._court_end(observation.get("court_xy"))
-            if court_end is not None:
+            if court_end is not None and self._recovery_source_allowed(observation, court_end):
                 observations_by_end.setdefault(court_end, []).append(index)
 
         recoveries = []
@@ -1448,7 +1512,7 @@ class CourtMultiObjectTracker:
 
         tracks_by_end = {}
         for track_id in unmatched_track_ids:
-            court_end = self._court_end(self.tracks[track_id].court_xy)
+            court_end = self._track_recovery_end(self.tracks[track_id])
             if court_end is None:
                 return []
             tracks_by_end.setdefault(court_end, []).append(track_id)
@@ -1458,6 +1522,8 @@ class CourtMultiObjectTracker:
             court_end = self._court_end(observation.get("court_xy"))
             if court_end is None:
                 return []
+            if not self._recovery_source_allowed(observation, court_end):
+                continue
             if (
                 float(observation.get("confidence") or 0.0) < self.person_association_policy["recovery_body_min"]
                 or float(observation.get("location_confidence") or 0.0) < self.person_association_policy["recovery_location_min"]
@@ -1496,6 +1562,13 @@ class CourtMultiObjectTracker:
                     continue
             recoveries.extend(pairs)
         return recoveries
+
+    def _recovery_source_allowed(self, observation, court_end):
+        return not (
+            self.sport_id == "badminton"
+            and court_end == "end_b"
+            and observation.get("source") == "far_roi"
+        )
 
     @staticmethod
     def _weak_recovery_observation(observation):
@@ -1554,6 +1627,20 @@ class CourtMultiObjectTracker:
         if court_xy is None:
             return None
         return "end_a" if float(court_xy[1]) < self.court_space.net_y_m else "end_b"
+
+    def _track_recovery_end(self, track):
+        if track.home_court_end is None:
+            return self._court_end(track.court_xy)
+        opposite = "end_b" if track.home_court_end == "end_a" else "end_a"
+        recent = track.court_history[-5:]
+        if len(recent) == 5 and all(
+            self._court_end(pt) == opposite
+            and abs(float(pt[1]) - self.court_space.net_y_m) >= 0.8
+            for pt in recent
+        ):
+            track.home_court_end = opposite
+            return opposite
+        return track.home_court_end
 
     @staticmethod
     def pose_keypoint_contract():

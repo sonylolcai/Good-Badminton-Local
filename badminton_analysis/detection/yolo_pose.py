@@ -3,7 +3,97 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Iterable, Sequence
 
+import cv2
 import numpy as np
+
+
+def _court_size_m(court_dimensions=None):
+    if court_dimensions is None:
+        return 6.1, 13.4
+    if isinstance(court_dimensions, dict):
+        width = court_dimensions.get("width_m", court_dimensions.get("width", 6.1))
+        length = court_dimensions.get("length_m", court_dimensions.get("length", 13.4))
+        return float(width), float(length)
+    return float(court_dimensions[0]), float(court_dimensions[1])
+
+
+def derive_far_court_roi(
+    corners,
+    frame_shape,
+    *,
+    court_dimensions=None,
+    world_points_m=None,
+    include_upper_body=False,
+):
+    """Return a tight far-half ROI anchored to the ground-plane net line.
+
+    ``corners`` uses the ordered floor calibration
+    ``[far_left, far_right, near_right, near_left]``.  Because a raised
+    net band projects near the far baseline under perspective, the bottom edge
+    of the far half is derived by projecting the court ground-plane net line
+    (``y_m = length_m / 2``) through the floor homography rather than taking an
+    image midpoint or visual net tape height.
+    """
+    points = np.asarray(corners, dtype=float)
+    if points.shape != (4, 2):
+        raise ValueError("court corners must contain four [x, y] points for far ROI")
+    far_left, far_right, near_right, near_left = points
+    width_m, length_m = _court_size_m(court_dimensions)
+    if world_points_m is not None:
+        world = np.asarray(world_points_m, dtype=float)
+        src_m = world if world.shape == (4, 2) else None
+    else:
+        src_m = np.asarray(
+            [[0.0, 0.0], [width_m, 0.0], [width_m, length_m], [0.0, length_m]],
+            dtype=float,
+        )
+
+    net_left = (far_left + near_left) / 2.0
+    net_right = (far_right + near_right) / 2.0
+    if src_m is not None and width_m > 0.0 and length_m > 0.0:
+        net_y_m = length_m / 2.0
+        y_min_m, y_max_m = float(src_m[:, 1].min()), float(src_m[:, 1].max())
+        x_min_m, x_max_m = float(src_m[:, 0].min()), float(src_m[:, 0].max())
+        if y_min_m < net_y_m < y_max_m:
+            homography, _ = cv2.findHomography(
+                src_m.astype(np.float32),
+                points.astype(np.float32),
+            )
+            if homography is not None and np.isfinite(homography).all():
+                net_query = np.asarray(
+                    [[[x_min_m, net_y_m], [x_max_m, net_y_m]]],
+                    dtype=np.float32,
+                )
+                projected = cv2.perspectiveTransform(net_query, homography)
+                if projected is not None and projected.shape == (1, 2, 2) and np.isfinite(projected).all():
+                    cand_left, cand_right = projected[0].astype(float)
+                    height, width = int(frame_shape[0]), int(frame_shape[1])
+                    limit = max(width, height) * 2.0
+                    far_top_y = float(min(far_left[1], far_right[1]))
+                    near_bot_y = float(max(near_left[1], near_right[1]))
+                    if (
+                        max(cand_left[1], cand_right[1]) > far_top_y
+                        and min(cand_left[1], cand_right[1]) < near_bot_y
+                        and max(abs(cand_left[0]), abs(cand_left[1]), abs(cand_right[0]), abs(cand_right[1])) <= limit
+                    ):
+                        net_left, net_right = cand_left, cand_right
+
+    far_half = np.asarray([far_left, far_right, net_right, net_left], dtype=float)
+    height, width = int(frame_shape[0]), int(frame_shape[1])
+    pad_x = max(4, round(width * 0.025))
+    pad_y_bottom = max(4, round(height * 0.025))
+    pad_y_top = (
+        max(pad_y_bottom, round(height * 0.15))
+        if include_upper_body
+        else pad_y_bottom
+    )
+    x1 = max(0, int(np.floor(far_half[:, 0].min())) - pad_x)
+    y1 = max(0, int(np.floor(far_half[:, 1].min())) - pad_y_top)
+    x2 = min(width, int(np.ceil(far_half[:, 0].max())) + pad_x)
+    y2 = min(height, int(np.ceil(far_half[:, 1].max())) + pad_y_bottom)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("derived far court ROI is empty")
+    return (x1, y1, x2, y2)
 
 
 def resolve_ultralytics_device(device="auto"):
@@ -269,6 +359,44 @@ class YOLOPoseProcessor:
         return intersection / union if union > 0 else 0.0
 
     @staticmethod
+    def _bbox_ios(first, second):
+        a = np.asarray(first, dtype=float)
+        b = np.asarray(second, dtype=float)
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        min_area = min(area_a, area_b)
+        return intersection / min_area if min_area > 0 else 0.0
+
+    @staticmethod
+    def _compatible_horizontal_span(first, second, min_ratio=0.50):
+        a = np.asarray(first, dtype=float)
+        b = np.asarray(second, dtype=float)
+        wa = max(0.0, float(a[2] - a[0]))
+        wb = max(0.0, float(b[2] - b[0]))
+        max_w = max(wa, wb)
+        return max_w > 0.0 and (min(wa, wb) / max_w) >= float(min_ratio)
+
+    @staticmethod
+    def _is_roi_edge_clipped(roi_det, full_det, edge_tol_px=12.0, overhang_px=8.0):
+        if roi_det.get("source") != "far_roi" or full_det.get("source") != "full_frame":
+            return False
+        roi = (roi_det.get("inference") or {}).get("roi")
+        if not isinstance(roi, Sequence) or len(roi) != 4:
+            return False
+        rx1, ry1, rx2, ry2 = (float(v) for v in roi)
+        fb = np.asarray(roi_det["bbox"], dtype=float)
+        full_b = np.asarray(full_det["bbox"], dtype=float)
+        return (
+            (fb[1] <= ry1 + edge_tol_px and full_b[1] < ry1 - overhang_px)
+            or (fb[3] >= ry2 - edge_tol_px and full_b[3] > ry2 + overhang_px)
+            or (fb[0] <= rx1 + edge_tol_px and full_b[0] < rx1 - overhang_px)
+            or (fb[2] >= rx2 - edge_tol_px and full_b[2] > rx2 + overhang_px)
+        )
+
+    @staticmethod
     def _pose_quality(detection):
         scores = detection.get("keypoint_scores")
         if scores is None or np.asarray(scores).size == 0:
@@ -287,23 +415,48 @@ class YOLOPoseProcessor:
         candidates.sort(key=self._pose_quality, reverse=True)
         kept = []
         for candidate in candidates:
-            duplicate = next(
-                (
-                    existing
-                    for existing in kept
-                    if self._bbox_iou(candidate["bbox"], existing["bbox"]) >= self.merge_iou
-                ),
-                None,
-            )
-            if duplicate is None:
+            duplicate_index = None
+            for idx, existing in enumerate(kept):
+                if self._bbox_iou(candidate["bbox"], existing["bbox"]) >= self.merge_iou:
+                    duplicate_index = idx
+                    break
+                if (
+                    candidate.get("source") != existing.get("source")
+                    and self._bbox_ios(candidate["bbox"], existing["bbox"]) >= 0.70
+                    and self._compatible_horizontal_span(candidate["bbox"], existing["bbox"])
+                ):
+                    duplicate_index = idx
+                    break
+
+            if duplicate_index is None:
                 candidate.setdefault("supporting_detections", [])
                 kept.append(candidate)
                 continue
 
-            duplicate.setdefault("merged_sources", [duplicate["source"]])
-            if candidate["source"] not in duplicate["merged_sources"]:
-                duplicate["merged_sources"].append(candidate["source"])
-            duplicate.setdefault("supporting_detections", []).append(
+            existing = kept[duplicate_index]
+            if self._is_roi_edge_clipped(existing, candidate):
+                existing_sources = existing.get("merged_sources") or [existing["source"]]
+                merged_sources = candidate.setdefault("merged_sources", [candidate["source"]])
+                for src in existing_sources:
+                    if src not in merged_sources:
+                        merged_sources.append(src)
+                supporting = candidate.setdefault("supporting_detections", [])
+                supporting.extend(existing.get("supporting_detections") or [])
+                supporting.append(
+                    {
+                        "source": existing["source"],
+                        "confidence": existing["confidence"],
+                        "bbox": np.asarray(existing["bbox"], dtype=float).copy(),
+                        "inference": deepcopy(existing["inference"]),
+                    }
+                )
+                kept[duplicate_index] = candidate
+                continue
+
+            existing.setdefault("merged_sources", [existing["source"]])
+            if candidate["source"] not in existing["merged_sources"]:
+                existing["merged_sources"].append(candidate["source"])
+            existing.setdefault("supporting_detections", []).append(
                 {
                     "source": candidate["source"],
                     "confidence": candidate["confidence"],

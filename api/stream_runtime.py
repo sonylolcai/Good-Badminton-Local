@@ -27,7 +27,7 @@ from badminton_analysis.detection.tennis_ball import (
     ExperimentalBadmintonBallTracker,
     TennisBallTracker,
 )
-from badminton_analysis.detection.yolo_pose import YOLOPoseProcessor
+from badminton_analysis.detection.yolo_pose import YOLOPoseProcessor, derive_far_court_roi
 from badminton_analysis.streaming.models import FinalizationContext, FrameContext, ProcessorEvent
 from badminton_analysis.tracking.person_only import PersonOnlyFrameProcessor, PersonOnlyTracker
 
@@ -129,39 +129,19 @@ def _load_tracknet_detector(model_path: str, model_sha256: str, device: str):
 
 
 def _derived_far_court_roi(corners, frame_shape, *, include_upper_body=False):
-    """Return a tight rectangular far-half ROI from ordered court corners.
+    """Return a tight rectangular far-half ROI anchored to the ground-plane net line.
 
     The session contract uses the existing calibration order
     ``far-left, far-right, near-right, near-left``.  A business-owned camera
     profile may provide ``far_pose_roi`` instead; this deterministic fallback
-    avoids the old full-width upper-half heuristic that often included judges.
+    uses ``derive_far_court_roi`` to avoid both the old full-width heuristic
+    and perspective-compressed visual net-tape estimates.
     """
-    points = np.asarray(corners, dtype=float)
-    if points.shape != (4, 2):
-        raise ValueError("court corners must contain four [x, y] points for far ROI")
-    far_left, far_right, near_right, near_left = points
-    far_half = np.asarray(
-        [
-            far_left,
-            far_right,
-            (far_right + near_right) / 2.0,
-            (far_left + near_left) / 2.0,
-        ],
-        dtype=float,
+    return derive_far_court_roi(
+        corners,
+        frame_shape,
+        include_upper_body=include_upper_body,
     )
-    height, width = int(frame_shape[0]), int(frame_shape[1])
-    pad_x, pad_y = max(4, round(width * 0.025)), max(4, round(height * 0.025))
-    if include_upper_body:
-        # Calibration describes the FLOOR. A player's head can be well above
-        # the far baseline in image space; a floor-only crop detects legs.
-        pad_y = max(pad_y, round(height * .15))
-    x1 = max(0, int(np.floor(far_half[:, 0].min())) - pad_x)
-    y1 = max(0, int(np.floor(far_half[:, 1].min())) - pad_y)
-    x2 = min(width, int(np.ceil(far_half[:, 0].max())) + pad_x)
-    y2 = min(height, int(np.ceil(far_half[:, 1].max())) + pad_y)
-    if x2 <= x1 or y2 <= y1:
-        raise ValueError("derived far court ROI is empty")
-    return (x1, y1, x2, y2)
 
 
 class PoseObservationProvider:
@@ -191,7 +171,11 @@ class PoseObservationProvider:
             else _derived_far_court_roi(
                 self.tracker.image_corners,
                 frame_shape,
-                include_upper_body=self.tracker.roster_identity_policy == "anchored_roster.v1",
+                include_upper_body=self.tracker.roster_identity_policy in {
+                    "anchored_roster.v1",
+                    "half_court_slots.v1",
+                    "individual_tracks.v1",
+                },
             )
         )
 
@@ -274,8 +258,31 @@ class PoseObservationProvider:
             return None
 
         court_xy = self.tracker.court_space.image_to_court(image_xy)
+        if (
+            (left_visible or right_visible)
+            and (
+                court_xy is None
+                or not self.tracker.contains_athlete(court_xy)
+                or float(court_xy[1]) < 0.0
+            )
+            and bbox.size >= 4
+            and np.isfinite(bbox[:4]).all()
+            and bbox[2] > bbox[0]
+            and bbox[3] > image_xy[1]
+        ):
+            box_h = float(bbox[3] - bbox[1])
+            if box_h > 0.0 and float(bbox[3] - image_xy[1]) <= 0.20 * box_h:
+                sole_xy = np.asarray([float(image_xy[0]), float(bbox[3])], dtype=float)
+                sole_court_xy = self.tracker.court_space.image_to_court(sole_xy)
+                if sole_court_xy is not None and self.tracker.contains_athlete(sole_court_xy):
+                    image_xy = sole_xy
+                    court_xy = sole_court_xy
         if court_xy is None or not self.tracker.contains_athlete(court_xy):
             return None
+        court_xy = (
+            min(float(self.tracker.court_space.width_m), max(0.0, float(court_xy[0]))),
+            min(float(self.tracker.court_space.length_m), max(0.0, float(court_xy[1]))),
+        )
         hands = {}
         if visible(9):
             hands["left"] = [float(value) for value in keypoints[9, :2]]

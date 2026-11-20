@@ -229,6 +229,7 @@ def validate_configuration(configuration):
         "roster_discovery_seconds",
         "roster_identity_policy",
         "candidate_photo_policy",
+        "allow_anonymous_report",
         "match_mode",
         "far_player_enhancement",
         "far_pose_roi",
@@ -318,6 +319,13 @@ def validate_configuration(configuration):
                 or configuration.get("lock_match_roster") is not True):
             raise ValueError("Invalid candidate_photo_policy")
         normalized["candidate_photo_policy"] = configuration["candidate_photo_policy"]
+    if "allow_anonymous_report" in configuration:
+        if (configuration["allow_anonymous_report"] is not True
+                or normalized.get("candidate_photo_policy") != "same_frame_roster.v1"
+                or configuration.get("expected_player_count") != 4
+                or configuration.get("roster_identity_policy") != "anchored_roster.v1"):
+            raise ValueError("Invalid allow_anonymous_report")
+        normalized["allow_anonymous_report"] = True
     if "far_pose_roi" in configuration:
         roi = configuration["far_pose_roi"]
         if not isinstance(roi, list) or len(roi) != 4:

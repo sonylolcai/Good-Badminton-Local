@@ -83,6 +83,27 @@ class MultiTrackModeTests(unittest.TestCase):
         self.assertEqual(4, sum(item["status"] == "detected" for item in result))
         self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
 
+    def test_doubles_near_end_recovery_rejects_far_roi_observation(self):
+        for mode in ("complement", "single", "pair"):
+            with self.subTest(mode=mode):
+                tracker, initial = self._locked_doubles_for_threshold_test()
+                near, teammate = initial[2:]
+                keyless = dict(near, association_key=None)
+                live = [*initial[:2], dict(keyless, source="far_roi")]
+                if mode == "complement":
+                    live.append(teammate)
+                elif mode == "pair":
+                    live.append(dict(teammate, association_key=None))
+
+                def near_track(snapshots):
+                    return next(t for t in snapshots if t["track_id"] == "track_004")
+
+                self.assertNotEqual("detected", near_track(tracker.update(3, live))["status"])
+                live[2] = keyless
+                recovered = near_track(tracker.update(4, live))
+                self.assertEqual("detected", recovered["status"])
+                self.assertEqual("full_frame", recovered["location_evidence"]["source"])
+
     def test_weak_distant_or_ambiguous_recovery_stays_unassigned(self):
         for position in [(3., 2.2), (3., 5.0)]:
             with self.subTest(position=position):
@@ -897,6 +918,131 @@ class MultiTrackModeTests(unittest.TestCase):
         second = pipeline.update(2, [self._observation((2.1, 2.0), None)], None)
         self.assertEqual(first["tracks"][0]["association"]["source"], "bytetrack")
         self.assertEqual(first["tracks"][0]["track_id"], second["tracks"][0]["track_id"])
+
+    def test_locked_doubles_bootstrap_rejects_unbalanced_same_half_and_low_loc_conf_until_two_per_end(self):
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="doubles",
+            lock_match_roster=True,
+            roster_stable_frames=2,
+        )
+        low_loc = dict(self._observation((5.6, 7.5), None), location_confidence=0.299)
+        unbalanced = [
+            low_loc,
+            self._observation((3.9, 10.3), None),
+            self._observation((4.7, 10.7), None),
+            self._observation((2.2, 13.0), None),
+        ]
+        step1 = pipeline.update(1, unbalanced, None)
+        self.assertEqual(step1["match_roster"]["status"], "bootstrapping")
+        self.assertTrue(step1["match_roster"]["reason"].startswith("waiting_for_"))
+        self.assertEqual(step1["tracks"], [])
+
+        four_near_high_conf = [
+            self._observation((1.5, 8.0), None),
+            self._observation((3.9, 10.3), None),
+            self._observation((4.7, 10.7), None),
+            self._observation((2.2, 12.8), None),
+        ]
+        step2 = pipeline.update(2, four_near_high_conf, None)
+        self.assertEqual(step2["match_roster"]["status"], "bootstrapping")
+        self.assertTrue(step2["match_roster"]["reason"].startswith("waiting_for_"))
+        self.assertEqual(step2["tracks"], [])
+
+        balanced = [
+            self._observation((1.2, 2.0), None),
+            self._observation((4.8, 2.2), None),
+            self._observation((1.3, 11.2), None),
+            self._observation((4.7, 11.0), None),
+        ]
+        step3 = pipeline.update(3, balanced, None)
+        self.assertEqual(step3["match_roster"]["status"], "bootstrapping")
+        step4 = pipeline.update(4, balanced, None)
+        self.assertEqual(step4["match_roster"]["status"], "locked")
+        ends = [track["court_end"] for track in step4["tracks"]]
+        self.assertEqual(ends.count("end_a"), 2)
+        self.assertEqual(ends.count("end_b"), 2)
+
+    def test_locked_doubles_bootstrap_ignores_outside_baseline_bystander(self):
+        pipeline = FixedCameraMatchPipeline(
+            self.CORNERS,
+            fps=10,
+            match_mode="doubles",
+            lock_match_roster=True,
+            roster_stable_frames=2,
+        )
+        with_bystander = [
+            self._observation((1.2, 2.0), None),
+            self._observation((4.8, 2.2), None),
+            self._observation((1.3, 11.2), None),
+            self._observation((4.7, 11.0), None),
+            self._observation((3.0, 14.0), None),
+        ]
+        step1 = pipeline.update(1, with_bystander, None)
+        self.assertEqual(step1["match_roster"]["status"], "bootstrapping")
+        step2 = pipeline.update(2, with_bystander, None)
+        self.assertEqual(step2["match_roster"]["status"], "locked")
+        self.assertEqual(len(step2["tracks"]), 4)
+        for track in step2["tracks"]:
+            x_m, y_m = track["court_xy_m"]
+            self.assertGreaterEqual(x_m, 0.0)
+            self.assertLessEqual(x_m, 6.10)
+            self.assertGreaterEqual(y_m, 0.0)
+            self.assertLessEqual(y_m, 13.40)
+
+    def test_locked_doubles_blocks_far_roi_from_hijacking_near_court_track_via_bytetrack(self):
+        tracker, initial = self._locked_doubles_for_threshold_test()
+        # initial[3] ("d", y=10.6) sorts before initial[2] ("c", y=11.0), so "d" is track_003.
+        step3 = [dict(item) for item in initial]
+        step3[3] = self._observation((2.61, 8.38), "d")
+        tracker.update(3, step3)
+
+        far_roi_bleed = [dict(item) for item in initial]
+        far_roi_bleed[3] = {
+            **self._observation((2.58, 6.65), "d"),
+            "location_confidence": 0.207,
+            "location_method": "bbox_bottom_center",
+            "source": "far_roi",
+        }
+        blocked = tracker.update(4, far_roi_bleed)
+        t3_blocked = next(item for item in blocked if item["track_id"] == "track_003")
+        self.assertNotEqual("detected", t3_blocked["status"])
+        self.assertEqual("end_b", t3_blocked["court_end"])
+
+        returned = [dict(item) for item in initial]
+        returned[3] = self._observation((2.59, 8.43), None)
+        recovered = tracker.update(5, returned)
+        t3_recovered = next(item for item in recovered if item["track_id"] == "track_003")
+        self.assertEqual("detected", t3_recovered["status"])
+        self.assertEqual([2.59, 8.43], t3_recovered["court_xy_m"])
+        self.assertEqual("end_b", t3_recovered["court_end"])
+        self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
+
+    def test_locked_doubles_recovers_near_track_even_if_last_measurement_crossed_net_margin(self):
+        tracker, initial = self._locked_doubles_for_threshold_test()
+        step3 = [dict(item) for item in initial]
+        step3[3] = self._observation((2.61, 8.38), "d")
+        tracker.update(3, step3)
+
+        momentary_net_dip = [dict(item) for item in initial]
+        momentary_net_dip[3] = self._observation((2.58, 6.65), "d")
+        tracker.update(4, momentary_net_dip)
+
+        for frame_index in range(5, 20):
+            tracker.update(frame_index, initial[:3])
+
+        mid_missing = tracker.update(19, initial[:3])
+        t3_missing = next(item for item in mid_missing if item["track_id"] == "track_003")
+        self.assertEqual("missing", t3_missing["status"])
+
+        returned = initial[:3] + [self._observation((2.11, 8.31), None)]
+        recovered = tracker.update(20, returned)
+        t3_restored = next(item for item in recovered if item["track_id"] == "track_003")
+        self.assertEqual("detected", t3_restored["status"])
+        self.assertEqual("doubles_team_side_complement", t3_restored["association"]["source"])
+        self.assertEqual([2.11, 8.31], t3_restored["court_xy_m"])
+        self.assertEqual(0, tracker.roster_summary()["unassigned_observation_count"])
 
     @staticmethod
     def _observation(court_xy, association_key):

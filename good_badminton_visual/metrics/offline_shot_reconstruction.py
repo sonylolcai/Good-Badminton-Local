@@ -18,7 +18,8 @@ import math
 from pathlib import Path
 from statistics import median
 from .court_contact_gate import scoped_rows, external_hand_is_nearest, valid_quad
-from .rally_activity import find_settle_terminals, derive_rally_activity
+from .rally_activity import assign_events_to_rallies, find_settle_terminals
+from .rally_segmentation import derivation_provenance, segment_rallies
 from typing import Iterable
 
 HUJI_PLAY_STATE_FILENAME = "huji_play_state_v1.json"
@@ -31,7 +32,7 @@ RALLY_FILENAME = "rallies_v2.jsonl"
 TERMINAL_CANDIDATE_FILENAME = "terminal_candidates_v1.jsonl"
 PLAYER_CONTACT_SUMMARY_FILENAME = "player_contact_summary_v1.json"
 RALLY_BOUNDARY_REFERENCE_FILENAME = "rally_boundary_reference_user_review.jsonl"
-DERIVATION_VERSION = "2.6"
+DERIVATION_VERSION = "2.7"
 
 
 def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_state_path=None):
@@ -48,13 +49,29 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
     fps = float(fps or infer_fps(rows) or 30.0)
     width, height = video_dimensions(detections_path.parent)
     px_scale = _pixel_scale(width, height)
-    track_rows = reconstruct_shuttle_track(rows, fps=fps, width=width, height=height, px_scale=px_scale)
     court_polygon = _court_polygon_from_metadata(detections_path.parent)
+    track_rows = reconstruct_shuttle_track(
+        rows, fps=fps, width=width, height=height, px_scale=px_scale, court_polygon=court_polygon,
+    )
+    provenance = derivation_provenance(detections_path, fps=fps, play_state_path=configured_play_state_path)
+    rally_context = None
+    if valid_quad(court_polygon):
+        metadata = json.loads((detections_path.parent / "metadata.json").read_text(encoding="utf-8"))
+        duration = (metadata.get("video") or {}).get("duration_sec")
+        if not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration <= 0:
+            duration = max(1 / fps, max(float(row["time_sec"]) for row in track_rows))
+        rally_context = segment_rallies(track_rows, rows, court_polygon, video_end_sec=duration, pixel_scale=px_scale)
+        rally_context["provenance"] = provenance
+        write_json(output_dir / "rallies_stage1.json", rally_context)
     # Metadata with an invalid/missing quad fails closed. Pre-metadata legacy
     # fixtures remain readable but are not a calibrated-contact claim.
     contact_polygon = court_polygon if court_polygon is not None else ([] if (detections_path.parent / 'metadata.json').exists() else None)
     hit_rows = scoped_rows(rows, contact_polygon) if contact_polygon is not None else rows
     events = build_shot_events(rows, track_rows, fps=fps, px_scale=px_scale, court_polygon=contact_polygon)
+    if rally_context is not None:
+        events = infer_missing_cross_net_opposite_returns(
+            hit_rows, track_rows, events, rallies=rally_context["rallies"], px_scale=px_scale,
+        )
     events = infer_missing_shuttle_events(hit_rows, events)
     events = refresh_event_evidence(events, track_rows)
     terminal_candidates = detect_rally_terminal_candidates(
@@ -64,10 +81,9 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
         px_scale=px_scale,
     )
     terminal_candidates = apply_huji_play_state_context(terminal_candidates, play_state_rows)
-    # Calibrated runs use one active-play state machine, not the legacy
-    # next-candidate-implies-start grouping. Raw candidates remain reviewable.
-    if valid_quad(court_polygon):
-        activity = derive_rally_activity(events, track_rows, terminal_candidates, pixel_scale=px_scale)
+    if rally_context is not None:
+        activity = assign_events_to_rallies(events, rally_context)
+        activity["provenance"] = provenance
         rallies = activity['rallies']
         for event in events:
             event['original_rally_id'] = event.get('rally_id')
@@ -91,6 +107,8 @@ def generate_offline_artifacts(detections_path, output_dir=None, fps=None, play_
     write_json(player_contact_summary_path, build_player_contact_summary(events))
     return {
         "version": DERIVATION_VERSION,
+        "provenance": provenance,
+        **({"rally_stage_path": str(output_dir / "rallies_stage1.json")} if rally_context is not None else {}),
         "tracks_path": str(track_path),
         "events_path": str(event_path),
         "rallies_path": str(rally_path),
@@ -163,17 +181,56 @@ def build_player_contact_summary(events):
     }
 
 
-def reconstruct_shuttle_track(rows, fps=30.0, width=None, height=None, max_gap_sec=0.35, max_speed_px_s=3200.0, px_scale=None):
+def _outside_court_corridor(point, court_polygon, px_scale=1.0):
+    """Reject far-lateral detections belonging to adjacent courts."""
+    if not valid_quad(court_polygon) or not _valid_point(point):
+        return False
+    far_left, far_right, near_right, near_left = [
+        (float(p[0]), float(p[1])) for p in court_polygon[:4]
+    ]
+    x, y = float(point[0]), float(point[1])
+
+    def _x_at_y(p_top, p_bot):
+        dy = p_bot[1] - p_top[1]
+        if abs(dy) <= 1e-6:
+            return p_top[0]
+        t = max(0.0, min(1.0, (y - p_top[1]) / dy))
+        return p_top[0] + t * (p_bot[0] - p_top[0])
+
+    left_x = _x_at_y(far_left, near_left)
+    right_x = _x_at_y(far_right, near_right)
+    lo_x, hi_x = min(left_x, right_x), max(left_x, right_x)
+    span = max(1.0, hi_x - lo_x)
+    pad_x = max(140.0 * float(px_scale), 0.35 * span)
+    return x < lo_x - pad_x or x > hi_x + pad_x
+
+
+
+def reconstruct_shuttle_track(
+    rows,
+    fps=30.0,
+    width=None,
+    height=None,
+    max_gap_sec=0.35,
+    max_speed_px_s=3200.0,
+    px_scale=None,
+    court_polygon=None,
+):
     """Build one per-analysis-frame shuttle sequence with honest gap labels."""
     if px_scale is None:
         px_scale = _pixel_scale(width, height)
     max_speed_px_s = float(max_speed_px_s) * px_scale
     candidates = [_raw_shuttle_candidate(row) for row in rows]
     rejected_indices = edge_static_artifacts(candidates, width=width, height=height)
+    corridor_rejected = set()
+    if court_polygon is not None and valid_quad(court_polygon):
+        for index, candidate in enumerate(candidates):
+            if candidate and _outside_court_corridor(candidate["image_xy"], court_polygon, px_scale=px_scale):
+                corridor_rejected.add(index)
     track_rows = []
     for index, (row, candidate) in enumerate(zip(rows, candidates)):
         base = _base_track_record(row, index)
-        if candidate and index not in rejected_indices:
+        if candidate and index not in rejected_indices and index not in corridor_rejected:
             base.update(
                 {
                     "status": "detected",
@@ -187,6 +244,11 @@ def reconstruct_shuttle_track(rows, fps=30.0, width=None, height=None, max_gap_s
                 }
             )
         elif candidate:
+            reason = (
+                "outside_court_corridor"
+                if index in corridor_rejected and index not in rejected_indices
+                else "repeated_low_confidence_edge_point"
+            )
             base.update(
                 {
                     "status": "rejected_artifact",
@@ -196,7 +258,7 @@ def reconstruct_shuttle_track(rows, fps=30.0, width=None, height=None, max_gap_s
                         "kind": "raw_detection_rejected",
                         "raw_status": candidate["raw_status"],
                         "accepted": False,
-                        "reason": "repeated_low_confidence_edge_point",
+                        "reason": reason,
                     },
                 }
             )
@@ -261,7 +323,7 @@ def reconstruct_shuttle_track(rows, fps=30.0, width=None, height=None, max_gap_s
                         },
                     }
                 )
-    _assign_trajectory_ids(track_rows)
+    _assign_trajectory_ids(track_rows, max_speed_px_s=max_speed_px_s)
     return track_rows
 
 
@@ -290,6 +352,7 @@ def build_shot_events(raw_rows, track_rows, fps=30.0, px_scale=1.0, court_polygo
             )
     seeds.extend(_trajectory_turn_seeds(track_rows, px_scale=px_scale))
     seeds.extend(_trajectory_heading_change_near_hand_seeds(raw_rows, track_rows, px_scale=px_scale))
+    seeds.extend(_trajectory_acceleration_near_player_seeds(raw_rows, track_rows, px_scale=px_scale))
     seeds.extend(_reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, px_scale=px_scale))
     seeds = _deduplicate_seeds(seeds)
     raw_by_frame = {int(item.get("frame", -1)): item for item in raw_rows}
@@ -419,6 +482,204 @@ def infer_missing_shuttle_events(raw_rows, events, min_gap_sec=0.45, max_gap_sec
             }
         )
     return _renumber_events(sorted([*ordered, *inferred], key=lambda item: float(item["hit_time_sec"])))
+
+
+def _event_court_side(event):
+    xy = (event.get("hitter") or {}).get("court_xy_m")
+    if not _valid_point(xy):
+        return None
+    return "far" if float(xy[1]) < 6.7 else "near"
+
+
+
+def _opposite_side_hitter(raw_rows, raw_times, track_row, expected_side, px_scale=1.0, max_reach_px=260.0):
+    """Find the closest detected player on ``expected_side`` within racket reach in O(log N)."""
+    shuttle_point = (track_row or {}).get("image_xy")
+    if not _valid_point(shuttle_point) or not raw_rows:
+        return None
+    t_target = float(track_row.get("time_sec", 0.0))
+    idx = bisect_left(raw_times, t_target)
+    best_raw = None
+    best_dt = 0.151
+    for cand_idx in (idx - 1, idx, idx + 1):
+        if 0 <= cand_idx < len(raw_rows):
+            dt = abs(raw_times[cand_idx] - t_target)
+            if dt < best_dt:
+                best_dt = dt
+                best_raw = raw_rows[cand_idx]
+    if best_raw is None:
+        return None
+    if external_hand_is_nearest(best_raw, shuttle_point):
+        return None
+    best = (None, math.inf, "visible_hand_proximity")
+    radius_px = float(max_reach_px) * px_scale
+    for track in ((best_raw.get("spatial") or {}).get("tracks") or []):
+        if track.get("status") != "detected":
+            continue
+        cxy = track.get("court_xy_m")
+        if not _valid_point(cxy):
+            continue
+        side = "far" if float(cxy[1]) < 6.7 else "near"
+        if side != expected_side:
+            continue
+        hands = ((track.get("location_evidence") or {}).get("hands_image") or {}).values()
+        for hand in hands:
+            if not _valid_point(hand):
+                continue
+            dx = abs(float(shuttle_point[0]) - float(hand[0]))
+            dy = float(shuttle_point[1]) - float(hand[1])
+            dist = math.hypot(dx, dy)
+            # Overhead racket head reaches above the wrist (dy < 0 in image coords).
+            in_overhead = dx <= 125.0 * px_scale and (-240.0 * px_scale) <= dy <= (90.0 * px_scale)
+            effective_dist = dist * 0.85 if in_overhead else dist
+            if (dist <= radius_px or in_overhead) and effective_dist < best[1]:
+                src = "visible_hand_proximity" if dist <= 150.0 * px_scale else "overhead_racket_reach"
+                best = (track, effective_dist, src)
+    if best[0] is None:
+        return None
+    return {
+        "track_id": best[0].get("track_id"),
+        "confidence": round(max(0.12, min(0.38, (1.0 - best[1] / max(radius_px, 1.0)) * float(best[0].get("confidence") or 0.5))), 4),
+        "source": best[2],
+        "distance_px": round(best[1], 2),
+        "measurement_status": "detected",
+        "zone_id": best[0].get("zone_id"),
+        "court_xy_m": best[0].get("court_xy_m"),
+    }
+
+
+
+def infer_missing_cross_net_opposite_returns(
+    raw_rows,
+    track_rows,
+    events,
+    *,
+    rallies,
+    px_scale=1.0,
+    min_gap_sec=0.65,
+    max_gap_sec=3.80,
+):
+    """Recover missed cross-net opposite-side returns between consecutive same-side hits.
+
+    Only consider same-side contacts within one upstream rally interval. A candidate
+    requires a measured ball point in a continuous trajectory plus an opposite-side
+    player near the turn or acceleration.
+    """
+    if not events or not track_rows or not rallies:
+        return list(events)
+    ordered = sorted(events, key=lambda item: (float(item["hit_time_sec"]), int(item.get("frame", 0))))
+    observed = [item for item in track_rows if item.get("status") in {"detected", "reconstructed"} and _valid_point(item.get("image_xy"))]
+    if len(observed) < 3:
+        return ordered
+
+    sorted_raw = sorted(raw_rows, key=lambda r: float(r.get("time_sec", 0.0)))
+    raw_times = [float(r.get("time_sec", 0.0)) for r in sorted_raw]
+    obs_times = [float(p["time_sec"]) for p in observed]
+
+    rally_starts = [float(rally["start_time_sec"]) for rally in rallies]
+    rally_ends = [float(rally["end_time_sec"]) for rally in rallies]
+
+    inferred = []
+    for before, after in zip(ordered, ordered[1:]):
+        side_before = _event_court_side(before)
+        side_after = _event_court_side(after)
+        if not side_before or side_before != side_after:
+            continue
+        t_start = float(before["hit_time_sec"])
+        t_end = float(after["hit_time_sec"])
+        interval = bisect_left(rally_ends, t_end)
+        if interval == len(rallies) or t_start < rally_starts[interval]:
+            continue
+        elapsed = t_end - t_start
+        if not (min_gap_sec <= elapsed <= max_gap_sec):
+            continue
+        expected_side = "far" if side_before == "near" else "near"
+
+        # O(log N) slice of observed points in [t_start, t_end].
+        lo = bisect_left(obs_times, t_start)
+        hi = bisect_left(obs_times, t_end + 1e-6)
+        interval_obs = observed[lo:hi]
+        if len(interval_obs) < 3:
+            continue
+        max_inner_gap = max(
+            (float(b["time_sec"]) - float(a["time_sec"]) for a, b in zip(interval_obs, interval_obs[1:])),
+            default=0.0,
+        )
+        if max_inner_gap > 1.5:
+            continue
+
+        # Score interior shuttle frames by kinematic contact cue + opposite-side player reach.
+        best_choice = None
+        for prev_pt, cur_pt, next_pt in zip(interval_obs, interval_obs[1:], interval_obs[2:]):
+            trajectory_id = cur_pt.get("trajectory_id")
+            if (cur_pt["status"] != "detected" or trajectory_id != prev_pt.get("trajectory_id")
+                    or trajectory_id != next_pt.get("trajectory_id")):
+                continue
+            t_cur = float(cur_pt["time_sec"])
+            if t_cur < t_start + 0.22 or t_cur > t_end - 0.22:
+                continue
+            dt_in = t_cur - float(prev_pt["time_sec"])
+            dt_out = float(next_pt["time_sec"]) - t_cur
+            if not (0.02 <= dt_in <= 0.35 and 0.02 <= dt_out <= 0.35):
+                continue
+            hitter = _opposite_side_hitter(sorted_raw, raw_times, cur_pt, expected_side, px_scale=px_scale)
+            if hitter is None:
+                continue
+            v_in = _velocity(prev_pt["image_xy"], cur_pt["image_xy"], dt_in)
+            v_out = _velocity(cur_pt["image_xy"], next_pt["image_xy"], dt_out)
+            sp_in = math.hypot(*v_in)
+            sp_out = math.hypot(*v_out)
+            dv = math.hypot(v_out[0] - v_in[0], v_out[1] - v_in[1])
+            cos_val = _cosine(v_in, v_out)
+            speed_ratio = sp_out / max(sp_in, 30.0 * px_scale)
+
+            # Require real kinematic contact evidence: direction kink, acceleration jump, or vertical turn.
+            has_turn = cos_val <= 0.55 and max(sp_in, sp_out) >= 100.0 * px_scale
+            has_accel = (speed_ratio >= 1.75 and sp_out >= 260.0 * px_scale) or dv >= 360.0 * px_scale
+            has_far_smash = expected_side == "far" and v_out[1] > 160.0 * px_scale and (sp_out - sp_in) >= 130.0 * px_scale
+            if not (has_turn or has_accel or has_far_smash):
+                continue
+
+            kinematic_score = (
+                max(0.0, 0.7 - cos_val) * 1.4
+                + min(2.0, dv / (450.0 * px_scale))
+                + (0.45 if cur_pt.get("status") == "detected" else 0.0)
+            )
+            dist_score = max(0.0, 1.0 - float(hitter["distance_px"]) / (260.0 * px_scale))
+            total_score = kinematic_score + dist_score * 1.3
+            if best_choice is None or total_score > best_choice[0]:
+                best_choice = (total_score, cur_pt, hitter, cos_val, dv, sp_in, sp_out)
+
+        if best_choice is None:
+            continue
+        _, cur_pt, hitter, cos_val, dv, sp_in, sp_out = best_choice
+        inferred.append(
+            {
+                "schema_version": DERIVATION_VERSION,
+                "event_id": "pending_cross_net",
+                "frame": int(cur_pt["frame"]),
+                "hit_time_sec": round(float(cur_pt["time_sec"]), 6),
+                "status": "candidate",
+                "candidate_source": "cross_net_opposite_return_candidate",
+                "candidate_reason": (
+                    f"cross-net opposite ({expected_side}) return between same-side hits; "
+                    f"cos={cos_val:.2f}; dv={dv:.0f}px/s; hand_d={hitter['distance_px']:.1f}px; "
+                    "offline review required"
+                ),
+                "event_origin": "machine_candidate",
+                "time_confidence": round(min(0.36, 0.14 + 0.18 * float(hitter["confidence"])), 4),
+                "trajectory": _event_trajectory_evidence(track_rows, float(cur_pt["time_sec"])),
+                "hitter": hitter,
+                "receiver": {"track_id": None, "confidence": 0.0, "source": "not_yet_inferred"},
+                "proposal": {"label": "unknown", "confidence": 0.0, "status": "needs_human_review"},
+                "decision": {"status": "pending", "label_source": "machine", "eligible_for_statistics": False},
+            }
+        )
+
+    if not inferred:
+        return ordered
+    return _renumber_events(sorted([*ordered, *inferred], key=lambda item: (float(item["hit_time_sec"]), int(item.get("frame", 0)))))
+
 
 
 def build_rallies(
@@ -950,17 +1211,35 @@ def _raw_shuttle_candidate(row):
     }
 
 
-def _assign_trajectory_ids(track_rows):
+def _assign_trajectory_ids(track_rows, max_speed_px_s=None):
     trajectory_index = 0
     active = False
+    prev_xy = None
+    prev_t = None
     for row in track_rows:
         if row["status"] in {"detected", "reconstructed"}:
-            if not active:
+            xy = row.get("image_xy")
+            t = float(row.get("time_sec", 0.0))
+            teleport = False
+            if (
+                active
+                and max_speed_px_s is not None
+                and _valid_point(xy)
+                and _valid_point(prev_xy)
+                and prev_t is not None
+                and t > prev_t
+            ):
+                if _distance(prev_xy, xy) / (t - prev_t) > float(max_speed_px_s):
+                    teleport = True
+            if not active or teleport:
                 trajectory_index += 1
                 active = True
             row["trajectory_id"] = f"trajectory_{trajectory_index:04d}"
+            prev_xy, prev_t = xy, t
         else:
             active = False
+            prev_xy = None
+            prev_t = None
 
 
 def _trajectory_turn_seeds(track_rows, px_scale=1.0):
@@ -1049,6 +1328,58 @@ def _trajectory_heading_change_near_hand_seeds(raw_rows, track_rows, px_scale=1.
     return seeds
 
 
+def _trajectory_acceleration_near_player_seeds(raw_rows, track_rows, px_scale=1.0):
+    """Detect smash/drive/drop acceleration kinks and post-gap turns near a player.
+
+    An overhead smash off a high clear often moves downward both before and
+    after contact (positive velocity cosine) while exhibiting a sharp speed
+    jump near the hitter's overhead racket reach.  Likewise, a far-court return
+    right after a brief reconstructed gap may have a detected contact frame
+    preceded by an interpolated point.
+    """
+    raw_by_frame = {int(item.get("frame", 0)): item for item in raw_rows}
+    observed = [item for item in track_rows if item.get("status") in {"detected", "reconstructed"} and _valid_point(item.get("image_xy"))]
+    seeds = []
+    for before, current, after in zip(observed, observed[1:], observed[2:]):
+        if current.get("status") != "detected":
+            continue
+        if before.get("trajectory_id") != current.get("trajectory_id") or current.get("trajectory_id") != after.get("trajectory_id"):
+            continue
+        dt_before = float(current["time_sec"]) - float(before["time_sec"])
+        dt_after = float(after["time_sec"]) - float(current["time_sec"])
+        if not (0.02 <= dt_before <= 0.30 and 0.02 <= dt_after <= 0.30):
+            continue
+        incoming = _velocity(before["image_xy"], current["image_xy"], dt_before)
+        outgoing = _velocity(current["image_xy"], after["image_xy"], dt_after)
+        sp_in = math.hypot(*incoming)
+        sp_out = math.hypot(*outgoing)
+        dv = math.hypot(outgoing[0] - incoming[0], outgoing[1] - incoming[1])
+        cosine = _cosine(incoming, outgoing)
+        speed_jump = sp_out >= max(360.0 * px_scale, 2.1 * max(sp_in, 40.0 * px_scale)) and dv >= 420.0 * px_scale
+        post_gap_turn = before.get("status") == "reconstructed" and cosine <= 0.20 and sp_out >= 220.0 * px_scale
+        if not (speed_jump or post_gap_turn):
+            continue
+        hitter = _hitter_evidence(raw_by_frame.get(int(current["frame"])), current, None, px_scale=px_scale)
+        if not hitter.get("track_id"):
+            continue
+        confidence = min(0.36, 0.14 + 0.14 * min(1.0, dv / (800.0 * px_scale)))
+        seeds.append(
+            {
+                "frame": int(current["frame"]),
+                "time_sec": float(current["time_sec"]),
+                "source": "trajectory_acceleration_near_player",
+                "confidence": confidence,
+                "hitter_track_id": hitter.get("track_id"),
+                "reason": (
+                    f"shuttle acceleration/post-gap kink dv={dv:.0f}px/s cos={cosine:.2f} "
+                    f"near {hitter.get('track_id')}; offline review required"
+                ),
+            }
+        )
+    return seeds
+
+
+
 def _reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, max_hand_distance_px=100.0, px_scale=1.0):
     """Turn a short TrackNet gap near a hand into an explicitly inferred cue.
 
@@ -1104,8 +1435,9 @@ def _reconstructed_gap_hand_proximity_seeds(raw_rows, track_rows, max_hand_dista
 
 def _deduplicate_seeds(seeds, min_gap_sec=0.35):
     priority = {
-        "spatial_hit_candidate": 3,
-        "trajectory_heading_change_near_hand": 2,
+        "spatial_hit_candidate": 4,
+        "trajectory_heading_change_near_hand": 3,
+        "trajectory_acceleration_near_player": 2,
         "trajectory_turn": 1,
         "reconstructed_gap_hand_proximity": 0,
     }
@@ -1163,16 +1495,43 @@ def _hitter_evidence(raw, track_row, preferred_track_id, px_scale=1.0):
                 if distance < best[2]:
                     best = (track, hand, distance)
     hand_radius_px = 150.0 * px_scale
-    if best[0] is None or best[2] > hand_radius_px:
+    if best[0] is not None and best[2] <= hand_radius_px:
+        return {
+            "track_id": best[0].get("track_id"),
+            "confidence": round(max(0.0, min(0.42, (1.0 - best[2] / hand_radius_px) * float(best[0].get("confidence") or 0.0))), 4),
+            "source": "visible_hand_proximity",
+            "distance_px": round(best[2], 2),
+            "measurement_status": "detected",
+            "zone_id": best[0].get("zone_id"),
+            "court_xy_m": best[0].get("court_xy_m"),
+        }
+    # Overhead racket-head reach fallback: shuttle struck above the wrist (dy < 0)
+    # on a clear/smash sits 60-80 cm beyond the wrist keypoint.
+    overhead_best = (None, None, math.inf)
+    for track in tracks:
+        if track.get("status") != "detected":
+            continue
+        hands = ((track.get("location_evidence") or {}).get("hands_image") or {}).values()
+        for hand in hands:
+            if not _valid_point(hand):
+                continue
+            dx = abs(float(shuttle_point[0]) - float(hand[0]))
+            dy = float(shuttle_point[1]) - float(hand[1])
+            if dx <= 115.0 * px_scale and (-230.0 * px_scale) <= dy <= (60.0 * px_scale):
+                dist = math.hypot(dx, dy)
+                if dist < overhead_best[2]:
+                    overhead_best = (track, hand, dist)
+    if overhead_best[0] is None:
         return {"track_id": None, "confidence": 0.0, "source": "no_near_visible_hand"}
+    overhead_radius = 240.0 * px_scale
     return {
-        "track_id": best[0].get("track_id"),
-        "confidence": round(max(0.0, min(0.42, (1.0 - best[2] / hand_radius_px) * float(best[0].get("confidence") or 0.0))), 4),
-        "source": "visible_hand_proximity",
-        "distance_px": round(best[2], 2),
+        "track_id": overhead_best[0].get("track_id"),
+        "confidence": round(max(0.08, min(0.32, (1.0 - overhead_best[2] / overhead_radius) * float(overhead_best[0].get("confidence") or 0.5))), 4),
+        "source": "overhead_racket_reach",
+        "distance_px": round(overhead_best[2], 2),
         "measurement_status": "detected",
-        "zone_id": best[0].get("zone_id"),
-        "court_xy_m": best[0].get("court_xy_m"),
+        "zone_id": overhead_best[0].get("zone_id"),
+        "court_xy_m": overhead_best[0].get("court_xy_m"),
     }
 
 

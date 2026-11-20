@@ -384,7 +384,7 @@ def _parse_options(value, *, sport_id="badminton"):
         # Doubles/Auto benefit from a second far-court pose pass; clients may
         # explicitly disable it for a speed-first local experiment.
         "far_player_enhancement": True,
-        "far_pose_roi": [0.12, 0.30, 0.86, 0.82],
+        "far_pose_roi": None,
         "match_mode": "auto",
         "lock_match_roster": True,
         "roster_stable_frames": 2,
@@ -443,6 +443,21 @@ def _parse_options(value, *, sport_id="badminton"):
         )
     if not 0 < float(options["pose_conf"]) <= 1:
         raise HTTPException(status_code=422, detail="pose_conf must be in (0, 1]")
+    if options["far_pose_roi"] is not None:
+        roi = options["far_pose_roi"]
+        if not isinstance(roi, (list, tuple)) or len(roi) != 4 or any(isinstance(v, bool) for v in roi):
+            raise HTTPException(status_code=422, detail="far_pose_roi must be [x1, y1, x2, y2] or null")
+        try:
+            values = [float(value) for value in roi]
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="far_pose_roi values must be numeric") from exc
+        if (
+            not all(0.0 <= value <= 1.0 for value in values)
+            or values[0] >= values[2]
+            or values[1] >= values[3]
+        ):
+            raise HTTPException(status_code=422, detail="far_pose_roi must be an ordered normalized rectangle")
+        options["far_pose_roi"] = values
     if options["output_video_style"] not in {"annotated", "skeleton"}:
         raise HTTPException(status_code=422, detail="output_video_style must be annotated or skeleton")
     for key in (

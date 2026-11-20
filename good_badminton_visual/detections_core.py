@@ -146,6 +146,10 @@ def _association_identity_confidence(association):
         "bytetrack": 0.95,
         "roster_bootstrap": 0.95,
         "court_association": 0.85,
+        "anchored_roster_opening": 0.85,
+        "anchored_roster_continuity": 0.85,
+        "anchored_roster_appearance": 0.85,
+        "anchored_roster_reference_recovery": 0.85,
         "roster_reassociation": 0.72,
         "roster_end_recovery": 0.55,
     }.get(str(association.get("source") or ""), 0.60)

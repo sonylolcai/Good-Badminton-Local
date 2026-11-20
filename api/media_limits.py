@@ -4,8 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import os
-from pathlib import Path
 import shutil
+from stat import S_ISDIR, S_ISLNK
 
 from .stream_errors import StreamSessionError
 
@@ -56,16 +56,22 @@ class MediaLimits:
 def tree_bytes(root):
     """Count the API data tree without following symlinks into other volumes."""
     total = 0
-    def fail(error):
-        raise error
-    for parent, _, files in os.walk(root, followlinks=False, onerror=fail):
-        for name in files:
-            path = Path(parent) / name
-            try:
-                if not path.is_symlink():
-                    total += path.stat().st_size
-            except FileNotFoundError:
-                pass  # An atomic replace or a completed cache release won the race.
+    directories = [root]
+    while directories:
+        parent = directories.pop()
+        # A queued subdirectory can be replaced after its directory entry was read.
+        if parent is not root and os.path.islink(parent):
+            continue
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue  # Atomic replacement or cache release removed this entry.
+                if S_ISDIR(info.st_mode):
+                    directories.append(entry.path)
+                elif not S_ISLNK(info.st_mode):
+                    total += info.st_size
     return total
 
 

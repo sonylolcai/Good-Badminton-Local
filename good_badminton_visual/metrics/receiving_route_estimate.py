@@ -83,10 +83,29 @@ def _pose_sample(row, track):
                 or track.get('slot_court_end') != track.get('court_end')):
             return None
     elif (scope == 'half_court_slots.v1'
-          or source not in {'bytetrack', 'court_association', 'roster_bootstrap'}):
+          or source not in {
+              'bytetrack',
+              'court_association',
+              'roster_bootstrap',
+              'anchored_roster_opening',
+              'anchored_roster_continuity',
+              'anchored_roster_appearance',
+              'anchored_roster_reference_recovery',
+          }):
         # Untrusted reconnects remain excluded in legacy person-identity mode.
         return None
-    identity = association.get('identity_confidence', {'bytetrack': .95, 'court_association': .85, 'roster_bootstrap': .95}.get(association.get('source'), 0))
+    identity = association.get(
+        'identity_confidence',
+        {
+            'bytetrack': .95,
+            'court_association': .85,
+            'roster_bootstrap': .95,
+            'anchored_roster_opening': .85,
+            'anchored_roster_continuity': .85,
+            'anchored_roster_appearance': .85,
+            'anchored_roster_reference_recovery': .85,
+        }.get(association.get('source'), 0),
+    )
     confidence = track.get('confidence')
     location = (track.get('location_evidence') or {}).get('confidence')
     if (not all(_finite(v) for v in (identity, confidence, location))

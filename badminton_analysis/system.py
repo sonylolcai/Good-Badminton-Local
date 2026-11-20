@@ -14,7 +14,7 @@ def load_runtime_dependencies():
     """Load heavy runtime dependencies after argparse has handled --help."""
     global cv2, np, YOLO, CourtMapper, annotate_court, compute_expanded_roi, PlayerTracker
     global CourtTrajectoryVisualizer, ShuttlecockTracker, FixedCameraMatchPipeline
-    global PlayerPoseVisualizer, StatsVisualizer, RTMPoseProcessor, YOLOPoseProcessor, vap
+    global PlayerPoseVisualizer, StatsVisualizer, RTMPoseProcessor, YOLOPoseProcessor, derive_far_court_roi, vap
     global JsonlDetectionWriter, write_json, SCHEMA_VERSION, TrackNetV3RawMeasurements
 
     yolo_config_dir = os.path.join(tempfile.gettempdir(), "good-badminton-ultralytics")
@@ -35,7 +35,7 @@ def load_runtime_dependencies():
         from .visualization.player_pose import PlayerPoseVisualizer as _PlayerPoseVisualizer
         from .visualization.stats import StatsVisualizer as _StatsVisualizer
         from .detection.rtmpose import RTMPoseProcessor as _RTMPoseProcessor
-        from .detection.yolo_pose import YOLOPoseProcessor as _YOLOPoseProcessor
+        from .detection.yolo_pose import YOLOPoseProcessor as _YOLOPoseProcessor, derive_far_court_roi as _derive_far_court_roi
         from .media import video_audio as _vap
         from .data.writer import JsonlDetectionWriter as _JsonlDetectionWriter
         from .data.writer import write_json as _write_json
@@ -61,6 +61,7 @@ def load_runtime_dependencies():
     StatsVisualizer = _StatsVisualizer
     RTMPoseProcessor = _RTMPoseProcessor
     YOLOPoseProcessor = _YOLOPoseProcessor
+    derive_far_court_roi = _derive_far_court_roi
     vap = _vap
     JsonlDetectionWriter = _JsonlDetectionWriter
     write_json = _write_json
@@ -81,7 +82,7 @@ class BadmintonAnalysisSystem:
                  shuttle_sample_hz=None,
                  court_health_check_hz=2.0,
                  pose_conf=0.15, far_player_enhancement=False,
-                 far_pose_roi=(0.12, 0.30, 0.86, 0.82), net_image_line=None,
+                 far_pose_roi=None, net_image_line=None,
                  match_mode='singles', tracker_backend='bytetrack',
                  enable_bytetrack=True, lock_match_roster=True,
                  roster_stable_frames=2, roster_discovery_seconds=3.0,
@@ -177,7 +178,12 @@ class BadmintonAnalysisSystem:
         if not 0.0 < self.pose_conf <= 1.0:
             raise ValueError("pose_conf must be greater than 0 and no more than 1")
         self.far_player_enhancement = bool(far_player_enhancement)
-        self.far_pose_roi = tuple(float(value) for value in far_pose_roi)
+        self.far_pose_roi = (
+            None
+            if far_pose_roi is None
+            else tuple(float(value) for value in far_pose_roi)
+        )
+        self._resolved_far_pose_roi_normalized = self.far_pose_roi
         self.net_image_line = net_image_line
         if match_mode not in {'auto', 'singles', 'doubles'}:
             raise ValueError("match_mode must be 'auto', 'singles', or 'doubles'.")
@@ -449,6 +455,41 @@ class BadmintonAnalysisSystem:
         corners, roi_corners, mid_height = self._setup_court_annotation(template_color)
         self.court_corners = corners
         self.court_roi_corners = roi_corners
+        if (
+            self.far_player_enhancement
+            and self.far_pose_roi is None
+            and self.frame_width > 0
+            and self.frame_height > 0
+        ):
+            derived_px = derive_far_court_roi(
+                corners,
+                (self.frame_height, self.frame_width),
+                court_dimensions=self.court_dimensions,
+                world_points_m=self.calibration_world_points_m,
+                include_upper_body=True,
+            )
+            self._resolved_far_pose_roi_normalized = (
+                round(derived_px[0] / self.frame_width, 4),
+                round(derived_px[1] / self.frame_height, 4),
+                round(derived_px[2] / self.frame_width, 4),
+                round(derived_px[3] / self.frame_height, 4),
+            )
+            crop_x1, crop_y1 = roi_corners[0]
+            crop_x2, crop_y2 = roi_corners[1]
+            crop_w = max(1, int(crop_x2) - int(crop_x1))
+            crop_h = max(1, int(crop_y2) - int(crop_y1))
+            local_far_px = (
+                max(0, min(crop_w - 1, derived_px[0] - int(crop_x1))),
+                max(0, min(crop_h - 1, derived_px[1] - int(crop_y1))),
+                max(1, min(crop_w, derived_px[2] - int(crop_x1))),
+                max(1, min(crop_h, derived_px[3] - int(crop_y1))),
+            )
+            if (
+                hasattr(self.rtmpose_processor, "far_roi")
+                and local_far_px[2] > local_far_px[0]
+                and local_far_px[3] > local_far_px[1]
+            ):
+                self.rtmpose_processor.far_roi = local_far_px
 
         self.detection_writer = JsonlDetectionWriter(self.detections_path)
         
@@ -624,7 +665,16 @@ class BadmintonAnalysisSystem:
                         if self.pose_family == "yolo-pose"
                         else "native"
                     ),
-                    "far_roi_normalized": list(self.far_pose_roi) if self.far_player_enhancement else None,
+                    "far_roi_normalized": (
+                        list(self._resolved_far_pose_roi_normalized)
+                        if self.far_player_enhancement and self._resolved_far_pose_roi_normalized is not None
+                        else None
+                    ),
+                    "far_roi_source": (
+                        ("court_net_ground_line" if self.far_pose_roi is None else "configured")
+                        if self.far_player_enhancement
+                        else None
+                    ),
                     # 0 is the explicit full-evidence mode: run pose on every
                     # source frame, then persist raw COCO17 joints for every
                     # detected track observation.  A positive value is an

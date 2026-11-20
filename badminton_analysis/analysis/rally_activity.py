@@ -31,16 +31,21 @@ def find_settle_terminals(track_rows, person_rows, polygon, pixel_scale=1):
     """Fast descent followed by a compact measured floor-plane cluster.
 
     This is an explainable terminal candidate, not a monocular height proof.
-    No interpolated or outside-court reacquisition point supplies the cluster.
+    Airborne pre-landing descent frames are allowed outside the 2D floor quad
+    so steep drops into the court still qualify once the settle point and
+    cluster land inside the calibrated court polygon.  No interpolated or
+    outside-court reacquisition point supplies the settle cluster.
     """
-    points = [r for r in _observed(track_rows) if inside_quad(r['image_xy'], polygon)]
-    times = [p['time_sec'] for p in points]
+    all_points = _observed(track_rows)
+    all_times = [p['time_sec'] for p in all_points]
     people = sorted((r for r in person_rows if _finite(r.get('time_sec'))), key=lambda r: r['time_sec'])
     person_times = [r['time_sec'] for r in people]
     terminals = []
-    for index, current in enumerate(points):
+    for index, current in enumerate(all_points):
         t, xy = current['time_sec'], current['image_xy']
-        before = points[bisect_left(times, t - POLICY['descent_lookback_sec']):index]
+        if not inside_quad(xy, polygon):
+            continue
+        before = all_points[bisect_left(all_times, t - POLICY['descent_lookback_sec']):index]
         if len(before) < 2:
             continue
         left, right = before[-2:]
@@ -53,12 +58,14 @@ def find_settle_terminals(track_rows, person_rows, polygon, pixel_scale=1):
             continue
         if xy[1] < right['image_xy'][1] - 12 * pixel_scale:
             continue
-        after = points[index:bisect_right(times, t + POLICY['settle_lookahead_sec'])]
+        after = all_points[index:bisect_right(all_times, t + POLICY['settle_lookahead_sec'])]
         cluster = []
         for p in after:
+            if not inside_quad(p['image_xy'], polygon):
+                break
             if math.dist(xy, p['image_xy']) > POLICY['settle_radius_px'] * pixel_scale:
                 break
-            if cluster and p['time_sec'] - cluster[-1]['time_sec'] > .16:
+            if cluster and p['time_sec'] - cluster[-1]['time_sec'] > .22:
                 break
             cluster.append(p)
         if len(cluster) < 3 or cluster[-1]['time_sec'] - t < POLICY['settle_min_span_sec']:
@@ -105,6 +112,45 @@ def _restart_pair(a, b, observed, pixel_scale, observed_times):
         if len(run) >= 3 and max(math.dist(p['image_xy'], q['image_xy']) for q in run[:-1]) >= POLICY['flight_min_span_px'] * pixel_scale:
             return True
     return False
+
+
+def assign_events_to_rallies(events, context):
+    """Project independent rally intervals onto the existing candidate records."""
+    rallies = []
+    assignments = {
+        event["event_id"]: {"rally_id": None, "rally_phase": "awaiting_restart"}
+        for event in events
+    }
+    for rally in context["rallies"]:
+        rally_id = rally["rally_id"]
+        group = [
+            event for event in events
+            if rally["start_time_sec"] <= event["hit_time_sec"] <= rally["end_time_sec"]
+            and assignments[event["event_id"]]["rally_id"] is None
+        ]
+        for index, event in enumerate(group, 1):
+            assignments[event["event_id"]] = {
+                "rally_id": rally_id, "rally_phase": "in_rally", "shot_index_in_rally": index,
+            }
+        rallies.append({
+            **rally,
+            "schema_version": VERSION,
+            "status": "candidate_active_interval",
+            "shot_count": len(group),
+            "shot_event_ids": [event["event_id"] for event in group],
+            "shot_times_sec": [event["hit_time_sec"] for event in group],
+            "score": {"status": "unknown", "included_in_player_statistics": False},
+        })
+    return {
+        "schema_version": VERSION,
+        "policy": context["policy"],
+        "rallies": rallies,
+        "terminals": context["automatic_terminal_candidates"],
+        "assignments": assignments,
+        "active_candidate_count": sum(v["rally_phase"] == "in_rally" for v in assignments.values()),
+        "waiting_restart_count": sum(v["rally_phase"] == "awaiting_restart" for v in assignments.values()),
+        "score_inference": False,
+    }
 
 
 def derive_rally_activity(events, track_rows, terminals, *, pixel_scale=1, video_end_sec=None):

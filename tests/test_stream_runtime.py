@@ -478,8 +478,12 @@ class StreamRuntimeTests(unittest.TestCase):
             for index in range(2)
         ]
         measurement.process_segment_frames(frames, contexts)
-        x1_0, y1_0, x2_0, y2_0 = _derived_far_court_roi(session["court_corners"], (100, 200, 3))
-        x1_1, y1_1, x2_1, y2_1 = _derived_far_court_roi(session["court_corners"], (200, 400, 3))
+        x1_0, y1_0, x2_0, y2_0 = _derived_far_court_roi(
+            session["court_corners"], (100, 200, 3), include_upper_body=True
+        )
+        x1_1, y1_1, x2_1, y2_1 = _derived_far_court_roi(
+            session["court_corners"], (200, 400, 3), include_upper_body=True
+        )
         self.assertEqual(
             pose_model.shapes,
             [
